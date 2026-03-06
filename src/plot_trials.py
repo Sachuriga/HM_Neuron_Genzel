@@ -202,35 +202,59 @@ if __name__ == "__main__":
     else:
         print("No .txt file found for node sequences.")
 
-    # --- 1c. Find and Parse Metadata CSV ---
-    CSV_GLOB = str(work_dir / "*Metadata.csv")
-    csv_paths = sorted(glob.glob(CSV_GLOB))
+    # --- 1c. Find and Parse Metadata Excel File ---
+    # Look specifically for RecordingMeta.xlsx or fallback to any *RecordingMeta.xlsx
+    EXCEL_GLOB = str(work_dir / "RecordingMeta.xlsx")
+    excel_paths = sorted(glob.glob(EXCEL_GLOB))
+    if not excel_paths:
+        excel_paths = sorted(glob.glob(str(work_dir / "*RecordingMeta.xlsx")))
     
     session_meta = None
-    target_goal_node_id = None
+    trial_metadata = {} # Dictionary to store per-trial metadata
     
-    if csv_paths:
-        print(f"Found Metadata CSV: {csv_paths[0]}")
+    if excel_paths:
+        print(f"Found Metadata Excel: {excel_paths[0]}")
         try:
-            meta_df = pd.read_csv(csv_paths[0])
+            # Use read_excel instead of read_csv
+            meta_df = pd.read_excel(excel_paths[0])
             if not meta_df.empty:
-                session_meta = meta_df.iloc[0].to_dict()
-                # Extract Goal Node ID
-                if 'Goal_Node' in session_meta:
-                    target_goal_node_id = str(int(session_meta['Goal_Node']))
-                    print(f"Target Goal Node loaded from Metadata: {target_goal_node_id}")
+                session_meta = meta_df.iloc[0].to_dict() # For the cover page
+                
+                # Attempt to find a trial ID column. Typical names: Trial_ID, Trial, trial_id
+                trial_col = None
+                for col in ['Trial_ID', 'Trial', 'trial_id', 'trial']:
+                    if col in meta_df.columns:
+                        trial_col = col
+                        break
+                
+                # Iterate over all rows to extract trial-specific goals, starts, and types
+                for idx, row in meta_df.iterrows():
+                    # If there's an explicit trial column use it, else assume 1-based index (1, 2, 3...)
+                    t_id = int(row[trial_col]) if trial_col else idx + 1
+                    
+                    trial_data = {}
+                    if 'Goal_Node' in row and pd.notna(row['Goal_Node']):
+                        trial_data['Goal_Node'] = str(int(row['Goal_Node']))
+                    if 'Start_Node' in row and pd.notna(row['Start_Node']):
+                        trial_data['Start_Node'] = str(int(row['Start_Node']))
+                    if 'Trial_Type' in row and pd.notna(row['Trial_Type']):
+                        trial_data['Trial_Type'] = str(row['Trial_Type'])
+                        
+                    trial_metadata[t_id] = trial_data
+                    
+                print(f"Target Nodes and Trial Types loaded for {len(trial_metadata)} trials.")
         except Exception as e:
-            print(f"Error parsing metadata CSV: {e}")
+            print(f"Error parsing metadata Excel: {e}")
     else:
-        print("No *SessionMetadata.csv found. Proceeding without metadata.")
+        print("No RecordingMeta.xlsx found. Proceeding without metadata.")
 
     # --- Corrected Regex Patterns ---
     
     # 1. Timestamp Regex: accurately handles the optional system time AND the optional colon separator
     ts_line_new = re.compile(
-        r'^(?:(?P<level>[A-Z]+)\s*:\s*)?'             # Level (INFO:)
+        r'^(?:(?P<level>[A-Z]+)\s*:\s*)?'            # Level (INFO:)
         r'(?:(?P<video>\d{1,2}:\d{1,2}:\d{1,2}\.\d{3})\s*)?' # Video Time
-        r'(?:(?P<sys>\d+(?:\.\d+)?)\s*)?'             # Optional Sys Time (No colon here yet)
+        r'(?:(?P<sys>\d+(?:\.\d+)?)\s*)?'            # Optional Sys Time (No colon here yet)
         r'(?::\s*)?'                                  # Match the colon separator separately so it doesn't end up in msg
         r'(?P<msg>.*)$'                               # The Message (clean)
     )
@@ -364,7 +388,7 @@ if __name__ == "__main__":
     SMOOTH_SAMPLES_50 = max(1, int(round(5.0 * FS))) 
 
     # --- Load Node List and Build Graph ---
-    node_file_path = Path("src/tools/node_list_new.csv")
+    node_file_path = Path(".src/tools/node_list_new.csv")
     nodes_data = None
     maze_graph = None
 
@@ -396,12 +420,8 @@ if __name__ == "__main__":
     
     summary_metrics = []
     print(f"Total Trials Processed: {len(per_trial_df)}")
-    print(f"Goal Node ID: {target_goal_node_id}")
     print(f"Graph Loaded: {maze_graph is not None}")
 
-    # Check if we have metrics for correlation
-    clean_metrics = [m for m in summary_metrics if not np.isnan(m['dist_log_score'])]
-    print(f"Trials with valid scores: {len(clean_metrics)} out of {len(summary_metrics)}")
     with PdfPages(pdf_path) as pdf:
         
         # --- Part 0: Metadata Summary Page ---
@@ -428,6 +448,12 @@ if __name__ == "__main__":
             xy_arr = row["xy"]
             
             if xy_arr.size == 0: continue
+            
+            # --- Look up trial-specific metadata ---
+            current_meta = trial_metadata.get(trial_id, {})
+            current_goal_node = current_meta.get('Goal_Node', None)
+            current_trial_type = current_meta.get('Trial_Type', 'Unknown')
+            meta_start_node = current_meta.get('Start_Node', None)
 
             x_raw = xy_arr[:, 0]
             y_raw = xy_arr[:, 1]
@@ -449,8 +475,8 @@ if __name__ == "__main__":
             gx_scaled, gy_scaled = None, None
             gx_raw, gy_raw = None, None
             
-            if target_goal_node_id and nodes_data is not None:
-                goal_row = nodes_data[nodes_data['id_str'] == target_goal_node_id]
+            if current_goal_node and nodes_data is not None:
+                goal_row = nodes_data[nodes_data['id_str'] == current_goal_node]
                 if not goal_row.empty:
                     gx_scaled = goal_row.iloc[0]['x_scaled']
                     gy_scaled = goal_row.iloc[0]['y_scaled']
@@ -468,13 +494,8 @@ if __name__ == "__main__":
                         first_goal_visit_idx = arrival_indices[0]
             
             # --- Handling the "Force End" Logic ---
-            # If goal NOT reached naturally, append it for visual connection (unless forbidden)
-            # The prompt implies for Type 2/3 we shouldn't force, but if they reached it, we don't need to force.
-            # We keep standard behavior for "No Path Found" cases to guide the eye, 
-            # but if we found the goal naturally, we definitely don't append.
-            
             appended_goal = False
-            if target_goal_node_id and not goal_reached_naturally and gx_scaled is not None:
+            if current_goal_node and not goal_reached_naturally and gx_scaled is not None:
                 # Check distance to last point
                 last_x, last_y = x_plot[-1], y_plot[-1]
                 dist_to_goal = np.sqrt((last_x - gx_scaled)**2 + (last_y - gy_scaled)**2)
@@ -555,12 +576,13 @@ if __name__ == "__main__":
                 try:
                     passed_nodes_list = [t.strip() for t in seq_str.split(',') if t.strip()]
                     if passed_nodes_list:
-                        start_node = passed_nodes_list[0]
+                        # Use metadata start_node if available, else first item in sequence
+                        start_node = meta_start_node if meta_start_node else passed_nodes_list[0]
                         
                         # Logic: Find index of Goal Node in sequence
-                        if target_goal_node_id in passed_nodes_list:
+                        if current_goal_node in passed_nodes_list:
                             # If goal is in list, count hops to FIRST occurrence
-                            idx_in_seq = passed_nodes_list.index(target_goal_node_id)
+                            idx_in_seq = passed_nodes_list.index(current_goal_node)
                             actual_hops_score_basis = idx_in_seq # hops = index (0->0, 0->1 is 1 hop)
                             # Update note if both agree
                             if "Start->FirstGoal" not in score_note: score_note = "(Start->GoalNode)"
@@ -579,8 +601,8 @@ if __name__ == "__main__":
             hops_score_msg = "N/A"
             hops_score_val = np.nan 
 
-            # FORCE END NODE TO BE FROM METADATA FOR OPTIMAL CALCULATION
-            end_node = target_goal_node_id
+            # SET TARGET NODE TO CURRENT TRIAL GOAL NODE
+            end_node = current_goal_node
 
             if maze_graph and start_node and end_node:
                 try:
@@ -630,7 +652,7 @@ if __name__ == "__main__":
             wrapped_seq = textwrap.fill(seq_str, width=110)
             summary_txt = (
                 f"Trial {trial_id} Summary: {score_note}\n"
-                f"Target Goal: {end_node if end_node else 'Unknown'}\n"
+                f"Trial Type: {current_trial_type} | Target Goal: {end_node if end_node else 'Unknown'}\n"
                 f"Passed Nodes: {wrapped_seq}\n"
                 f"Avg Speed: {avg_speed_trial:.3f} m/s | Median Speed: {median_speed_trial:.3f} m/s\n"
                 f"--------------------------------------------------\n"

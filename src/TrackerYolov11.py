@@ -5,6 +5,7 @@ Description: 1. Reads metadata from *RecordingMeta.xlsx (Handles vertical lists)
              2. Automatically finds 'stitched.mp4' in input_folder.
              3. Optimized for Batch/Massive Analysis.
              4. Updated to use Ultralytics YOLO11x.pt
+             5. Added function to copy RecordingMeta.xlsx to output folder.
 '''
 
 from itertools import groupby
@@ -31,6 +32,7 @@ import pandas as pd
 import sys
 import argparse
 import glob
+import shutil # <-- ADDED FOR FILE COPYING
 from tqdm import tqdm
 
 
@@ -968,6 +970,14 @@ if __name__ == "__main__":
             
         xlsx_file = meta_files[0] # Take the first matching file
         metadata = parse_metadata_xlsx(xlsx_file)
+
+        # --- NEW CODE: Copy the Excel file to the output folder ---
+        print(f"\nCopying metadata file to output folder...")
+        # Ensure the output directory exists before copying
+        os.makedirs(out_p, exist_ok=True)
+        shutil.copy2(xlsx_file, out_p)
+        print(f"Successfully copied: {os.path.basename(xlsx_file)} to {out_p}\n")
+        # ----------------------------------------------------------
 
         # 3. Start Tracker
         tracker = Tracker(vp=vid_p, nl=node_list, out=out_p, metadata=metadata, onnx_weight=model_path)
