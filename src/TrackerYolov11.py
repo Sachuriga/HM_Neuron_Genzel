@@ -800,18 +800,31 @@ class Tracker:
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
+            _dbg_sec = int(self.frame_time / 1000)
             if minutes >= 2:
                 if not self.probe_researcher_signalled:
                     closest_to_goal = self.closest_researcher_to(self.goal_location)
-                    if (closest_to_goal is not None and
-                            points_dist(closest_to_goal, self.goal_location) <= 80):
-                        self.probe_researcher_signalled = True
+                    if closest_to_goal is not None:
+                        dist = points_dist(closest_to_goal, self.goal_location)
+                        if _dbg_sec != getattr(self, '_probe_dbg_sec', -1):
+                            self._probe_dbg_sec = _dbg_sec
+                            print(f"[PROBE] min={minutes} | res->goal={dist:.1f}px | threshold=80px | will_signal={dist<=80}")
+                        if dist <= 80:
+                            self.probe_researcher_signalled = True
+                    else:
+                        if _dbg_sec != getattr(self, '_probe_dbg_sec', -1):
+                            self._probe_dbg_sec = _dbg_sec
+                            print(f"[PROBE] min={minutes} | no researcher detected this frame")
                 else:
                     if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
                         if not is_immune:
                             self.probe = False
                             self.probe_researcher_signalled = False
                             self.end_trial()
+            else:
+                if _dbg_sec != getattr(self, '_probe_dbg_sec', -1):
+                    self._probe_dbg_sec = _dbg_sec
+                    print(f"[PROBE] waiting: {minutes}min elapsed (need >= 2)")
 
         if self.normal_trial:
             if not is_did_not_reach:
@@ -1021,9 +1034,15 @@ class Tracker:
             if self.probe and self.goal_location:
                 _probe_min = (self.frame_time / (1000 * 60)) % 60 - self.start_time
                 if _probe_min < 0: _probe_min += 60
+                _timer_int = int(_probe_min)
                 _closest_res = self.closest_researcher_to(self.goal_location)
-                _res_dist_str = f'{points_dist(_closest_res, self.goal_location):.0f}px' if _closest_res else 'no res'
-                cv2.putText(frame, f'Probe: {_probe_min:.2f}min | Res->goal: {_res_dist_str}', (60, 154),
+                if _closest_res:
+                    _res_d = points_dist(_closest_res, self.goal_location)
+                    _res_dist_str = f'{_res_d:.0f}px (thr:80)'
+                else:
+                    _res_dist_str = 'no res'
+                _timer_label = f'{_probe_min:.2f}min [int={_timer_int}]'
+                cv2.putText(frame, f'Probe: {_timer_label} | Res->goal: {_res_dist_str}', (60, 154),
                             fontFace=FONT, fontScale=0.65, color=(255, 140, 80), thickness=1)
 
             cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 172),
