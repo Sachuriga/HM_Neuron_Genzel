@@ -960,6 +960,15 @@ class Tracker:
             cv2.putText(frame, 'Waiting start new trial...', (60, 80),
                         fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
 
+            _type_names = {1: "Normal", 2: "NGL", 3: "Probe", 4: "NGL-Sp4", 5: "NGL-Sp5", 6: "NGL-Sp6"}
+            if self.counter < len(self.trial_types):
+                _next_type = int(self.trial_types[self.counter])
+                cv2.putText(frame, f'Type: {_type_names.get(_next_type, f"Type {_next_type}")}', (60, 100),
+                            fontFace=FONT, fontScale=0.65, color=(180, 220, 255), thickness=1)
+            _next_goal = str(self.goal_nodes[self.counter]) if self.counter < len(self.goal_nodes) else "?"
+            cv2.putText(frame, f'Goal: {_next_goal}', (60, 118),
+                        fontFace=FONT, fontScale=0.65, color=(180, 255, 180), thickness=1)
+
             start_pos = self.start_nodes_locations[self.counter]
             start_node_name = self.start_nodes[self.counter]
             self.annotate_node(frame, point=start_pos, node=start_node_name, t=1)
@@ -985,9 +994,33 @@ class Tracker:
                         fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
             cv2.putText(frame, 'Currently writing to file...', (60, 80),
                         fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
-            cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 130),
+
+            _type_names = {1: "Normal", 2: "NGL", 3: "Probe", 4: "NGL-Sp4", 5: "NGL-Sp5", 6: "NGL-Sp6"}
+            _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else -1
+            cv2.putText(frame, f'Type: {_type_names.get(_curr_type, f"Type {_curr_type}")}', (60, 100),
+                        fontFace=FONT, fontScale=0.65, color=(180, 220, 255), thickness=1)
+
+            _conds = []
+            if self.normal_trial: _conds.append("normal")
+            if self.NGL: _conds.append("NGL")
+            if self.probe: _conds.append("probe")
+            if self.probe and self.probe_researcher_signalled: _conds.append("res.signalled")
+            if self.NGL and self.reached: _conds.append("reached_goal")
+            _is_dnr = (self.counter < len(self.did_not_reach_list) and
+                       self.did_not_reach_list[self.counter] == 1)
+            if _is_dnr: _conds.append("DNR")
+            if self.check_immunity(): _conds.append("immune")
+            cv2.putText(frame, f'Conds: {", ".join(_conds) if _conds else "none"}', (60, 118),
+                        fontFace=FONT, fontScale=0.65, color=(180, 220, 255), thickness=1)
+
+            if self.pos_centroid and self.goal_location:
+                _dist_to_goal = points_dist(self.pos_centroid, self.goal_location)
+                cv2.putText(frame, f'Dist to goal: {_dist_to_goal:.1f}px', (60, 136),
+                            fontFace=FONT, fontScale=0.65, color=(255, 200, 100), thickness=1)
+
+            cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 158),
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
-            cv2.putText(frame, "Rat-head Count: " + str(self.count_head), (40, 160),
+            cv2.putText(frame, "Rat-head Count: " + str(self.count_head), (40, 176),
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
 
             if len(self.centroid_list) >= 2:
