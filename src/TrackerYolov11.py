@@ -1004,7 +1004,7 @@ class Tracker:
             if self.normal_trial: _conds.append("normal")
             if self.NGL: _conds.append("NGL")
             if self.probe: _conds.append("probe")
-            if self.probe_researcher_signalled: _conds.append("res.signalled")
+            if self.probe: _conds.append(f'res.signalled={"T" if self.probe_researcher_signalled else "F"}')
             if self.NGL and self.reached: _conds.append("reached_goal")
             _is_dnr = (self.counter < len(self.did_not_reach_list) and
                        self.did_not_reach_list[self.counter] == 1)
