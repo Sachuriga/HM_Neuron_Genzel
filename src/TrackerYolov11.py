@@ -259,6 +259,7 @@ class Tracker:
         self.normal_trial = False
         self.NGL = False
         self.probe = False
+        self.probe_researcher_signalled = False
         self.unnormal_intervals = self.metadata.get('unnormal_intervals', {})
 
         self.goal_residence_timer = 0.0
@@ -573,6 +574,7 @@ class Tracker:
                 self.normal_trial = False
                 self.NGL = False
                 self.probe = False
+                self.probe_researcher_signalled = False
                 self.reached = False
                 self.end_trial()
                 self.start_trial = True
@@ -642,6 +644,7 @@ class Tracker:
                                 self.normal_trial = False
                                 self.NGL = False
                                 self.probe = False
+                                self.probe_researcher_signalled = False
                                 self.end_trial()
                                 self.researcher_goal_timer = 0.0
                         else:
@@ -675,6 +678,7 @@ class Tracker:
                             self.normal_trial = False
                             self.NGL = False
                             self.probe = False
+                            self.probe_researcher_signalled = False
 
                             self.end_trial()
                             self.researcher_goal_timer = 0.0
@@ -737,13 +741,17 @@ class Tracker:
         if self.probe:
             minutes = self.timer(start=self.start_time)
             if minutes > 2:
-                if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
+                if not self.probe_researcher_signalled:
                     closest_to_goal = self.closest_researcher_to(self.goal_location)
-                    researcher_at_goal = (closest_to_goal is not None and
-                                          points_dist(closest_to_goal, self.goal_location) <= 80)
-                    if researcher_at_goal and not is_immune:
-                        self.probe = False
-                        self.end_trial()
+                    if (closest_to_goal is not None and
+                            points_dist(closest_to_goal, self.goal_location) <= 80):
+                        self.probe_researcher_signalled = True
+                else:
+                    if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
+                        if not is_immune:
+                            self.probe = False
+                            self.probe_researcher_signalled = False
+                            self.end_trial()
 
         if self.normal_trial:
             if not is_did_not_reach:
@@ -793,13 +801,17 @@ class Tracker:
         if self.probe:
             minutes = self.timer(start=self.start_time)
             if minutes > 2:
-                if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
+                if not self.probe_researcher_signalled:
                     closest_to_goal = self.closest_researcher_to(self.goal_location)
-                    researcher_at_goal = (closest_to_goal is not None and
-                                          points_dist(closest_to_goal, self.goal_location) <= 80)
-                    if researcher_at_goal and not is_immune:
-                        self.probe = False
-                        self.end_trial()
+                    if (closest_to_goal is not None and
+                            points_dist(closest_to_goal, self.goal_location) <= 80):
+                        self.probe_researcher_signalled = True
+                else:
+                    if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
+                        if not is_immune:
+                            self.probe = False
+                            self.probe_researcher_signalled = False
+                            self.end_trial()
 
         if self.normal_trial:
             if not is_did_not_reach:
