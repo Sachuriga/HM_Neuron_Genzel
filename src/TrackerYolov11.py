@@ -808,8 +808,8 @@ class Tracker:
                         dist = points_dist(closest_to_goal, self.goal_location)
                         if _dbg_sec != getattr(self, '_probe_dbg_sec', -1):
                             self._probe_dbg_sec = _dbg_sec
-                            print(f"[PROBE] min={minutes} | res->goal={dist:.1f}px | threshold=80px | will_signal={dist<=80}")
-                        if dist <= 80:
+                            print(f"[PROBE] min={minutes} | res->goal={dist:.1f}px | threshold=600px | will_signal={dist<=600}")
+                        if dist <= 600:
                             self.probe_researcher_signalled = True
                     else:
                         if _dbg_sec != getattr(self, '_probe_dbg_sec', -1):
@@ -1038,7 +1038,7 @@ class Tracker:
                 _closest_res = self.closest_researcher_to(self.goal_location)
                 if _closest_res:
                     _res_d = points_dist(_closest_res, self.goal_location)
-                    _res_dist_str = f'{_res_d:.0f}px (thr:80)'
+                    _res_dist_str = f'{_res_d:.0f}px (thr:600)'
                 else:
                     _res_dist_str = 'no res'
                 _timer_label = f'{_probe_min:.2f}min [int={_timer_int}]'
