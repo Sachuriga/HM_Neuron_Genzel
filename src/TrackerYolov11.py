@@ -800,7 +800,7 @@ class Tracker:
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
-            if minutes > 2:
+            if minutes >= 2:
                 if not self.probe_researcher_signalled:
                     closest_to_goal = self.closest_researcher_to(self.goal_location)
                     if (closest_to_goal is not None and
@@ -833,7 +833,7 @@ class Tracker:
                             self.pickup_timer = 0.0
                     else:
                         self.pickup_timer = 0.0
-    
+
     def end_trial(self):
         self.pos_centroid = self.goal_location
         self.centroid_list.append(self.pos_centroid)
@@ -1018,9 +1018,17 @@ class Tracker:
                 cv2.putText(frame, f'Dist to goal: {_dist_to_goal:.1f}px', (60, 136),
                             fontFace=FONT, fontScale=0.65, color=(255, 200, 100), thickness=1)
 
-            cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 158),
+            if self.probe and self.goal_location:
+                _probe_min = (self.frame_time / (1000 * 60)) % 60 - self.start_time
+                if _probe_min < 0: _probe_min += 60
+                _closest_res = self.closest_researcher_to(self.goal_location)
+                _res_dist_str = f'{points_dist(_closest_res, self.goal_location):.0f}px' if _closest_res else 'no res'
+                cv2.putText(frame, f'Probe: {_probe_min:.2f}min | Res->goal: {_res_dist_str}', (60, 154),
+                            fontFace=FONT, fontScale=0.65, color=(255, 140, 80), thickness=1)
+
+            cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 172),
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
-            cv2.putText(frame, "Rat-head Count: " + str(self.count_head), (40, 176),
+            cv2.putText(frame, "Rat-head Count: " + str(self.count_head), (40, 190),
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
 
             if len(self.centroid_list) >= 2:
