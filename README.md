@@ -23,8 +23,6 @@ The pipeline takes raw Trodes recordings (`.rec`) and multi-camera video, then r
 HM_Tracker_2025/
 ├── src/
 │   ├── TrackerYolov11.py         # Main YOLOv11 tracker
-│   ├── TrackerYolov.py           # Legacy YOLOv tracker
-│   ├── TrackerYolov_tiling.py    # Tiling variant (SAHI)
 │   ├── Video_LED_Sync_using_ICA.py  # LED sync via ICA
 │   ├── join_views.py             # Multi-camera stitching
 │   ├── plot_trials.py            # Trial-level plotting
@@ -177,7 +175,7 @@ Each trial has a type read from `RecordingMeta.xlsx`. The end condition differs 
 |---|---|---|
 | 1 | Normal | Rat centroid within 25 px of goal node |
 | 2 | NGL (New Goal Location) | Rat visited goal (within 20 px) AND 10 minutes elapsed |
-| 3 | Probe | 2 minutes elapsed AND rat within 25 px of goal |
+| 3 | Probe | More than 2 minutes elapsed AND researcher within 80 px of goal AND rat within 25 px of goal |
 | 4–6 | Special NGL variants | Same as NGL; followed by a 10-minute inter-trial lockout |
 
 **Did-Not-Reach override** — If `Did_Not_Reach = 1` for a trial in the metadata, the normal goal-proximity check is skipped. Instead, the trial ends when a researcher stays within 60 px of the rat for ≥ 1 second (rat-pickup detection).
@@ -229,7 +227,7 @@ The CSV timestamps are merged from the LED-ICA sync file produced in Step 2, so 
 ## Key Scripts
 
 ### `src/TrackerYolov11.py`
-Reads session metadata from `RecordingMeta.xlsx`, finds `stitched.mp4` in the input folder, runs YOLOv11x detection + tracking, and writes an annotated output video and position CSV. Supports tiling via SAHI for small-object detection.
+Reads session metadata from `RecordingMeta.xlsx`, finds `stitched.mp4` in the input folder, runs YOLOv11x detection + tracking, and writes an annotated output video and position CSV.
 
 ### `src/Video_LED_Sync_using_ICA.py`
 Extracts LED blink signals from video frames using FastICA, aligns them with Trodes DIO timestamps, and produces a synchronized timestamp file for downstream analysis.
