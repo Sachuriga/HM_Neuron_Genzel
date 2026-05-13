@@ -9,16 +9,12 @@ Author: sachuriga
 '''
 
 from itertools import groupby
-from datetime import date, timedelta, datetime
+from datetime import datetime
 from pathlib import Path
 from collections import deque
 from tools import mask
 import cv2
 from ultralytics import YOLO 
-# --- ADDED FOR TILING ---
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
-# ------------------------
 import os
 import math
 import time
@@ -740,13 +736,14 @@ class Tracker:
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
-            if minutes >= 2:
+            if minutes > 2:
                 if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
-                    if not is_immune:
+                    closest_to_goal = self.closest_researcher_to(self.goal_location)
+                    researcher_at_goal = (closest_to_goal is not None and
+                                          points_dist(closest_to_goal, self.goal_location) <= 80)
+                    if researcher_at_goal and not is_immune:
                         self.probe = False
                         self.end_trial()
-                    else:
-                        pass
 
         if self.normal_trial:
             if not is_did_not_reach:
@@ -795,13 +792,14 @@ class Tracker:
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
-            if minutes >= 2:
+            if minutes > 2:
                 if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
-                    if not is_immune:
+                    closest_to_goal = self.closest_researcher_to(self.goal_location)
+                    researcher_at_goal = (closest_to_goal is not None and
+                                          points_dist(closest_to_goal, self.goal_location) <= 80)
+                    if researcher_at_goal and not is_immune:
                         self.probe = False
                         self.end_trial()
-                    else:
-                        pass 
 
         if self.normal_trial:
             if not is_did_not_reach:
