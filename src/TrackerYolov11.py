@@ -657,7 +657,7 @@ class Tracker:
             if closest_to_goal is not None:
                 dist_to_goal = points_dist(closest_to_goal, self.goal_location)
 
-                if dist_to_goal <= 80:
+                if dist_to_goal <= 160:
 
                     allow_end = True
 
