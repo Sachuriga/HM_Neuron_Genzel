@@ -834,6 +834,21 @@ class Tracker:
                     self.end_trial()
                     return
 
+        # General rule: for all trial types except probe (3) and type 6,
+        # end the trial immediately when researcher is within 500px of the goal
+        if self.goal_location is not None:
+            _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
+            if _curr_type not in (3, 6):
+                _closest_to_goal = self.closest_researcher_to(self.goal_location)
+                if _closest_to_goal is not None:
+                    _res_goal_dist = points_dist(_closest_to_goal, self.goal_location)
+                    if _res_goal_dist <= 500:
+                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 500px of goal ({_res_goal_dist:.0f}px), ending trial')
+                        self.normal_trial = False
+                        self.NGL = False
+                        self.end_trial()
+                        return
+
         if self.probe:
             minutes = self.timer(start=self.start_time)
             _dbg_sec = int(self.frame_time / 1000)
