@@ -632,7 +632,7 @@ class Tracker:
                                     font, 1, (0, 255, 0), 2)
 
                 if (not self.start_trial and not self.end_session and
-                    not self.record_detections and dist <= 160 and can_trigger):
+                    not self.record_detections and dist <= 300 and can_trigger):
 
                     print(f">>> Lockout finished/not required. Starting Trial {self.trial_num}")
                     self.start_trial = True
@@ -1044,7 +1044,7 @@ class Tracker:
                     _lockout_rem = max(0, self.lockout_duration_ms - (self.frame_time - getattr(self, 'last_trial_start_time_ms', -1e9))) / 1000
                     _trig_color = (0, 200, 0) if _st_dist <= 160 and not _lockout_active else (180, 180, 180)
                     _lockout_str = f' [LOCKOUT {_lockout_rem:.0f}s]' if _lockout_active else ''
-                    cv2.putText(frame, f'TrigA res->rat {_st_dist:.0f}px/160{_lockout_str} | start_trial={self.start_trial}',
+                    cv2.putText(frame, f'TrigA res->rat {_st_dist:.0f}px/300{_lockout_str} | start_trial={self.start_trial}',
                                 (60, 190), fontFace=FONT, fontScale=0.55, color=_trig_color, thickness=1)
                 else:
                     cv2.putText(frame, 'TrigA: no researcher detected',
