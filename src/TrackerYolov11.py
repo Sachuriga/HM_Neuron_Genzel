@@ -819,8 +819,11 @@ class Tracker:
                         self.reached = False
                         self.end_trial()
 
+        trial_elapsed_ms = self.frame_time - self.last_trial_start_time_ms
+        researcher_trigger_allowed = trial_elapsed_ms >= 10_000
+
         # DNR: end trial when researcher reaches within 300px of the goal node
-        if is_did_not_reach and self.goal_location is not None:
+        if is_did_not_reach and researcher_trigger_allowed and self.goal_location is not None:
             closest_to_goal = self.closest_researcher_to(self.goal_location)
             if closest_to_goal is not None:
                 dnr_dist = points_dist(closest_to_goal, self.goal_location)
@@ -836,7 +839,7 @@ class Tracker:
 
         # General rule: for all trial types except probe (3) and type 6,
         # end the trial immediately when researcher is within 500px of the goal
-        if self.goal_location is not None:
+        if researcher_trigger_allowed and self.goal_location is not None:
             _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
             if _curr_type not in (3, 6):
                 _closest_to_goal = self.closest_researcher_to(self.goal_location)
