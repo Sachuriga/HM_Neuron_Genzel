@@ -260,6 +260,7 @@ class Tracker:
         self.NGL = False
         self.probe = False
         self.probe_researcher_signalled = False
+        self.start_node_delay_until = 0
         self.unnormal_intervals = self.metadata.get('unnormal_intervals', {})
 
         self.goal_residence_timer = 0.0
@@ -798,6 +799,17 @@ class Tracker:
                         self.reached = False
                         self.end_trial()
 
+        # DNR: if researcher detected at any point during trial → skip immediately
+        if is_did_not_reach and self.all_researchers:
+            print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} - researcher detected, skipping to next trial')
+            self.start_node_delay_until = self.frame_time + 5000
+            self.normal_trial = False
+            self.NGL = False
+            self.probe = False
+            self.probe_researcher_signalled = False
+            self.end_trial()
+            return
+
         if self.probe:
             minutes = self.timer(start=self.start_time)
             _dbg_sec = int(self.frame_time / 1000)
@@ -827,25 +839,10 @@ class Tracker:
                     print(f"[PROBE] waiting: {minutes}min elapsed (need >= 2)")
 
         if self.normal_trial:
-            if not is_did_not_reach:
-                if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
-                    if not is_immune:
-                        self.normal_trial = False
-                        self.end_trial()
-            else:
-                # "Did Not Reach" end logic: trial ends when rat is picked up by researcher
-                closest_to_rat = self.closest_researcher_to(self.pos_centroid)
-                if closest_to_rat is not None:
-                    dist_to_researcher = points_dist(self.pos_centroid, closest_to_rat)
-                    if dist_to_researcher <= 60:
-                        self.pickup_timer += (1.0 / self.vid_fps)
-                        if self.pickup_timer >= 1.0:
-                            print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} ended - rat picked up by researcher')
-                            self.normal_trial = False
-                            self.end_trial()
-                            self.pickup_timer = 0.0
-                    else:
-                        self.pickup_timer = 0.0
+            if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
+                if not is_immune:
+                    self.normal_trial = False
+                    self.end_trial()
 
     def end_trial(self):
         self.pos_centroid = self.goal_location
@@ -970,8 +967,6 @@ class Tracker:
         if self.start_trial and self.counter < len(self.start_nodes):
             cv2.putText(frame, f'Next trial: {self.trial_num}', (60, 60),
                         fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
-            cv2.putText(frame, 'Waiting start new trial...', (60, 80),
-                        fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
 
             _type_names = {1: "Normal", 2: "NGL", 3: "Probe", 4: "NGL-Sp4", 5: "NGL-Sp5", 6: "NGL-Sp6"}
             if self.counter < len(self.trial_types):
@@ -982,9 +977,16 @@ class Tracker:
             cv2.putText(frame, f'Goal: {_next_goal}', (60, 118),
                         fontFace=FONT, fontScale=0.65, color=(180, 255, 180), thickness=1)
 
-            start_pos = self.start_nodes_locations[self.counter]
-            start_node_name = self.start_nodes[self.counter]
-            self.annotate_node(frame, point=start_pos, node=start_node_name, t=1)
+            if self.frame_time < self.start_node_delay_until:
+                _remaining = (self.start_node_delay_until - self.frame_time) / 1000
+                cv2.putText(frame, f'Start node in {_remaining:.1f}s...', (60, 80),
+                            fontFace=FONT, fontScale=0.75, color=(255, 200, 80), thickness=1)
+            else:
+                cv2.putText(frame, 'Waiting start new trial...', (60, 80),
+                            fontFace=FONT, fontScale=0.75, color=(255, 255, 255), thickness=1)
+                start_pos = self.start_nodes_locations[self.counter]
+                start_node_name = self.start_nodes[self.counter]
+                self.annotate_node(frame, point=start_pos, node=start_node_name, t=1)
 
         # Inside annotate_frame, find the 'record_detections' block:
         if self.record_detections:
@@ -1030,6 +1032,15 @@ class Tracker:
                 _dist_to_goal = points_dist(self.pos_centroid, self.goal_location)
                 cv2.putText(frame, f'Dist to goal: {_dist_to_goal:.1f}px', (60, 136),
                             fontFace=FONT, fontScale=0.65, color=(255, 200, 100), thickness=1)
+
+            _is_dnr = (self.counter < len(self.did_not_reach_list) and
+                       self.did_not_reach_list[self.counter] == 1)
+            if _is_dnr:
+                _res_detected = bool(self.all_researchers)
+                _dnr_color = (0, 60, 255) if _res_detected else (255, 255, 255)
+                _dnr_label = 'DNR: researcher detected - ENDING' if _res_detected else 'DNR: waiting for researcher...'
+                cv2.putText(frame, _dnr_label, (60, 154),
+                            fontFace=FONT, fontScale=0.65, color=_dnr_color, thickness=1)
 
             if self.probe and self.goal_location:
                 _probe_min = (self.frame_time / (1000 * 60)) % 60 - self.start_time

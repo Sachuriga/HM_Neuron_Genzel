@@ -246,6 +246,14 @@ Reads Trodes-exported LFP channels and exports them to NWB or CSV format.
 
 ---
 
+## Node Analysis
+
+Behavioral metrics computed from trial node sequences (shortest path ratios, island entries, performance scores, etc.) are handled by `src/node_analysis/hex_maze_analysis.py`.
+
+For a full explanation of every computed column, see [`src/node_analysis/README.md`](src/node_analysis/README.md).
+
+---
+
 ## Metadata
 
 `RecordingMeta.xlsx` contains per-session information (subject ID, date, trial structure, etc.) read by the tracker and plotting scripts. Update this file before running a new batch.
