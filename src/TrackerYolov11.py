@@ -217,6 +217,7 @@ class Tracker:
         
         self.special_trials = self.metadata['special_trials_list']
         self.did_not_reach_list = self.metadata.get('did_not_reach_list', [])
+        self.xlsx_src_path = self.metadata.get('xlsx_src_path', None)
         self.repeat = self.metadata['repeat']
         self.day_num = self.metadata['day']
         self.session_num = self.metadata['session']
@@ -266,6 +267,7 @@ class Tracker:
         self.unnormal_intervals = self.metadata.get('unnormal_intervals', {})
         self._last_end_reason = "n/a"
         self._last_end_frame_time = -1e9
+        self.trial_delays = []  # list of (trial_num, delay_seconds)
 
         self.goal_residence_timer = 0.0
         self.centroid_list = deque(maxlen=500)
@@ -390,6 +392,7 @@ class Tracker:
         pbar.close()
         
         self.export_tracking_data()
+        self.post_process_xlsx()
 
         end = time.time()
         hours, rem = divmod(end - self.Start_Time, 3600)
@@ -822,22 +825,22 @@ class Tracker:
                         self.end_trial(reason="NGL 10min timeout")
 
         trial_elapsed_ms = self.frame_time - self.last_trial_start_time_ms
-        researcher_trigger_allowed = trial_elapsed_ms >= 6_000
+        researcher_trigger_allowed = trial_elapsed_ms >= 5_000
 
-        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 500px of the rat
+        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 240px of the rat
         if researcher_trigger_allowed:
             _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
             if _curr_type not in (3, 4, 5, 6):
                 _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
                 if _closest_to_rat is not None:
                     _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
-                    if _res_rat_dist <= 500:
-                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 500px of rat ({_res_rat_dist:.0f}px), ending trial')
+                    if _res_rat_dist <= 240:
+                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 240px of rat ({_res_rat_dist:.0f}px), ending trial')
                         self.normal_trial = False
                         self.NGL = False
                         self.probe = False
                         self.probe_researcher_signalled = False
-                        self.end_trial(reason="researcher near rat 500px")
+                        self.end_trial(reason="researcher near rat 240px")
                         return
 
         if self.probe:
@@ -877,6 +880,8 @@ class Tracker:
     def end_trial(self, reason="unknown"):
         self._last_end_reason = reason
         self._last_end_frame_time = self.frame_time
+        _delay_s = round((self.frame_time - self.last_trial_start_time_ms) / 1000, 2)
+        self.trial_delays.append((self.trial_num, _delay_s))
         print(f'\n[END_TRIAL] trial={self.trial_num} counter={self.counter} reason="{reason}" '
               f'frame_time={self.frame_time/1000:.2f}s '
               f'normal={self.normal_trial} NGL={self.NGL} probe={self.probe} immune={self.check_immunity()}')
@@ -1114,8 +1119,8 @@ class Tracker:
                 _closest = self.closest_researcher_to(self.pos_centroid)
                 if _closest is not None:
                     _res_rat_dist = points_dist(_closest, self.pos_centroid)
-                    _res_rat_color = (0, 60, 255) if _res_rat_dist <= 500 else (255, 255, 255)
-                    _res_rat_label = f'Res->rat {_res_rat_dist:.0f}px (thr:500) - {"ENDING" if _res_rat_dist <= 500 else "waiting"}'
+                    _res_rat_color = (0, 60, 255) if _res_rat_dist <= 240 else (255, 255, 255)
+                    _res_rat_label = f'Res->rat {_res_rat_dist:.0f}px (thr:240) - {"ENDING" if _res_rat_dist <= 240 else "waiting"}'
                 else:
                     _res_rat_color = (255, 255, 255)
                     _res_rat_label = 'Res->rat: no researcher detected'
@@ -1176,6 +1181,83 @@ class Tracker:
                 line = " ".join(map(str, self.summary_trial[i]))
                 file.write(line + '\n')
             file.write('\n')
+
+    def post_process_xlsx(self):
+        import shutil
+        import openpyxl
+
+        if not self.xlsx_src_path or not os.path.exists(self.xlsx_src_path):
+            print("[POST] No source xlsx found, skipping post-processing.")
+            return
+
+        # --- Copy xlsx to output folder ---
+        xlsx_dst = os.path.join(self.out_path, os.path.basename(self.xlsx_src_path))
+        shutil.copy2(self.xlsx_src_path, xlsx_dst)
+        print(f"[POST] Copied RecordingMeta.xlsx to: {xlsx_dst}")
+
+        # --- Parse txt file for paths per trial ---
+        paths_by_trial = {}
+        if os.path.exists(self.save):
+            with open(self.save, 'r') as f:
+                content = f.read()
+            current_path = None
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith('Summary Trial'):
+                    try:
+                        trial_num_txt = int(line.split('Summary Trial')[1].strip())
+                        if current_path is not None:
+                            paths_by_trial[trial_num_txt] = current_path
+                        current_path = None
+                    except ValueError:
+                        pass
+                elif (current_path is None and line
+                      and not line.startswith('Trial End')
+                      and not line.startswith('Start-Next')
+                      and not line.startswith('Rat number')):
+                    # Node path lines contain only numbers and commas
+                    nodes = [n.strip() for n in line.split(',') if n.strip().isdigit()]
+                    if nodes:
+                        current_path = ' > '.join(nodes)
+
+        # --- Build delay lookup by trial_num ---
+        delays_by_trial = {tn: d for tn, d in self.trial_delays}
+
+        # --- Write new columns into copied xlsx ---
+        try:
+            wb = openpyxl.load_workbook(xlsx_dst)
+            ws = wb.active
+
+            # Find header row (row 1) and last used column
+            headers = [cell.value for cell in ws[1]]
+            last_col = len(headers) + 1
+
+            # Add headers if not already present
+            if 'paths' not in headers:
+                ws.cell(row=1, column=last_col, value='paths')
+                path_col = last_col
+                last_col += 1
+            else:
+                path_col = headers.index('paths') + 1
+
+            if 'delay' not in headers:
+                ws.cell(row=1, column=last_col, value='delay')
+                delay_col = last_col
+            else:
+                delay_col = headers.index('delay') + 1
+
+            # Fill rows: row 2 = trial 1, row 3 = trial 2, ...
+            num_trials = int(self.num_trials)
+            for i in range(num_trials):
+                trial_num = i + 1
+                row = i + 2
+                ws.cell(row=row, column=path_col, value=paths_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=delay_col, value=delays_by_trial.get(trial_num, ''))
+
+            wb.save(xlsx_dst)
+            print(f"[POST] Updated xlsx with 'paths' and 'delay' columns ({num_trials} trials).")
+        except Exception as e:
+            print(f"[POST] Failed to update xlsx: {e}")
 
     def find_location(self, start_nodes, goal_nodes):
         nodes_dict = self.nodes_dict
@@ -1292,8 +1374,9 @@ if __name__ == "__main__":
             print(f"ERROR: No file found matching pattern '*RecordingMeta.xlsx' in folder: {in_p}")
             sys.exit(1)
             
-        xlsx_file = meta_files[0] 
+        xlsx_file = meta_files[0]
         metadata = parse_metadata_xlsx(xlsx_file)
+        metadata['xlsx_src_path'] = xlsx_file
 
         # 3. Start Tracker
         tracker = Tracker(vp=vid_p, nl=node_list, out=out_p, metadata=metadata, onnx_weight=model_path)
