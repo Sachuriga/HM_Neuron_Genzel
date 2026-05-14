@@ -820,28 +820,12 @@ class Tracker:
                         self.end_trial()
 
         trial_elapsed_ms = self.frame_time - self.last_trial_start_time_ms
-        researcher_trigger_allowed = trial_elapsed_ms >= 10_000
+        researcher_trigger_allowed = trial_elapsed_ms >= 3_000
 
-        # DNR: end trial when researcher reaches within 300px of the rat
-        if is_did_not_reach and researcher_trigger_allowed:
-            closest_to_rat = self.closest_researcher_to(self.pos_centroid)
-            if closest_to_rat is not None:
-                dnr_dist = points_dist(closest_to_rat, self.pos_centroid)
-                if dnr_dist <= 500:
-                    print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} - researcher near rat ({dnr_dist:.0f}px), skipping to next trial')
-                    self.start_node_delay_until = self.frame_time + 5000
-                    self.normal_trial = False
-                    self.NGL = False
-                    self.probe = False
-                    self.probe_researcher_signalled = False
-                    self.end_trial()
-                    return
-
-        # General rule: for all trial types except probe (3) and type 6,
-        # end the trial immediately when researcher is within 500px of the rat
+        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 500px of the rat
         if researcher_trigger_allowed:
             _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
-            if _curr_type not in (3, 6):
+            if _curr_type not in (3, 4, 5, 6):
                 _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
                 if _closest_to_rat is not None:
                     _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
@@ -849,6 +833,8 @@ class Tracker:
                         print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 500px of rat ({_res_rat_dist:.0f}px), ending trial')
                         self.normal_trial = False
                         self.NGL = False
+                        self.probe = False
+                        self.probe_researcher_signalled = False
                         self.end_trial()
                         return
 
@@ -1075,19 +1061,18 @@ class Tracker:
                 cv2.putText(frame, f'Dist to goal: {_dist_to_goal:.1f}px', (60, 136),
                             fontFace=FONT, fontScale=0.65, color=(255, 200, 100), thickness=1)
 
-            _is_dnr = (self.counter < len(self.did_not_reach_list) and
-                       self.did_not_reach_list[self.counter] == 1)
-            if _is_dnr and self.pos_centroid:
+            _curr_type_dbg = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
+            if _curr_type_dbg not in (3, 4, 5, 6) and self.pos_centroid:
                 _closest = self.closest_researcher_to(self.pos_centroid)
                 if _closest is not None:
-                    _dnr_dist = points_dist(_closest, self.pos_centroid)
-                    _dnr_color = (0, 60, 255) if _dnr_dist <= 500 else (255, 255, 255)
-                    _dnr_label = f'DNR: res->rat {_dnr_dist:.0f}px (thr:500) - {"ENDING" if _dnr_dist <= 500 else "waiting"}'
+                    _res_rat_dist = points_dist(_closest, self.pos_centroid)
+                    _res_rat_color = (0, 60, 255) if _res_rat_dist <= 500 else (255, 255, 255)
+                    _res_rat_label = f'Res->rat {_res_rat_dist:.0f}px (thr:500) - {"ENDING" if _res_rat_dist <= 500 else "waiting"}'
                 else:
-                    _dnr_color = (255, 255, 255)
-                    _dnr_label = 'DNR: no researcher detected'
-                cv2.putText(frame, _dnr_label, (60, 154),
-                            fontFace=FONT, fontScale=0.65, color=_dnr_color, thickness=1)
+                    _res_rat_color = (255, 255, 255)
+                    _res_rat_label = 'Res->rat: no researcher detected'
+                cv2.putText(frame, _res_rat_label, (60, 154),
+                            fontFace=FONT, fontScale=0.65, color=_res_rat_color, thickness=1)
 
             if self.probe and self.goal_location:
                 _probe_min = (self.frame_time / (1000 * 60)) % 60 - self.start_time
