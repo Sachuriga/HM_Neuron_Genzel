@@ -243,8 +243,10 @@ class Tracker:
         self.last_trial_start_time_ms = -1e9  # Added
         self.lockout_duration_ms = 10 * 60 * 1000  
         
-        self.last_rat_pos = None        
-        self.last_researcher_pos = None 
+        self.last_rat_pos = None
+        self.last_researcher_pos = None
+        self.prev_frame_gray = None
+        self.motion_skip_threshold = 500  # changed pixels below this → skip YOLO
 
         if self.start_point is None:
            self.trial_num = 1
@@ -494,8 +496,24 @@ class Tracker:
             return None
         return min(self.all_researchers, key=lambda r: points_dist(r, point))
 
+    def compute_motion(self, frame):
+        """Return True if enough pixels changed since the last frame, False otherwise.
+        Always updates self.prev_frame_gray so comparisons stay current even on skipped frames."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        prev = self.prev_frame_gray
+        self.prev_frame_gray = gray
+
+        if prev is None:
+            return True  # first frame — always detect
+
+        diff = cv2.absdiff(gray, prev)
+        _, thresh = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+        thresh = cv2.dilate(thresh, None, iterations=3)
+        return cv2.countNonZero(thresh) >= self.motion_skip_threshold
+
     def cnn(self, frame):
-        results = self.model(frame, conf=0.7, verbose=False, imgsz=1280)
+        has_motion = self.compute_motion(frame)
 
         self.Rat = None
         self.Researcher = None
@@ -507,28 +525,30 @@ class Tracker:
         detected_head_this_frame = False
         detected_rat_body_this_frame = False
 
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                confidence = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                label = self.model_names[cls_id]
-                centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        if has_motion:
+            results = self.model(frame, conf=0.7, verbose=False, imgsz=1280)
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    confidence = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    label = self.model_names[cls_id]
+                    centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-                color = colors[cls_id % len(colors)]
-                cv2.rectangle(self.disp_frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
-                            (x1, y1 + 20), font, 1, (255, 255, 255), 1)
+                    color = colors[cls_id % len(colors)]
+                    cv2.rectangle(self.disp_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
+                                (x1, y1 + 20), font, 1, (255, 255, 255), 1)
 
-                if label == 'head':
-                    rat_candidates.append((confidence, centroid, 'head'))
-                    detected_head_this_frame = True
-                elif label == 'rat':
-                    rat_candidates.append((confidence, centroid, 'rat'))
-                    detected_rat_body_this_frame = True
-                elif label == 'researcher':
-                    researcher_candidates.append((confidence, centroid))
+                    if label == 'head':
+                        rat_candidates.append((confidence, centroid, 'head'))
+                        detected_head_this_frame = True
+                    elif label == 'rat':
+                        rat_candidates.append((confidence, centroid, 'rat'))
+                        detected_rat_body_this_frame = True
+                    elif label == 'researcher':
+                        researcher_candidates.append((confidence, centroid))
 
         # --- RAT SELECTION (unchanged) ---
         if rat_candidates:
@@ -799,16 +819,20 @@ class Tracker:
                         self.reached = False
                         self.end_trial()
 
-        # DNR: if researcher detected at any point during trial → skip immediately
-        if is_did_not_reach and self.all_researchers:
-            print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} - researcher detected, skipping to next trial')
-            self.start_node_delay_until = self.frame_time + 5000
-            self.normal_trial = False
-            self.NGL = False
-            self.probe = False
-            self.probe_researcher_signalled = False
-            self.end_trial()
-            return
+        # DNR: end trial when researcher reaches within 300px of the goal node
+        if is_did_not_reach and self.goal_location is not None:
+            closest_to_goal = self.closest_researcher_to(self.goal_location)
+            if closest_to_goal is not None:
+                dnr_dist = points_dist(closest_to_goal, self.goal_location)
+                if dnr_dist <= 300:
+                    print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} - researcher at goal ({dnr_dist:.0f}px), skipping to next trial')
+                    self.start_node_delay_until = self.frame_time + 5000
+                    self.normal_trial = False
+                    self.NGL = False
+                    self.probe = False
+                    self.probe_researcher_signalled = False
+                    self.end_trial()
+                    return
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
@@ -1035,10 +1059,15 @@ class Tracker:
 
             _is_dnr = (self.counter < len(self.did_not_reach_list) and
                        self.did_not_reach_list[self.counter] == 1)
-            if _is_dnr:
-                _res_detected = bool(self.all_researchers)
-                _dnr_color = (0, 60, 255) if _res_detected else (255, 255, 255)
-                _dnr_label = 'DNR: researcher detected - ENDING' if _res_detected else 'DNR: waiting for researcher...'
+            if _is_dnr and self.goal_location:
+                _closest = self.closest_researcher_to(self.goal_location)
+                if _closest is not None:
+                    _dnr_dist = points_dist(_closest, self.goal_location)
+                    _dnr_color = (0, 60, 255) if _dnr_dist <= 300 else (255, 255, 255)
+                    _dnr_label = f'DNR: res->goal {_dnr_dist:.0f}px (thr:300) - {"ENDING" if _dnr_dist <= 300 else "waiting"}'
+                else:
+                    _dnr_color = (255, 255, 255)
+                    _dnr_label = 'DNR: no researcher detected'
                 cv2.putText(frame, _dnr_label, (60, 154),
                             fontFace=FONT, fontScale=0.65, color=_dnr_color, thickness=1)
 
