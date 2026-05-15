@@ -94,6 +94,8 @@ setuptools==82.0.1
 shapely==2.1.2
 shellingham==1.5.4
 shiboken6==6.10.2
+sleap-io==0.7.0 
+sleap-nn==0.2.0
 sip==6.15.2
 six==1.17.0
 skops==0.13.0
