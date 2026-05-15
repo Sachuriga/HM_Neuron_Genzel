@@ -139,12 +139,20 @@ class Tracker:
                  print("Loaded timestamp file: " + os.path.basename(specific_ts_path))
                  self.ts_file_loaded = True
             else:
-                 stitched_ts_path = os.path.join(out, 'stitched_framewise_ts.csv')
-                 if os.path.exists(stitched_ts_path):
-                     print("Specific timestamp file not found. Loading 'stitched_framewise_ts.csv'...")
-                     self.sync_ts_dict = pd.read_csv(stitched_ts_path, index_col=0).to_dict()
-                     self.ts_file_loaded = True
-                 else:
+                 candidates = [
+                     'stitched_framewise_seconds.csv',
+                     'stitched_framewise_ts.csv',
+                 ]
+                 loaded = False
+                 for fname in candidates:
+                     p = os.path.join(out, fname)
+                     if os.path.exists(p):
+                         print(f"Specific timestamp file not found. Loading '{fname}'...")
+                         self.sync_ts_dict = pd.read_csv(p, index_col=0).to_dict()
+                         self.ts_file_loaded = True
+                         loaded = True
+                         break
+                 if not loaded:
                      raise FileNotFoundError
         except Exception:
              print("Warning: No timestamp CSV found. Logs might lack sync times.")
@@ -267,7 +275,10 @@ class Tracker:
         self.unnormal_intervals = self.metadata.get('unnormal_intervals', {})
         self._last_end_reason = "n/a"
         self._last_end_frame_time = -1e9
-        self.trial_delays = []  # list of (trial_num, delay_seconds)
+        self.trial_delays = []       # list of (trial_num, delay_seconds)
+        self.trial_speed_stats = []  # list of (trial_num, avg_speed, avg_between_node_speed)
+        self.trial_times = []        # list of (trial_num, start_ts, end_ts)
+        self.current_trial_start_ts = ''
 
         self.goal_residence_timer = 0.0
         self.centroid_list = deque(maxlen=500)
@@ -353,7 +364,7 @@ class Tracker:
             
             rat_x = self.pos_centroid[0] if self.pos_centroid else np.nan
             rat_y = self.pos_centroid[1] if self.pos_centroid else np.nan
-            
+
             res_x = self.Researcher[0] if self.Researcher else np.nan
             res_y = self.Researcher[1] if self.Researcher else np.nan
 
@@ -452,6 +463,8 @@ class Tracker:
             
             # --- RECORD TRIAL START TIME ---
             self.last_trial_start_time_ms = self.frame_time
+            curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            self.current_trial_start_ts = self.sync_ts_dict.get(self.ts_column_name, {}).get(curr_idx, '')
             # -------------------------------
             
             current_trial_type = int(self.trial_types[self.counter])
@@ -533,7 +546,7 @@ class Tracker:
 
         if has_motion:
             results = self.model(frame, conf=0.7, verbose=False, imgsz=1280)
-            self.last_detection_boxes = []
+            current_boxes = []
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
@@ -542,16 +555,20 @@ class Tracker:
                     cls_id = int(box.cls[0])
                     label = self.model_names[cls_id]
                     centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                    self.last_detection_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
+                    current_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
 
                     if label == 'head':
-                        rat_candidates.append((confidence, centroid, 'head'))
                         detected_head_this_frame = True
                     elif label == 'rat':
-                        rat_candidates.append((confidence, centroid, 'rat'))
+                        rat_candidates.append((confidence, centroid))
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
                         researcher_candidates.append((confidence, centroid))
+
+            # Only update cache when YOLO actually found something;
+            # keeping stale boxes on missed frames prevents flash
+            if current_boxes:
+                self.last_detection_boxes = current_boxes
 
         # Always redraw last known boxes so display doesn't flash on skipped frames
         for x1, y1, x2, y2, label, confidence, cls_id in self.last_detection_boxes:
@@ -560,19 +577,10 @@ class Tracker:
             cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
                         (x1, y1 + 20), font, 1, (255, 255, 255), 1)
 
-        # --- RAT SELECTION (unchanged) ---
+        # --- RAT SELECTION: always use body ---
         if rat_candidates:
             rat_candidates.sort(key=lambda x: x[0], reverse=True)
-            best_conf, best_centroid, best_label = rat_candidates[0]
-
-            if best_label == 'head':
-                self.locked_to_head = True
-
-            if self.locked_to_head and best_label != 'head':
-                head_cands = [c for c in rat_candidates if c[2] == 'head']
-                if head_cands:
-                    _, best_centroid, _ = head_cands[0]
-
+            _, best_centroid = rat_candidates[0]
             self.Rat = best_centroid
 
         # --- RESEARCHER SELECTION: store ALL positions ---
@@ -887,6 +895,9 @@ class Tracker:
         self._last_end_frame_time = self.frame_time
         _delay_s = round((self.frame_time - self.last_trial_start_time_ms) / 1000, 2)
         self.trial_delays.append((self.trial_num, _delay_s))
+        _curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        _end_ts = self.sync_ts_dict.get(self.ts_column_name, {}).get(_curr_idx, '')
+        self.trial_times.append((self.trial_num, self.current_trial_start_ts, _end_ts))
         print(f'\n[END_TRIAL] trial={self.trial_num} counter={self.counter} reason="{reason}" '
               f'frame_time={self.frame_time/1000:.2f}s '
               f'normal={self.normal_trial} NGL={self.NGL} probe={self.probe} immune={self.check_immunity()}')
@@ -896,6 +907,16 @@ class Tracker:
         self.annotate_frame(self.disp_frame)
 
         self.calculate_velocity(self.time_points)
+
+        if self.summary_trial:
+            total_dist = sum(seg[3] for seg in self.summary_trial)
+            total_time_s = sum(seg[2] for seg in self.summary_trial)
+            avg_speed = round(total_dist / total_time_s, 3) if total_time_s > 0 else ''
+        else:
+            avg_speed = ''
+        avg_between_node = round(sum(self.saved_velocities) / len(self.saved_velocities), 3) if self.saved_velocities else ''
+        self.trial_speed_stats.append((self.trial_num, avg_speed, avg_between_node))
+
         self.save_to_file(self.save)
         self.last_trial_end_time = self.frame_time
 
@@ -1187,6 +1208,40 @@ class Tracker:
                 file.write(line + '\n')
             file.write('\n')
 
+    def _close_excel_if_open(self, filepath):
+        """Quit Excel if it has filepath locked, then wait until the lock releases."""
+        import platform
+        import subprocess
+
+        def is_locked(path):
+            if not os.path.exists(path):
+                return False
+            try:
+                with open(path, 'a'):
+                    return False
+            except (IOError, PermissionError):
+                return True
+
+        if not is_locked(filepath):
+            return
+
+        print(f"[POST] '{os.path.basename(filepath)}' is open — closing Excel...")
+        system = platform.system()
+        if system == 'Darwin':
+            subprocess.run(
+                ['osascript', '-e', 'tell application "Microsoft Excel" to quit saving no'],
+                capture_output=True
+            )
+        elif system == 'Windows':
+            subprocess.run(['taskkill', '/f', '/im', 'EXCEL.EXE'], capture_output=True)
+
+        for _ in range(20):
+            time.sleep(0.5)
+            if not is_locked(filepath):
+                print("[POST] Excel closed successfully.")
+                return
+        print("[POST] Warning: file may still be locked — proceeding anyway.")
+
     def post_process_xlsx(self):
         import shutil
         import openpyxl
@@ -1197,6 +1252,7 @@ class Tracker:
 
         # --- Copy xlsx to output folder ---
         xlsx_dst = os.path.join(self.out_path, os.path.basename(self.xlsx_src_path))
+        self._close_excel_if_open(self.xlsx_src_path)
         shutil.copy2(self.xlsx_src_path, xlsx_dst)
         print(f"[POST] Copied RecordingMeta.xlsx to: {xlsx_dst}")
 
@@ -1225,8 +1281,12 @@ class Tracker:
                     if nodes:
                         current_path = ','.join(nodes)
 
-        # --- Build delay lookup by trial_num ---
+        # --- Build lookups by trial_num ---
         delays_by_trial = {tn: d for tn, d in self.trial_delays}
+        avg_speed_by_trial = {tn: s for tn, s, _ in self.trial_speed_stats}
+        avg_node_speed_by_trial = {tn: ns for tn, _, ns in self.trial_speed_stats}
+        start_ts_by_trial = {tn: s for tn, s, _ in self.trial_times}
+        end_ts_by_trial = {tn: e for tn, _, e in self.trial_times}
 
         # --- Write new columns into copied xlsx ---
         try:
@@ -1237,30 +1297,40 @@ class Tracker:
             headers = [cell.value for cell in ws[1]]
             last_col = len(headers) + 1
 
-            # Add headers if not already present
-            if 'paths' not in headers:
-                ws.cell(row=1, column=last_col, value='paths')
-                path_col = last_col
-                last_col += 1
-            else:
-                path_col = headers.index('paths') + 1
+            def get_or_add_col(name):
+                nonlocal last_col
+                if name not in headers:
+                    ws.cell(row=1, column=last_col, value=name)
+                    col = last_col
+                    last_col += 1
+                else:
+                    col = headers.index(name) + 1
+                return col
 
-            if 'delay' not in headers:
-                ws.cell(row=1, column=last_col, value='delay')
-                delay_col = last_col
-            else:
-                delay_col = headers.index('delay') + 1
+            path_col          = get_or_add_col('paths')
+            delay_col         = get_or_add_col('delay')
+            active_time_col   = get_or_add_col('active_time')
+            avg_speed_col     = get_or_add_col('avg_speed')
+            avg_node_col      = get_or_add_col('avg_between_node_speed')
+            start_ts_col      = get_or_add_col('trial_start_time')
+            end_ts_col        = get_or_add_col('trial_end_time')
 
             # Fill rows: row 2 = trial 1, row 3 = trial 2, ...
             num_trials = int(self.num_trials)
             for i in range(num_trials):
                 trial_num = i + 1
                 row = i + 2
-                ws.cell(row=row, column=path_col, value=paths_by_trial.get(trial_num, ''))
-                ws.cell(row=row, column=delay_col, value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=path_col,        value=paths_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=delay_col,       value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=active_time_col, value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=avg_speed_col,   value=avg_speed_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=avg_node_col,    value=avg_node_speed_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=start_ts_col,    value=start_ts_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=end_ts_col,      value=end_ts_by_trial.get(trial_num, ''))
 
+            self._close_excel_if_open(xlsx_dst)
             wb.save(xlsx_dst)
-            print(f"[POST] Updated xlsx with 'paths' and 'delay' columns ({num_trials} trials).")
+            print(f"[POST] Updated xlsx with paths, active_time, avg_speed, avg_between_node_speed, trial_start/end_time ({num_trials} trials).")
         except Exception as e:
             print(f"[POST] Failed to update xlsx: {e}")
 

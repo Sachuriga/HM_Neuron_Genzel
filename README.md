@@ -139,11 +139,11 @@ Every frame is passed through YOLOv11 at confidence threshold 0.7 and input size
 
 | Class | Meaning |
 |---|---|
-| `head` | Rat's head (preferred for position) |
-| `rat` | Rat's body (fallback) |
+| `head` | Rat's head (counted only) |
+| `rat` | Rat's body (used for position) |
 | `researcher` | Human experimenter |
 
-**Rat position selection** — All detections are collected and sorted by confidence. If a `head` box is found, the tracker locks onto head detections (`locked_to_head = True`) and ignores body boxes for the rest of the trial. If no detection fires on a frame, the last known position (`last_rat_pos`) is carried forward so the state machine never stalls.
+**Rat position selection** — Only `rat` (body) detections are used for position. All body candidates are sorted by confidence and the highest-confidence box is selected. Head detections are tracked separately for the `Rat-head Count` overlay but do not influence the centroid. If no body detection fires on a frame, the last known position (`last_rat_pos`) is carried forward so the state machine never stalls.
 
 **Researcher selection** — All `researcher` boxes are stored. The one geometrically closest to the rat's active position is used for trial-trigger and force-end logic. This handles the common case of multiple people visible in the arena.
 
@@ -219,8 +219,23 @@ Segment lengths are either looked up from a hardcoded bridge table (known physic
 | `<date>_Rat<id>.txt` | Per-trial node sequence, segment timing, and velocity summary |
 | `<date>_Rat<id>_Coordinates_Full.csv` | Per-frame: `Frame_Index`, `Timestamp` (sync seconds), `Trial_Num`, `Rat_X/Y`, `Researcher_X/Y` |
 | `<date>_Rat<id>.mp4` | Annotated video: bounding boxes, centroid trail (pink), crosshair, node markers, start/goal overlays, FPS counter |
+| `<RecordingMeta>.xlsx` (copy) | Source metadata with the following columns appended per trial (see table below) |
 
 The CSV timestamps are merged from the LED-ICA sync file produced in Step 2, so each frame carries an absolute time reference aligned to the neural recording.
+
+#### RecordingMeta output columns
+
+| Column | Description |
+|---|---|
+| `paths` | Comma-separated sequence of visited node IDs (e.g. `101,202,303`) |
+| `delay` | Trial duration in seconds (start node entry → end condition) |
+| `active_time` | Same as `delay` — trial duration in seconds |
+| `avg_speed` | Overall trial speed: total path distance ÷ total path time (m/s) |
+| `avg_between_node_speed` | Mean of per-segment speeds across all node transitions (m/s) |
+| `trial_start_time` | Sync timestamp (seconds) at the moment the rat enters the start node |
+| `trial_end_time` | Sync timestamp (seconds) at the moment the trial end condition fires |
+
+`trial_start_time` and `trial_end_time` are populated only when a framewise timestamp CSV is present in the output folder (`stitched_framewise_seconds.csv`, `stitched_framewise_ts.csv`, or `<date>_Rat<id>_framewise_ts.csv` — checked in that order). If no file is found, those columns are left empty.
 
 ---
 
