@@ -294,6 +294,7 @@ class Tracker:
         
         self.researcher_goal_timer = 0.0
         self.pickup_timer = 0.0
+        self.last_detection_boxes = []  # cached boxes for skipped frames
 
     def run_vid(self):
         print('\nStarting video processing (Live Stream Enabled).....\n')
@@ -532,6 +533,7 @@ class Tracker:
 
         if has_motion:
             results = self.model(frame, conf=0.7, verbose=False, imgsz=1280)
+            self.last_detection_boxes = []
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
@@ -540,11 +542,7 @@ class Tracker:
                     cls_id = int(box.cls[0])
                     label = self.model_names[cls_id]
                     centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-
-                    color = colors[cls_id % len(colors)]
-                    cv2.rectangle(self.disp_frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
-                                (x1, y1 + 20), font, 1, (255, 255, 255), 1)
+                    self.last_detection_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
 
                     if label == 'head':
                         rat_candidates.append((confidence, centroid, 'head'))
@@ -554,6 +552,13 @@ class Tracker:
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
                         researcher_candidates.append((confidence, centroid))
+
+        # Always redraw last known boxes so display doesn't flash on skipped frames
+        for x1, y1, x2, y2, label, confidence, cls_id in self.last_detection_boxes:
+            color = colors[cls_id % len(colors)]
+            cv2.rectangle(self.disp_frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
+                        (x1, y1 + 20), font, 1, (255, 255, 255), 1)
 
         # --- RAT SELECTION (unchanged) ---
         if rat_candidates:
@@ -1218,7 +1223,7 @@ class Tracker:
                     # Node path lines contain only numbers and commas
                     nodes = [n.strip() for n in line.split(',') if n.strip().isdigit()]
                     if nodes:
-                        current_path = ' > '.join(nodes)
+                        current_path = ','.join(nodes)
 
         # --- Build delay lookup by trial_num ---
         delays_by_trial = {tn: d for tn, d in self.trial_delays}
