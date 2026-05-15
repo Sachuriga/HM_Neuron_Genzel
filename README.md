@@ -81,13 +81,19 @@ HM_Tracker_2025/
 
 ### 1. Environment
 
-```bash
+**Option A — automated (recommended):** double-click `install.bat` or run it from an Anaconda Prompt.
+
+**Option B — manual:**
+
+```bat
 conda env create -f reproduce.yml
 conda activate HM_neuron
 pip install -r requirements.txt
 ```
 
-> Requires a CUDA-capable GPU. PyTorch is installed with CUDA 12.8 support (`torch==2.10.0+cu128`).
+> Requires a CUDA-capable GPU and **CUDA 12.8** drivers. PyTorch (`torch==2.10.0+cu128`) is fetched automatically from `download.pytorch.org` — no manual download needed.
+>
+> If `conda env create` freezes, make sure you are using **Python 3.10** and that no older `HM_neuron` environment already exists (`conda env remove -n HM_neuron`).
 
 ### 2. External tools
 

@@ -32,26 +32,36 @@ The paths in `hm_tracker_paths.txt` are incorrect or Trodes is not installed.
 
 ## Python Environment Issues
 
-**Error: Package not found, version conflict, or import error**
+**`conda env create` freezes or hangs**
 
-The environment requires Python 3.10 with specific package versions.
+The most common causes are a Python version that conflicts with neuro packages, or a contradictory numpy constraint that the solver cannot resolve.
 
-1. Re-create the conda environment from scratch:
+1. Remove any existing environment and re-create from the current `reproduce.yml` (which uses Python 3.10):
    ```
-   conda env remove -n hm_tracker
+   conda env remove -n HM_neuron
    conda env create -f reproduce.yml
-   conda activate hm_tracker
+   conda activate HM_neuron
+   pip install -r requirements.txt
    ```
 
-2. If numpy-related errors appear, enforce the version constraint:
+2. If it still hangs, use the faster `libmamba` solver:
    ```
-   pip install "numpy<2.0.0"
+   conda install -n base conda-libmamba-solver
+   conda config --set solver libmamba
+   conda env create -f reproduce.yml
    ```
 
-3. If Qt-related errors appear (PyQt / PySide conflict), only one Qt binding is allowed. Remove the other:
+**Error: Package not found, version conflict, or import error after pip install**
+
+1. Verify the PyTorch index URL is present at the top of `requirements.txt`:
    ```
-   pip uninstall pyqt5 pyside2 pyside6
-   pip install pyqt6
+   --extra-index-url https://download.pytorch.org/whl/cu128
+   ```
+   Without this line, `torch==2.10.0+cu128` cannot be found and pip will fail.
+
+2. If Qt-related errors appear, only one Qt binding is allowed. `PySide6` has been removed from `requirements.txt` — if it was previously installed, uninstall it:
+   ```
+   pip uninstall PySide6 shiboken6
    ```
 
 ---
