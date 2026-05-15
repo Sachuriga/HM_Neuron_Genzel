@@ -37,7 +37,7 @@ echo.
 echo [3/3] Installing Python packages (this may take 10-20 minutes)...
 echo       PyTorch (CUDA 12.8) will be fetched from download.pytorch.org
 echo.
-pip install -r requirements.txt
+pip install -r requirements_core.txt
 if errorlevel 1 (
     echo.
     echo [ERROR] pip install failed.
@@ -49,6 +49,10 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+echo.
+echo Saving exact installed versions to requirements_lock.txt...
+pip freeze > requirements_lock.txt
 
 echo.
 echo ============================================================
