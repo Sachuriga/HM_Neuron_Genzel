@@ -1,0 +1,59 @@
+# Direct dependencies only — pip resolves the rest automatically.
+# Install with:
+#   pip install -r requirements_core.txt
+#
+# After a successful install, regenerate the full lockfile with:
+#   pip freeze > requirements_lock.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# PyTorch (CUDA 12.8)
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+
+# Computer vision / tracking
+ultralytics
+opencv-python
+sahi
+pillow
+
+# Neuroscience
+spikeinterface[full]
+kilosort
+neuroconv
+ephyviewer
+probeinterface
+pynwb
+neo
+numba
+
+# Data / numerics
+numpy
+scipy
+pandas
+matplotlib
+networkx
+shapely
+polars
+h5py
+zarr
+faiss-cpu
+scikit-learn
+openpyxl
+
+# GUI
+PyQt6
+pyqtgraph
+
+# ML / deep learning extras
+huggingface_hub
+sleap-io
+sleap-nn
+
+# Utilities
+tqdm
+psutil
+requests
+PyYAML
+rich

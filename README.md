@@ -88,7 +88,7 @@ HM_Tracker_2025/
 ```bat
 conda env create -f reproduce.yml
 conda activate HM_neuron
-pip install -r requirements.txt
+pip install -r requirements_core.txt
 ```
 
 > Requires a CUDA-capable GPU and **CUDA 12.8** drivers. PyTorch (`torch==2.10.0+cu128`) is fetched automatically from `download.pytorch.org` — no manual download needed.
