@@ -34,9 +34,9 @@ The paths in `hm_tracker_paths.txt` are incorrect or Trodes is not installed.
 
 **`conda env create` freezes or hangs**
 
-The most common causes are a Python version that conflicts with neuro packages, or a contradictory numpy constraint that the solver cannot resolve.
+The most common cause is a contradictory numpy constraint that the solver cannot resolve, or an existing environment with the same name.
 
-1. Remove any existing environment and re-create from the current `reproduce.yml` (which uses Python 3.10):
+1. Remove any existing environment and re-create from the current `reproduce.yml` (Python 3.13):
    ```
    conda env remove -n HM_neuron
    conda env create -f reproduce.yml

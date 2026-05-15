@@ -93,7 +93,7 @@ pip install -r requirements.txt
 
 > Requires a CUDA-capable GPU and **CUDA 12.8** drivers. PyTorch (`torch==2.10.0+cu128`) is fetched automatically from `download.pytorch.org` — no manual download needed.
 >
-> If `conda env create` freezes, make sure you are using **Python 3.10** and that no older `HM_neuron` environment already exists (`conda env remove -n HM_neuron`).
+> If `conda env create` freezes, make sure no older `HM_neuron` environment already exists (`conda env remove -n HM_neuron`).
 
 ### 2. External tools
 
