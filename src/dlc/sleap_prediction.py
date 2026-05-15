@@ -148,12 +148,17 @@ def export_coordinates(slp_path: Path) -> Path:
 # ============================================================
 
 def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
-    """Overlay keypoints and skeleton edges from a .slp file onto the source video."""
+    """Overlay keypoints and skeleton edges onto only the predicted frames."""
     labels = sio.load_slp(str(slp_path))
     skeleton = labels.skeletons[0] if labels.skeletons else None
 
-    # Fast lookup: frame_idx -> list[Instance]
+    # Only render frames that have predictions, in order
     frame_lookup: dict[int, list] = {lf.frame_idx: lf.instances for lf in labels.labeled_frames}
+    predicted_frame_indices = sorted(frame_lookup)
+
+    if not predicted_frame_indices:
+        print("   No predicted frames to render — skipping.")
+        return slp_path
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -162,7 +167,6 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     out_video = OUTPUTS_DIR / f"{slp_path.stem}.labeled.mp4"
     writer = cv2.VideoWriter(
@@ -181,13 +185,15 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
             except ValueError:
                 pass
 
-    frame_idx = 0
-    while True:
+    n_total = len(predicted_frame_indices)
+    for i, frame_idx in enumerate(predicted_frame_indices):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
-            break
+            print(f"   WARNING: could not read frame {frame_idx}")
+            continue
 
-        for instance in frame_lookup.get(frame_idx, []):
+        for instance in frame_lookup[frame_idx]:
             coords = [(p.x, p.y, p.visible) for p in instance.points]
 
             # Skeleton edges (draw beneath keypoints)
@@ -205,9 +211,8 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
                     cv2.circle(frame, (int(x), int(y)), KEYPOINT_RADIUS, _color(kp_idx), -1)
 
         writer.write(frame)
-        frame_idx += 1
-        if frame_idx % 500 == 0:
-            print(f"   rendered {frame_idx}/{total_frames} frames …")
+        if (i + 1) % 500 == 0:
+            print(f"   rendered {i + 1}/{n_total} frames …")
 
     cap.release()
     writer.release()
