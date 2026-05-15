@@ -11,7 +11,7 @@ from sleap_nn.predict import run_inference
 # Config
 # ============================================================
 MODEL_PATH = Path(
-    r"\\genzelneuron.z.science.ru.nl\genzelneuron\code\HM_Sleap\src\models\sachi_test-2"
+    r"\\genzelneuron.z.science.ru.nl\genzelneuron\code\HM_Sleap\src\models\sachi_test"
 )
 # Source videos to process
 VIDEOS = [
