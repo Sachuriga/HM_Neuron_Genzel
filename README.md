@@ -83,7 +83,7 @@ HM_Tracker_2025/
 
 ```bash
 conda env create -f reproduce.yml
-conda activate si_trodes
+conda activate HM_neuron
 pip install -r requirements.txt
 ```
 
