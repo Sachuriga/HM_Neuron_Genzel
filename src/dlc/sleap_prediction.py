@@ -64,6 +64,13 @@ def _color(idx: int) -> tuple[int, int, int]:
     return _PALETTE[idx % len(_PALETTE)]
 
 
+def _pt(point) -> tuple[float, float, bool]:
+    """Return (x, y, visible) from either a sleap_io Point or a numpy.void row."""
+    if hasattr(point, "x"):
+        return float(point.x), float(point.y), bool(point.visible)
+    return float(point["x"]), float(point["y"]), bool(point["visible"])
+
+
 def _video_frame_count(video_path: Path) -> int:
     cap = cv2.VideoCapture(str(video_path))
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -137,15 +144,16 @@ def export_coordinates(labels: sio.Labels, out_stem: str) -> Path:
         for inst_idx, instance in enumerate(lf.instances):
             score = getattr(instance, "score", float("nan"))
             for node, point in zip(instance.skeleton.nodes, instance.points):
+                x, y, visible = _pt(point)
                 rows.append(
                     {
                         "frame_idx": lf.frame_idx,
                         "instance_idx": inst_idx,
                         "node": node.name,
-                        "x": point.x,
-                        "y": point.y,
+                        "x": x,
+                        "y": y,
                         "score": score,
-                        "visible": point.visible,
+                        "visible": visible,
                     }
                 )
 
@@ -204,7 +212,7 @@ def render_labeled_video(labels: sio.Labels, video_path: Path, out_stem: str) ->
             continue
 
         for instance in frame_lookup[frame_idx]:
-            coords = [(p.x, p.y, p.visible) for p in instance.points]
+            coords = [_pt(p) for p in instance.points]
 
             for src_i, dst_i in edge_pairs:
                 if src_i >= len(coords) or dst_i >= len(coords):
