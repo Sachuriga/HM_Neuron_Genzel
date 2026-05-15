@@ -353,7 +353,7 @@ class Tracker:
             
             rat_x = self.pos_centroid[0] if self.pos_centroid else np.nan
             rat_y = self.pos_centroid[1] if self.pos_centroid else np.nan
-            
+
             res_x = self.Researcher[0] if self.Researcher else np.nan
             res_y = self.Researcher[1] if self.Researcher else np.nan
 
@@ -533,7 +533,7 @@ class Tracker:
 
         if has_motion:
             results = self.model(frame, conf=0.7, verbose=False, imgsz=1280)
-            self.last_detection_boxes = []
+            current_boxes = []
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
@@ -542,7 +542,7 @@ class Tracker:
                     cls_id = int(box.cls[0])
                     label = self.model_names[cls_id]
                     centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                    self.last_detection_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
+                    current_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
 
                     if label == 'head':
                         rat_candidates.append((confidence, centroid, 'head'))
@@ -552,6 +552,11 @@ class Tracker:
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
                         researcher_candidates.append((confidence, centroid))
+
+            # Only update cache when YOLO actually found something;
+            # keeping stale boxes on missed frames prevents flash
+            if current_boxes:
+                self.last_detection_boxes = current_boxes
 
         # Always redraw last known boxes so display doesn't flash on skipped frames
         for x1, y1, x2, y2, label, confidence, cls_id in self.last_detection_boxes:
