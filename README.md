@@ -30,6 +30,7 @@ A batch-processing pipeline for neuroscience experiments — integrates video-ba
    - [Step 9 — Cleanup](#step-9--cleanup)
    - [Step n — Node Analysis](#step-n--node-analysis)
 8. [Tracker — How It Works](#tracker--how-it-works)
+   - [Model](#model)
 9. [Node Analysis — Computed Metrics](#node-analysis--computed-metrics)
 10. [Metadata](#metadata)
 
@@ -94,7 +95,7 @@ pip install -r requirements.txt
 |---|---|
 | [Trodes](https://spikegadgets.com/trodes/) | `.rec` file export (DIO, raw, LFP) |
 | [FFmpeg](https://ffmpeg.org/) | Multi-camera stitching and GPU-accelerated compression |
-| YOLOv11 weights | Object detection model (`.pt` file) |
+| YOLOv11 weights | Object detection model (`.pt` file) — see [Model](#model) |
 
 ### 3. Path config
 
@@ -423,6 +424,16 @@ Reads all `.xlsx` files in the input folder and computes behavioral metrics from
 ## Tracker — How It Works
 
 `src/TrackerYolov11.py` is based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT) and is built around a per-frame detect → classify → update-state loop.
+
+### Model
+
+The YOLOv11 model was trained on a custom dataset labeled by the authors specifically for this setup — rat body, rat head, and researcher detections in a hex maze environment.
+
+**Dataset:** [box_hm_rat on Roboflow Universe](https://universe.roboflow.com/rathm-wjck3/box_hm_rat) *(self-labeled)*
+
+[![Download Dataset](https://app.roboflow.com/images/download-dataset-badge.svg)](https://universe.roboflow.com/rathm-wjck3/box_hm_rat)
+
+---
 
 ### Detection (`cnn()`)
 
