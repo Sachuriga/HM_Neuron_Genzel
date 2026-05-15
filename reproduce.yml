@@ -1,9 +1,9 @@
-name: si_trodes
+name: HM_neuron
 channels:
   - conda-forge
   - pytorch
 dependencies:
-  - python=3.10  # 3.10 is usually the safest for neuro-tools
+  - python=3.13  # 3.10 is usually the safest for neuro-tools
   - numpy<2.0    # Force 1.x if your tools aren't ready for 2.0
   - pytorch
   - scipy
