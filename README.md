@@ -2,7 +2,7 @@
 
 **Author:** Sachuriga
 
-A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Kilosort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
+A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Mountainsort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
 > **Attribution** — `src/Video_LED_Sync_using_ICA.py` (Step 2), `src/join_views.py` (Step 3), and `src/TrackerYolov11.py` (Step 4) are based on and modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a summary of changes to the tracker.
 
@@ -43,7 +43,7 @@ The pipeline takes raw Trodes recordings (`.rec`) and multi-camera video, then r
 - Per-trial metrics written back into `RecordingMeta.xlsx`
 - LED-synchronized behavioral timestamps (via ICA)
 - Behavioral metrics computed from trial node sequences (via hex maze analysis)
-- Spike-sorted neural data (via Kilosort4 / SpikeInterface)
+- Spike-sorted neural data (via Mountainsort4 / SpikeInterface)
 - LFP traces (1 kHz, 500 Hz low-pass)
 - DeepLabCut-ready video export
 - GPU-compressed output video
@@ -60,7 +60,7 @@ HM_Tracker_2025/
 │   ├── join_views.py                # Multi-camera stitching
 │   ├── plot_trials.py               # Trial-level plotting
 │   ├── sorter/
-│   │   ├── sorting.py               # Kilosort4 spike sorting
+│   │   ├── sorting.py               # Mountainsort4 spike sorting
 │   │   └── export_lfp.py            # LFP extraction & export
 │   ├── node_analysis/
 │   │   ├── hex_maze_analysis.py     # Hex maze behavioral metrics
@@ -251,11 +251,12 @@ Aligns the video timeline to the neural recording timeline using an LED synchron
 python join_views.py <ip>
 ```
 
-Stitches multiple individual camera video files (named `eye01_*.mp4`, `eye02_*.mp4`, etc.) into a single side-by-side output file:
+Stitches multiple individual camera video files (named `eye??_*.mp4`) into a single combined output file:
 
-- Videos are sorted naturally and laid out in a **2-row grid** (`math.ceil(n / 2)` columns).
-- Each input frame is scaled to **600 × 800 px** before stitching; optional `crop_x` / `crop_y` arguments trim borders.
-- The stitching command is built as an FFmpeg `hstack`/`vstack` filtergraph and executed via `os.system`.
+- Expects **12 videos** by default; videos are sorted naturally and arranged in a **2-row grid** (`ceil(n/2)` columns per row).
+- Raw frame size per camera: **600 × 800 px**. A crop is applied before stitching — default **104 px** from each horizontal side and **91 px** from the top (bottom-row cameras start 91 px lower). Effective frame size after crop: **392 × 709 px** per tile.
+- Bottom-row cameras are horizontally and vertically flipped (`hflip,vflip`) to correct for inverted mounting.
+- The FFmpeg command uses a **nullsrc canvas + overlay** filter chain (not hstack/vstack). Output is encoded with **h264_nvenc** (NVIDIA GPU), preset `fast`, bitrate **4000k**, pixel format `yuv420p`, at **30 fps**.
 - Output is written as `stitched.mp4` in the input folder. This file is required by Step 4 (tracker).
 
 ---
@@ -294,12 +295,11 @@ python plot_trials.py --input_folder <ip> --output_folder <op>
 
 Generates a PDF report with trial-level visualizations from the tracker output:
 
-- Reads the `*_Coordinates_Full.csv` position file and the `*.txt` node-sequence file from the output folder.
-- Reconstructs the hex maze graph from the node coordinate file using NetworkX, connecting nodes within 65 px of each other.
-- For each trial, plots the rat's XY trajectory overlaid on the maze, coloured by speed (computed from pixel coordinates and frame timestamps).
-- Computes and annotates per-trial path length, trial duration, and speed statistics.
-- Applies a moving-average smoother to reduce GPS-like jitter in the plotted trajectory.
-- Outputs a multi-page PDF (one page per trial) to the output folder.
+- Reads **`.log` files** from the output folder (produced by the tracker). Extracts rat position events (`The rat position is: (x, y) @ frame`) and trial markers (`Recording Trial N`) via regex.
+- Optionally reads the `*.txt` node-sequence file from the output folder and `RecordingMeta.xlsx` from the input folder for goal/start node overlays.
+- Reconstructs the hex maze graph from the hardcoded node coordinate file (`src/tools/node_list_new.csv`) using NetworkX, connecting nodes within **65 px** of each other. Manually adds bridge edges (121↔302, 324↔401, 305↔220, 404↔223, 201↔124, 224↔218).
+- Per-trial speed is computed from pixel coordinates at **30 fps** and smoothed at multiple windows (0.4 s, 0.5 s, 1.0 s, 2.0 s, 5.0 s).
+- Outputs a multi-page PDF with per-trial trajectory plots (coloured by speed), aggregate speed distributions, occupancy heatmaps, and path-scoring statistics.
 
 ---
 
@@ -334,16 +334,18 @@ Compresses the annotated tracker output video using NVIDIA hardware encoding:
 python sorting.py --input_folder <ip> --output_folder <op>
 ```
 
-Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via SpikeInterface + Kilosort4:
+Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via SpikeInterface + **Mountainsort4**:
 
-1. **Data loading** — Reads raw voltage traces from `.dat` files using the official Trodes reader (`readTrodesExtractedDataFile3.py`). Applies gain (`0.195 µV/bit`) and offset.
-2. **Probe geometry** — Attaches an **8 × 4 tetrode grid** probe layout (32 tetrodes, 128 channels). Tetrodes are spaced 250 µm apart; contacts within each tetrode are offset in a ±10 µm diamond pattern.
+1. **Data loading** — Searches for `**/*.raw/*_group0.dat` files under the input folder. Reads raw voltage traces using the official Trodes reader (`readTrodesExtractedDataFile3.py`). Applies gain (`0.195 mV/unit`) and offset.
+2. **Probe geometry** — Attaches an **8 × 4 tetrode grid** (32 tetrodes, 128 channels total). Tetrodes are spaced **250 µm** apart; contacts within each tetrode are arranged in a ±10 µm diamond pattern. Contact shape: circle, radius 5 µm.
 3. **Preprocessing:**
-   - Bandpass filter: 300–6 000 Hz
-   - Bad-channel interpolation (50 µm radius): a fixed list of known bad channels is interpolated from their neighbours
+   - Bandpass filter: **300–6 000 Hz**
+   - Bad-channel interpolation (**50 µm** radius): a fixed list of known bad channels is interpolated from their neighbours
    - Common-average referencing per tetrode group
-4. **Sorting** — Kilosort4 is run via SpikeInterface on the preprocessed recording.
-5. **Export** — Results are exported to `phy_export/` in the output folder for manual curation in Phy. All intermediate files (preprocessed binary, sorter temp files) are deleted afterwards.
+   - Whitening (float32)
+4. **Sorting** — **Mountainsort4** is run via SpikeInterface (`adjacency_radius=50 µm`, pre-filtering and whitening disabled since already done).
+5. **Analysis** — Waveforms extracted (1 ms before, 2 ms after spike peak), 3-component PCA per channel, quality metrics (SNR, ISI violation, firing rate).
+6. **Export** — Results exported to `phy_export/` for manual curation in Phy. All intermediate files are deleted; only `phy_export/` is retained.
 
 ---
 
@@ -356,13 +358,16 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
 python export_lfp.py --input_folder <ip> --output_folder <op>
 ```
 
-Reads the Trodes-exported LFP `.dat` files (produced by Step e) and compiles them into analysis-ready output:
+Reads the Trodes-exported LFP `.dat` files (produced by Step e) and compiles them into analysis-ready output under `LFP_Output/`:
 
 - **File discovery** — Scans for `*.LFP/*.dat` files, excluding the timestamps file. Falls back to a flat `*LFP*.dat` glob if the subfolder structure is absent.
-- **Channel parsing** — Extracts ntrode and channel numbers from filenames (pattern `_nt<N>ch<C>.dat`).
-- **Timestamps** — Reads the companion `*.timestamps.dat` file to get absolute sample timestamps.
-- **Quality check** — Computes a per-channel Welch power spectrum and z-scores to flag noisy or saturated channels.
-- **Output** — Writes a combined multi-channel LFP array (channels × samples) to the output folder, along with channel metadata and the aligned timestamp vector.
+- **Channel parsing** — Extracts ntrode and channel numbers from filenames (pattern `_nt<N>ch<C>.dat`). Voltage scaled by `voltagescaling` from file header (default **0.195 mV/unit**).
+- **Timestamps** — Reads the companion `*.timestamps.dat` file; converts raw counts to seconds (zero-referenced).
+- **Channel selection:**
+  - **EMG** — Welch power spectrum over the first 60 s; channel with maximum power in the **20–200 Hz** band.
+  - **EEG (cleanest)** — SNR = sleep-band power (0.5–30 Hz) ÷ noise-band power (>50 Hz); top **3 channels** selected.
+- **Awakeness index** — Computed per 1-second epoch: z-scored EMG RMS × **0.6** + z-scored theta/delta ratio × **0.4**, upsampled back to sample rate. Theta band: **5–9 Hz**, delta band: **0.5–4 Hz**.
+- **Output files** — `lfp_data.npy` **(n_samples × n_channels)**, per-channel `.npy` files, `lfp_timestamps.npy`, `channel_map.npy`, `emg_data.npy`, `awakeness.npy`, `theta_delta_ratio.npy`, `channel_snr_scores.npy`.
 
 ---
 
@@ -461,15 +466,13 @@ INTER-TRIAL  (start_trial=False, record_detections=False)
 
 **Researcher proximity end** — For types 1 and 2, if the closest researcher comes within 240 px of the rat after at least 5 seconds have elapsed, the trial ends immediately.
 
-**Did-Not-Reach override** — If `Did_Not_Reach = 1` in the metadata, the goal-proximity check is replaced: the trial ends when a researcher stays within 60 px of the rat for ≥ 1 second (rat-pickup detection).
-
 **Force-end fallbacks:**
 - Closest researcher to the **goal** within 50 px for 10 continuous seconds → trial ends.
 - Closest researcher to the **goal** within 160 px for 30 continuous seconds → trial ends (probe immunity and unnormal-interval rules apply).
 
 **Unnormal intervals** — Time windows specified in the `Unnormal_Intervals` metadata column (`trial_num:start_min-end_min`) suppress goal-reach and force-end checks during that window.
 
-**Inter-trial lockout** — After a type-4/5/6 trial, a 10-minute lockout prevents the next trial from starting. A countdown overlay is shown; the researcher-proximity trigger is blocked until expiry.
+**Inter-trial lockout** — After a type-4/5/6 trial, the next trial cannot start until 10 minutes have elapsed **from the start of the special trial** (not from when it ended). A countdown overlay shows the remaining time; the researcher-proximity trigger is blocked until the lockout expires.
 
 ---
 
@@ -519,7 +522,7 @@ Based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). Key changes:
 
 - Detection backend replaced with YOLOv11 (Ultralytics)
 - Rat position uses `rat` (body) class only; `head` is counted separately and does not affect the tracked centroid
-- Extended trial state machine: NGL variants (types 4–6), Did-Not-Reach logic, researcher-proximity trigger and force-end timers, inter-trial lockout
+- Extended trial state machine: NGL variants (types 4–6), researcher-proximity trigger and force-end timers, inter-trial lockout
 - Per-trial metrics (`avg_speed`, `avg_between_node_speed`, `active_time`, `trial_start_time`, `trial_end_time`) written back into a copy of `RecordingMeta.xlsx`
 - Motion-based YOLO skip with cached bounding-box redraw to prevent display flicker
 - Threaded video writer for non-blocking frame output
@@ -616,7 +619,7 @@ Rows with missing or unparseable `path_to_reach` are flagged in a `flag` column 
 | `Goal_Node` | Per-row goal node IDs |
 | `Trial_Type` | Per-row trial type (1–6) |
 | `Special_Trials` | Per-row special trial flags |
-| `Did_Not_Reach` | `1` if rat did not reach the goal for this trial |
+| `Did_Not_Reach` | `1` if rat did not reach the goal for this trial (read by the tracker but currently has no effect on trial end logic) |
 | `Unnormal_Intervals` | Immunity windows per trial (`trial:start_min-end_min`) |
 
 ---
