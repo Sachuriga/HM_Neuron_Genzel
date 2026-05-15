@@ -545,10 +545,9 @@ class Tracker:
                     current_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
 
                     if label == 'head':
-                        rat_candidates.append((confidence, centroid, 'head'))
                         detected_head_this_frame = True
                     elif label == 'rat':
-                        rat_candidates.append((confidence, centroid, 'rat'))
+                        rat_candidates.append((confidence, centroid))
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
                         researcher_candidates.append((confidence, centroid))
@@ -565,19 +564,10 @@ class Tracker:
             cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
                         (x1, y1 + 20), font, 1, (255, 255, 255), 1)
 
-        # --- RAT SELECTION (unchanged) ---
+        # --- RAT SELECTION: always use body ---
         if rat_candidates:
             rat_candidates.sort(key=lambda x: x[0], reverse=True)
-            best_conf, best_centroid, best_label = rat_candidates[0]
-
-            if best_label == 'head':
-                self.locked_to_head = True
-
-            if self.locked_to_head and best_label != 'head':
-                head_cands = [c for c in rat_candidates if c[2] == 'head']
-                if head_cands:
-                    _, best_centroid, _ = head_cands[0]
-
+            _, best_centroid = rat_candidates[0]
             self.Rat = best_centroid
 
         # --- RESEARCHER SELECTION: store ALL positions ---
