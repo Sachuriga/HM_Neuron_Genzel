@@ -4,7 +4,6 @@ import random
 import numpy as np
 import pandas as pd
 import cv2
-import h5py
 import sleap_io as sio
 from sleap_nn.predict import run_inference
 
@@ -30,11 +29,16 @@ OUTPUTS_DIR = Path(
 
 # --- Inference mode ---
 MODE = "sample"   # "full" = entire video | "sample" = random N frames
-SAMPLE_N = 3000  # number of frames to randomly sample (only used when MODE="sample")
+SAMPLE_N = 3000   # number of frames to randomly sample (only used when MODE="sample")
 
 # --- Hardware ---
 DEVICE = "cuda"   # "cuda" / "cuda:0" / "cpu"
 BATCH_SIZE = 8    # increase to 16 or 32 if VRAM allows
+
+# --- Detection sensitivity ---
+# Default in SLEAP is typically 0.2. Lower this if you get 0 predictions.
+# Try 0.05 first; go as low as 0.01 to confirm the model detects anything at all.
+PEAK_THRESHOLD = 0.05
 
 # --- Post-processing ---
 EXPORT_CSV = True        # write a coordinate CSV for each prediction
@@ -71,8 +75,13 @@ def _video_frame_count(video_path: Path) -> int:
 # Step 1 — Inference
 # ============================================================
 
-def predict_one(video_path: Path) -> Path:
-    """Run SLEAP inference on one video. Returns the output .slp path."""
+def predict_one(video_path: Path) -> tuple[Path, sio.Labels]:
+    """Run SLEAP inference on one video.
+
+    Returns (slp_path, labels) where labels is the in-memory Labels object
+    from run_inference — used directly by later steps to avoid a reload that
+    returns 0 frames due to a sleap_nn/sleap_io format mismatch.
+    """
     total_frames = _video_frame_count(video_path)
 
     if MODE == "sample":
@@ -88,19 +97,22 @@ def predict_one(video_path: Path) -> Path:
     out_path = PREDICTIONS_DIR / f"{video_path.stem}{suffix}.slp"
     print(f"\n=== {video_path.name} -> {out_path.name} ===")
 
-    run_inference(
+    labels = run_inference(
         data_path=str(video_path),
         model_paths=[str(MODEL_PATH)],
         output_path=str(out_path),
         make_labels=True,
         device=DEVICE,
         batch_size=BATCH_SIZE,
-        frames=frames,  # None = full video
+        frames=frames,
+        peak_threshold=PEAK_THRESHOLD,
     )
 
-    # Sanity check — inspect what was actually written to the file
-    _diagnose_slp(out_path)
-    labels = sio.load_slp(str(out_path))
+    # run_inference may return None in some versions — fall back to disk load
+    if labels is None or not hasattr(labels, "labeled_frames"):
+        print("   run_inference returned no Labels object — loading from disk")
+        labels = sio.load_slp(str(out_path))
+
     n_predicted = len(labels.labeled_frames)
     expected = len(frames) if frames is not None else total_frames
     pct = 100.0 * n_predicted / expected if expected else 0
@@ -108,36 +120,18 @@ def predict_one(video_path: Path) -> Path:
     if n_predicted < 0.5 * expected:
         print("   WARNING: fewer than half the frames have predictions")
 
-    return out_path
-
-
-def _diagnose_slp(slp_path: Path) -> None:
-    """Print the raw HDF5 structure of an .slp file to help diagnose empty-prediction issues."""
-    file_size_mb = slp_path.stat().st_size / 1_048_576
-    print(f"\n   [diag] File size: {file_size_mb:.2f} MB")
-
-    try:
-        with h5py.File(str(slp_path), "r") as f:
-            def _print_item(name: str, obj) -> None:
-                if isinstance(obj, h5py.Dataset):
-                    print(f"   [diag]   {name}: shape={obj.shape} dtype={obj.dtype}")
-                else:
-                    print(f"   [diag]   {name}/")
-            f.visititems(_print_item)
-    except Exception as e:
-        print(f"   [diag] Could not inspect HDF5: {e}")
+    return out_path, labels
 
 
 # ============================================================
 # Step 2 — Coordinate export
 # ============================================================
 
-def export_coordinates(slp_path: Path) -> Path:
-    """Write a CSV of keypoint coordinates from a .slp prediction file.
+def export_coordinates(labels: sio.Labels, out_stem: str) -> Path:
+    """Write a CSV of keypoint coordinates from an in-memory Labels object.
 
     Columns: frame_idx, instance_idx, node, x, y, score, visible
     """
-    labels = sio.load_slp(str(slp_path))
     rows = []
     for lf in labels.labeled_frames:
         for inst_idx, instance in enumerate(lf.instances):
@@ -156,7 +150,7 @@ def export_coordinates(slp_path: Path) -> Path:
                 )
 
     df = pd.DataFrame(rows)
-    out_csv = OUTPUTS_DIR / f"{slp_path.stem}.coordinates.csv"
+    out_csv = OUTPUTS_DIR / f"{out_stem}.coordinates.csv"
     df.to_csv(out_csv, index=False)
     print(f"   Coordinates → {out_csv.name}  ({len(df)} rows)")
     return out_csv
@@ -166,18 +160,16 @@ def export_coordinates(slp_path: Path) -> Path:
 # Step 3 — Labeled video rendering
 # ============================================================
 
-def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
+def render_labeled_video(labels: sio.Labels, video_path: Path, out_stem: str) -> Path:
     """Overlay keypoints and skeleton edges onto only the predicted frames."""
-    labels = sio.load_slp(str(slp_path))
     skeleton = labels.skeletons[0] if labels.skeletons else None
 
-    # Only render frames that have predictions, in order
     frame_lookup: dict[int, list] = {lf.frame_idx: lf.instances for lf in labels.labeled_frames}
     predicted_frame_indices = sorted(frame_lookup)
 
     if not predicted_frame_indices:
         print("   No predicted frames to render — skipping.")
-        return slp_path
+        return video_path
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -187,13 +179,12 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out_video = OUTPUTS_DIR / f"{slp_path.stem}.labeled.mp4"
+    out_video = OUTPUTS_DIR / f"{out_stem}.labeled.mp4"
     writer = cv2.VideoWriter(
         str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
 
     node_names = [n.name for n in skeleton.nodes] if skeleton else []
-
     edge_pairs: list[tuple[int, int]] = []
     if skeleton:
         for edge in skeleton.edges:
@@ -215,7 +206,6 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
         for instance in frame_lookup[frame_idx]:
             coords = [(p.x, p.y, p.visible) for p in instance.points]
 
-            # Skeleton edges (draw beneath keypoints)
             for src_i, dst_i in edge_pairs:
                 if src_i >= len(coords) or dst_i >= len(coords):
                     continue
@@ -224,7 +214,6 @@ def render_labeled_video(slp_path: Path, video_path: Path) -> Path:
                 if sv and dv and not any(np.isnan(v) for v in (sx, sy, dx, dy)):
                     cv2.line(frame, (int(sx), int(sy)), (int(dx), int(dy)), (200, 200, 200), LINE_THICKNESS)
 
-            # Keypoint circles
             for kp_idx, (x, y, visible) in enumerate(coords):
                 if visible and not (np.isnan(x) or np.isnan(y)):
                     cv2.circle(frame, (int(x), int(y)), KEYPOINT_RADIUS, _color(kp_idx), -1)
@@ -252,22 +241,24 @@ def main():
             print(f"SKIP (not found): {video_path}")
             continue
         try:
-            slp_path = predict_one(video_path)
+            slp_path, labels = predict_one(video_path)
         except Exception as e:
             print(f"FAILED inference on {video_path.name}: {e}")
             continue
 
+        out_stem = slp_path.stem  # e.g. "video.sample3000.predictions"
+
         if EXPORT_CSV:
             try:
-                export_coordinates(slp_path)
+                export_coordinates(labels, out_stem)
             except Exception as e:
-                print(f"FAILED export on {slp_path.name}: {e}")
+                print(f"FAILED export: {e}")
 
         if RENDER_VIDEOS:
             try:
-                render_labeled_video(slp_path, video_path)
+                render_labeled_video(labels, video_path, out_stem)
             except Exception as e:
-                print(f"FAILED render on {slp_path.name}: {e}")
+                print(f"FAILED render: {e}")
 
     print(f"\nDone. Outputs in {OUTPUTS_DIR}")
 
