@@ -1187,6 +1187,40 @@ class Tracker:
                 file.write(line + '\n')
             file.write('\n')
 
+    def _close_excel_if_open(self, filepath):
+        """Quit Excel if it has filepath locked, then wait until the lock releases."""
+        import platform
+        import subprocess
+
+        def is_locked(path):
+            if not os.path.exists(path):
+                return False
+            try:
+                with open(path, 'a'):
+                    return False
+            except (IOError, PermissionError):
+                return True
+
+        if not is_locked(filepath):
+            return
+
+        print(f"[POST] '{os.path.basename(filepath)}' is open — closing Excel...")
+        system = platform.system()
+        if system == 'Darwin':
+            subprocess.run(
+                ['osascript', '-e', 'tell application "Microsoft Excel" to quit saving no'],
+                capture_output=True
+            )
+        elif system == 'Windows':
+            subprocess.run(['taskkill', '/f', '/im', 'EXCEL.EXE'], capture_output=True)
+
+        for _ in range(20):
+            time.sleep(0.5)
+            if not is_locked(filepath):
+                print("[POST] Excel closed successfully.")
+                return
+        print("[POST] Warning: file may still be locked — proceeding anyway.")
+
     def post_process_xlsx(self):
         import shutil
         import openpyxl
@@ -1197,6 +1231,7 @@ class Tracker:
 
         # --- Copy xlsx to output folder ---
         xlsx_dst = os.path.join(self.out_path, os.path.basename(self.xlsx_src_path))
+        self._close_excel_if_open(self.xlsx_src_path)
         shutil.copy2(self.xlsx_src_path, xlsx_dst)
         print(f"[POST] Copied RecordingMeta.xlsx to: {xlsx_dst}")
 
@@ -1259,6 +1294,7 @@ class Tracker:
                 ws.cell(row=row, column=path_col, value=paths_by_trial.get(trial_num, ''))
                 ws.cell(row=row, column=delay_col, value=delays_by_trial.get(trial_num, ''))
 
+            self._close_excel_if_open(xlsx_dst)
             wb.save(xlsx_dst)
             print(f"[POST] Updated xlsx with 'paths' and 'delay' columns ({num_trials} trials).")
         except Exception as e:
