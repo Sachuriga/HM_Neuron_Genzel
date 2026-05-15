@@ -244,6 +244,8 @@ The CSV timestamps are merged from the LED-ICA sync file produced in Step 2, so 
 ### `src/TrackerYolov11.py`
 Reads session metadata from `RecordingMeta.xlsx`, finds `stitched.mp4` in the input folder, runs YOLOv11x detection + tracking, and writes an annotated output video and position CSV.
 
+> **Based on** [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). The tracker has been substantially modified: YOLOv11 replaces the original detection backend, the trial state machine has been extended with new trial types, force-end conditions, and DNR logic, and post-processing now writes trial metrics directly into the RecordingMeta spreadsheet.
+
 ### `src/Video_LED_Sync_using_ICA.py`
 Extracts LED blink signals from video frames using FastICA, aligns them with Trodes DIO timestamps, and produces a synchronized timestamp file for downstream analysis.
 
