@@ -6,6 +6,17 @@ Description: 1. Reads metadata from *RecordingMeta.xlsx (Handles vertical lists)
              3. Optimized for Batch/Massive Analysis.
              4. Updated to use Ultralytics YOLO11x.pt
 Author: sachuriga
+
+Based on / modified from: https://github.com/genzellab/HM_RAT
+Key modifications from the original:
+  - Detection backend replaced with YOLOv11 (Ultralytics)
+  - Rat position uses body ('rat') class only; head class counted separately
+  - Extended trial state machine: NGL variants (types 4-6), DNR logic,
+    researcher-proximity triggers, force-end timers, inter-trial lockout
+  - Per-trial metrics (avg speed, between-node speed, active time,
+    start/end sync timestamps) written back into RecordingMeta.xlsx
+  - Motion-based YOLO skip with cached bounding boxes to prevent display flash
+  - Threaded video writer for non-blocking output
 '''
 
 from itertools import groupby
