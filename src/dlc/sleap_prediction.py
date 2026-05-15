@@ -4,6 +4,7 @@ import random
 import numpy as np
 import pandas as pd
 import cv2
+import h5py
 import sleap_io as sio
 from sleap_nn.predict import run_inference
 
@@ -97,7 +98,8 @@ def predict_one(video_path: Path) -> Path:
         frames=frames,  # None = full video
     )
 
-    # Sanity check — the silent-0-frame bug bit you once, don't trust it
+    # Sanity check — inspect what was actually written to the file
+    _diagnose_slp(out_path)
     labels = sio.load_slp(str(out_path))
     n_predicted = len(labels.labeled_frames)
     expected = len(frames) if frames is not None else total_frames
@@ -107,6 +109,23 @@ def predict_one(video_path: Path) -> Path:
         print("   WARNING: fewer than half the frames have predictions")
 
     return out_path
+
+
+def _diagnose_slp(slp_path: Path) -> None:
+    """Print the raw HDF5 structure of an .slp file to help diagnose empty-prediction issues."""
+    file_size_mb = slp_path.stat().st_size / 1_048_576
+    print(f"\n   [diag] File size: {file_size_mb:.2f} MB")
+
+    try:
+        with h5py.File(str(slp_path), "r") as f:
+            def _print_item(name: str, obj) -> None:
+                if isinstance(obj, h5py.Dataset):
+                    print(f"   [diag]   {name}: shape={obj.shape} dtype={obj.dtype}")
+                else:
+                    print(f"   [diag]   {name}/")
+            f.visititems(_print_item)
+    except Exception as e:
+        print(f"   [diag] Could not inspect HDF5: {e}")
 
 
 # ============================================================
