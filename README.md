@@ -4,7 +4,7 @@
 
 A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Kilosort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
-> **Tracker attribution** — `src/TrackerYolov11.py` is based on and substantially modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a full list of changes.
+> **Attribution** — `src/Video_LED_Sync_using_ICA.py` (Step 2), `src/join_views.py` (Step 3), and `src/TrackerYolov11.py` (Step 4) are based on and modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a summary of changes to the tracker.
 
 ---
 
@@ -225,7 +225,7 @@ These files are read by Step 8 (LFP extraction).
 ### Step 2 — LED Sync (ICA)
 
 **Key:** `2`  
-**Script:** `src/Video_LED_Sync_using_ICA.py`  
+**Script:** `src/Video_LED_Sync_using_ICA.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
 ```
 python Video_LED_Sync_using_ICA.py -i <ip> -o <op> -f 30000
@@ -245,7 +245,7 @@ Aligns the video timeline to the neural recording timeline using an LED synchron
 ### Step 3 — Multi-Camera Stitching
 
 **Key:** `3`  
-**Script:** `src/join_views.py`  
+**Script:** `src/join_views.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
 ```
 python join_views.py <ip>
@@ -263,7 +263,7 @@ Stitches multiple individual camera video files (named `eye01_*.mp4`, `eye02_*.m
 ### Step 4 — YOLOv11 Tracker
 
 **Key:** `4`  
-**Script:** `src/TrackerYolov11.py`  
+**Script:** `src/TrackerYolov11.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Requires:** `stitched.mp4` in the input folder  
 **Command:**
 ```

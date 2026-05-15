@@ -3,6 +3,8 @@
 """
 Created on Mon Jun 21 10:50:39 2021
 
+@author: Sachuriga
+Based on / modified from: https://github.com/genzellab/HM_RAT
 """
 #!/usr/bin/env python
 import os

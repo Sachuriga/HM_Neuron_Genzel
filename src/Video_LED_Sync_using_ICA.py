@@ -2,7 +2,8 @@
 """
 Created on Sun November 30 14:08:05 2025
 
-@author: Sachi
+@author: Sachuriga
+Based on / modified from: https://github.com/genzellab/HM_RAT
 """
 
 import os
