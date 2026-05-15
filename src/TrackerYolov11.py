@@ -139,12 +139,20 @@ class Tracker:
                  print("Loaded timestamp file: " + os.path.basename(specific_ts_path))
                  self.ts_file_loaded = True
             else:
-                 stitched_ts_path = os.path.join(out, 'stitched_framewise_ts.csv')
-                 if os.path.exists(stitched_ts_path):
-                     print("Specific timestamp file not found. Loading 'stitched_framewise_ts.csv'...")
-                     self.sync_ts_dict = pd.read_csv(stitched_ts_path, index_col=0).to_dict()
-                     self.ts_file_loaded = True
-                 else:
+                 candidates = [
+                     'stitched_framewise_seconds.csv',
+                     'stitched_framewise_ts.csv',
+                 ]
+                 loaded = False
+                 for fname in candidates:
+                     p = os.path.join(out, fname)
+                     if os.path.exists(p):
+                         print(f"Specific timestamp file not found. Loading '{fname}'...")
+                         self.sync_ts_dict = pd.read_csv(p, index_col=0).to_dict()
+                         self.ts_file_loaded = True
+                         loaded = True
+                         break
+                 if not loaded:
                      raise FileNotFoundError
         except Exception:
              print("Warning: No timestamp CSV found. Logs might lack sync times.")
@@ -267,7 +275,10 @@ class Tracker:
         self.unnormal_intervals = self.metadata.get('unnormal_intervals', {})
         self._last_end_reason = "n/a"
         self._last_end_frame_time = -1e9
-        self.trial_delays = []  # list of (trial_num, delay_seconds)
+        self.trial_delays = []       # list of (trial_num, delay_seconds)
+        self.trial_speed_stats = []  # list of (trial_num, avg_speed, avg_between_node_speed)
+        self.trial_times = []        # list of (trial_num, start_ts, end_ts)
+        self.current_trial_start_ts = ''
 
         self.goal_residence_timer = 0.0
         self.centroid_list = deque(maxlen=500)
@@ -452,6 +463,8 @@ class Tracker:
             
             # --- RECORD TRIAL START TIME ---
             self.last_trial_start_time_ms = self.frame_time
+            curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            self.current_trial_start_ts = self.sync_ts_dict.get(self.ts_column_name, {}).get(curr_idx, '')
             # -------------------------------
             
             current_trial_type = int(self.trial_types[self.counter])
@@ -882,6 +895,9 @@ class Tracker:
         self._last_end_frame_time = self.frame_time
         _delay_s = round((self.frame_time - self.last_trial_start_time_ms) / 1000, 2)
         self.trial_delays.append((self.trial_num, _delay_s))
+        _curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        _end_ts = self.sync_ts_dict.get(self.ts_column_name, {}).get(_curr_idx, '')
+        self.trial_times.append((self.trial_num, self.current_trial_start_ts, _end_ts))
         print(f'\n[END_TRIAL] trial={self.trial_num} counter={self.counter} reason="{reason}" '
               f'frame_time={self.frame_time/1000:.2f}s '
               f'normal={self.normal_trial} NGL={self.NGL} probe={self.probe} immune={self.check_immunity()}')
@@ -891,6 +907,16 @@ class Tracker:
         self.annotate_frame(self.disp_frame)
 
         self.calculate_velocity(self.time_points)
+
+        if self.summary_trial:
+            total_dist = sum(seg[3] for seg in self.summary_trial)
+            total_time_s = sum(seg[2] for seg in self.summary_trial)
+            avg_speed = round(total_dist / total_time_s, 3) if total_time_s > 0 else ''
+        else:
+            avg_speed = ''
+        avg_between_node = round(sum(self.saved_velocities) / len(self.saved_velocities), 3) if self.saved_velocities else ''
+        self.trial_speed_stats.append((self.trial_num, avg_speed, avg_between_node))
+
         self.save_to_file(self.save)
         self.last_trial_end_time = self.frame_time
 
@@ -1255,8 +1281,12 @@ class Tracker:
                     if nodes:
                         current_path = ','.join(nodes)
 
-        # --- Build delay lookup by trial_num ---
+        # --- Build lookups by trial_num ---
         delays_by_trial = {tn: d for tn, d in self.trial_delays}
+        avg_speed_by_trial = {tn: s for tn, s, _ in self.trial_speed_stats}
+        avg_node_speed_by_trial = {tn: ns for tn, _, ns in self.trial_speed_stats}
+        start_ts_by_trial = {tn: s for tn, s, _ in self.trial_times}
+        end_ts_by_trial = {tn: e for tn, _, e in self.trial_times}
 
         # --- Write new columns into copied xlsx ---
         try:
@@ -1267,31 +1297,40 @@ class Tracker:
             headers = [cell.value for cell in ws[1]]
             last_col = len(headers) + 1
 
-            # Add headers if not already present
-            if 'paths' not in headers:
-                ws.cell(row=1, column=last_col, value='paths')
-                path_col = last_col
-                last_col += 1
-            else:
-                path_col = headers.index('paths') + 1
+            def get_or_add_col(name):
+                nonlocal last_col
+                if name not in headers:
+                    ws.cell(row=1, column=last_col, value=name)
+                    col = last_col
+                    last_col += 1
+                else:
+                    col = headers.index(name) + 1
+                return col
 
-            if 'delay' not in headers:
-                ws.cell(row=1, column=last_col, value='delay')
-                delay_col = last_col
-            else:
-                delay_col = headers.index('delay') + 1
+            path_col          = get_or_add_col('paths')
+            delay_col         = get_or_add_col('delay')
+            active_time_col   = get_or_add_col('active_time')
+            avg_speed_col     = get_or_add_col('avg_speed')
+            avg_node_col      = get_or_add_col('avg_between_node_speed')
+            start_ts_col      = get_or_add_col('trial_start_time')
+            end_ts_col        = get_or_add_col('trial_end_time')
 
             # Fill rows: row 2 = trial 1, row 3 = trial 2, ...
             num_trials = int(self.num_trials)
             for i in range(num_trials):
                 trial_num = i + 1
                 row = i + 2
-                ws.cell(row=row, column=path_col, value=paths_by_trial.get(trial_num, ''))
-                ws.cell(row=row, column=delay_col, value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=path_col,        value=paths_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=delay_col,       value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=active_time_col, value=delays_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=avg_speed_col,   value=avg_speed_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=avg_node_col,    value=avg_node_speed_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=start_ts_col,    value=start_ts_by_trial.get(trial_num, ''))
+                ws.cell(row=row, column=end_ts_col,      value=end_ts_by_trial.get(trial_num, ''))
 
             self._close_excel_if_open(xlsx_dst)
             wb.save(xlsx_dst)
-            print(f"[POST] Updated xlsx with 'paths' and 'delay' columns ({num_trials} trials).")
+            print(f"[POST] Updated xlsx with paths, active_time, avg_speed, avg_between_node_speed, trial_start/end_time ({num_trials} trials).")
         except Exception as e:
             print(f"[POST] Failed to update xlsx: {e}")
 
