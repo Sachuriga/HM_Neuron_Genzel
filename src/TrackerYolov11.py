@@ -851,20 +851,20 @@ class Tracker:
         trial_elapsed_ms = self.frame_time - self.last_trial_start_time_ms
         researcher_trigger_allowed = trial_elapsed_ms >= 5_000
 
-        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 240px of the rat
+        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 150px of the rat
         if researcher_trigger_allowed:
             _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
             if _curr_type not in (3, 4, 5, 6):
                 _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
                 if _closest_to_rat is not None:
                     _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
-                    if _res_rat_dist <= 240:
-                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 240px of rat ({_res_rat_dist:.0f}px), ending trial')
+                    if _res_rat_dist <= 150:
+                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 150px of rat ({_res_rat_dist:.0f}px), ending trial')
                         self.normal_trial = False
                         self.NGL = False
                         self.probe = False
                         self.probe_researcher_signalled = False
-                        self.end_trial(reason="researcher near rat 240px")
+                        self.end_trial(reason="researcher near rat 150px")
                         return
 
         if self.probe:
@@ -1156,8 +1156,8 @@ class Tracker:
                 _closest = self.closest_researcher_to(self.pos_centroid)
                 if _closest is not None:
                     _res_rat_dist = points_dist(_closest, self.pos_centroid)
-                    _res_rat_color = (0, 60, 255) if _res_rat_dist <= 240 else (255, 255, 255)
-                    _res_rat_label = f'Res->rat {_res_rat_dist:.0f}px (thr:240) - {"ENDING" if _res_rat_dist <= 240 else "waiting"}'
+                    _res_rat_color = (0, 60, 255) if _res_rat_dist <= 150 else (255, 255, 255)
+                    _res_rat_label = f'Res->rat {_res_rat_dist:.0f}px (thr:150) - {"ENDING" if _res_rat_dist <= 150 else "waiting"}'
                 else:
                     _res_rat_color = (255, 255, 255)
                     _res_rat_label = 'Res->rat: no researcher detected'

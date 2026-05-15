@@ -464,7 +464,7 @@ INTER-TRIAL  (start_trial=False, record_detections=False)
 | 3 | Probe | ≥ 2 min elapsed AND researcher ≤ 600 px from goal AND rat ≤ 25 px from goal |
 | 4–6 | Special NGL | Same as NGL; 10-minute inter-trial lockout after the trial ends |
 
-**Researcher proximity end** — For types 1 and 2, if the closest researcher comes within 240 px of the rat after at least 5 seconds have elapsed, the trial ends immediately.
+**Researcher proximity end** — For types 1 and 2, if the closest researcher comes within 150 px of the rat after at least 5 seconds have elapsed, the trial ends immediately.
 
 **Force-end fallbacks:**
 - Closest researcher to the **goal** within 50 px for 10 continuous seconds → trial ends.
