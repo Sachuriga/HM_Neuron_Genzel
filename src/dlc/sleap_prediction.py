@@ -28,7 +28,7 @@ OUTPUTS_DIR = Path(
 )
 
 # --- Inference mode ---
-MODE = "full"   # "full" = entire video | "sample" = random N frames
+MODE = "sample"   # "full" = entire video | "sample" = random N frames
 SAMPLE_N = 3000  # number of frames to randomly sample (only used when MODE="sample")
 
 # --- Hardware ---
