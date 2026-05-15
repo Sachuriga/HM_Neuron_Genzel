@@ -1,8 +1,8 @@
 # HM Tracker 2025
 
-A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Kilosort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
-
 **Author:** Sachuriga
+
+A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Kilosort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
 > **Tracker attribution** — `src/TrackerYolov11.py` is based on and substantially modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a full list of changes.
 
