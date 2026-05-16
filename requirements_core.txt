@@ -17,6 +17,7 @@ ultralytics
 opencv-python
 sahi
 pillow
+deeplabcut
 
 # Neuroscience
 spikeinterface[full]
