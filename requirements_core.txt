@@ -17,6 +17,7 @@ ultralytics
 opencv-python
 sahi
 pillow
+deeplabcut
 
 # Neuroscience
 spikeinterface[full]
@@ -48,8 +49,6 @@ pyqtgraph
 
 # ML / deep learning extras
 huggingface_hub
-sleap-io
-sleap-nn
 
 # Utilities
 tqdm
