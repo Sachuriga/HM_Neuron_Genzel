@@ -274,7 +274,7 @@ class Tracker:
            self.trial_num = int(self.custom_trial)
         self.counter = 0 
         self.count_rat = 0
-        self.count_head = 0
+
         self.start_time = 0 
         self.converted_time = "00:00:00.000"  
         
@@ -564,7 +564,6 @@ class Tracker:
         rat_candidates = []
         researcher_candidates = []
 
-        detected_head_this_frame = False
         detected_rat_body_this_frame = False
 
         if has_motion:
@@ -580,9 +579,7 @@ class Tracker:
                     centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
                     current_boxes.append((x1, y1, x2, y2, label, confidence, cls_id))
 
-                    if label == 'head':
-                        detected_head_this_frame = True
-                    elif label == 'rat':
+                    if label == 'rat':
                         rat_candidates.append((confidence, centroid, x1, y1, x2, y2))
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
@@ -699,11 +696,8 @@ class Tracker:
             if self.start_trial:
                 self.find_start(active_rat_pos)
 
-            if self.record_detections:
-                if detected_head_this_frame:
-                    self.count_head += 1
-                elif detected_rat_body_this_frame:
-                    self.count_rat += 1
+            if self.record_detections and detected_rat_body_this_frame:
+                self.count_rat += 1
 
                 self.object_detection(rat=active_rat_pos)
 
@@ -969,7 +963,7 @@ class Tracker:
             self.end_session = True
 
         self.count_rat = 0
-        self.count_head = 0
+
         print(f'[END_TRIAL] → next trial_num={self.trial_num} counter={self.counter} end_session={self.end_session}')
 
 
@@ -1208,8 +1202,6 @@ class Tracker:
                             fontFace=FONT, fontScale=0.65, color=(255, 140, 80), thickness=1)
 
             cv2.putText(frame, "Rat Count: " + str(self.count_rat), (40, 172),
-                        fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
-            cv2.putText(frame, "Rat-head Count: " + str(self.count_head), (40, 190),
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
 
             if len(self.centroid_list) >= 2:
