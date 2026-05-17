@@ -525,6 +525,19 @@ class Tracker:
             return None
         return min(self.all_researchers, key=lambda r: points_dist(r, point))
 
+    @staticmethod
+    def _box_overlap_ratio(box_a, box_b):
+        """Fraction of box_a's area that is covered by box_b (0.0–1.0)."""
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max((ax2 - ax1) * (ay2 - ay1), 1)
+        return inter / area_a
+
     def compute_motion(self, frame):
         """Return True if enough pixels changed since the last frame, False otherwise.
         Always updates self.prev_frame_gray so comparisons stay current even on skipped frames."""
@@ -570,10 +583,10 @@ class Tracker:
                     if label == 'head':
                         detected_head_this_frame = True
                     elif label == 'rat':
-                        rat_candidates.append((confidence, centroid))
+                        rat_candidates.append((confidence, centroid, x1, y1, x2, y2))
                         detected_rat_body_this_frame = True
                     elif label == 'researcher':
-                        researcher_candidates.append((confidence, centroid))
+                        researcher_candidates.append((confidence, centroid, x1, y1, x2, y2))
 
             # Only update cache when YOLO actually found something;
             # keeping stale boxes on missed frames prevents flash
@@ -587,15 +600,21 @@ class Tracker:
             cv2.putText(self.disp_frame, f"{label} {confidence:.2f}",
                         (x1, y1 + 20), font, 1, (255, 255, 255), 1)
 
-        # --- RAT SELECTION: always use body ---
+        # --- RESEARCHER SELECTION: store ALL positions ---
+        researcher_boxes = [(rx1, ry1, rx2, ry2) for _, _, rx1, ry1, rx2, ry2 in researcher_candidates]
+        if researcher_candidates:
+            self.all_researchers = [pos for _, pos, *_ in researcher_candidates]
+
+        # --- RAT SELECTION: highest-confidence body that doesn't overlap a researcher ---
+        RAT_OVERLAP_THRESHOLD = 0.3  # reject rat if >30 % of its box is covered by a researcher box
         if rat_candidates:
             rat_candidates.sort(key=lambda x: x[0], reverse=True)
-            _, best_centroid = rat_candidates[0]
-            self.Rat = best_centroid
-
-        # --- RESEARCHER SELECTION: store ALL positions ---
-        if researcher_candidates:
-            self.all_researchers = [pos for _, pos in researcher_candidates]
+            for conf, centroid, rx1, ry1, rx2, ry2 in rat_candidates:
+                rat_box = (rx1, ry1, rx2, ry2)
+                if not any(self._box_overlap_ratio(rat_box, rb) > RAT_OVERLAP_THRESHOLD
+                           for rb in researcher_boxes):
+                    self.Rat = centroid
+                    break
 
         # --- CACHE LAST KNOWN POSITIONS ---
         if self.Rat is not None:
