@@ -3,3 +3,4 @@
 **/.pyc
 src/tools/__pycache__/mask.cpython-310.pyc
 src/tools/__pycache__/mask.cpython-313.pyc
+src/sorter/__pycache__/readTrodesExtractedDataFile3.cpython-313.pyc
