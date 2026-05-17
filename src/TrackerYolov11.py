@@ -327,9 +327,8 @@ class Tracker:
         cv2.resizeWindow(window_name, 1176, 712) 
         # -----------------
 
-        if self.start_point is None:
-            with open(self.save, 'a+') as file:
-                file.write(f"Rat number: {self.rat} , Date: {self.date} \n")
+        with open(self.save, 'w') as file:
+            file.write(f"Rat number: {self.rat} , Date: {self.date} \n")
         self.Start_Time = time.time()
         
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -915,6 +914,7 @@ class Tracker:
 
         self.pos_centroid = self.goal_location
         self.centroid_list.append(self.pos_centroid)
+        self.record_detections = False  # must be False before annotate_frame so the goal location is not injected into saved_nodes
         self.annotate_frame(self.disp_frame)
 
         self.calculate_velocity(self.time_points)
@@ -938,7 +938,6 @@ class Tracker:
         else:
             self.end_session = True
 
-        self.record_detections = False
         self.count_rat = 0
         self.count_head = 0
         print(f'[END_TRIAL] → next trial_num={self.trial_num} counter={self.counter} end_session={self.end_session}')

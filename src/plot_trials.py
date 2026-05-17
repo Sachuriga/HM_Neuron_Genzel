@@ -498,18 +498,8 @@ if __name__ == "__main__":
                         goal_reached_naturally = True
                         first_goal_visit_idx = arrival_indices[0]
             
-            # --- Handling the "Force End" Logic ---
-            appended_goal = False
-            if current_goal_node and not goal_reached_naturally and gx_scaled is not None:
-                # Check distance to last point
-                last_x, last_y = x_plot[-1], y_plot[-1]
-                dist_to_goal = np.sqrt((last_x - gx_scaled)**2 + (last_y - gy_scaled)**2)
-                
-                # If far from goal, append goal point for visual connection
-                if dist_to_goal > 0.5: # Threshold in scaled units
-                    x_plot = np.append(x_plot, gx_scaled)
-                    y_plot = np.append(y_plot, gy_scaled)
-                    appended_goal = True
+            # Trial is failed if a goal was defined but the rat never reached it
+            trial_failed = current_goal_node is not None and not goal_reached_naturally
 
             # -- Stats for Correlation Plots --
             avg_speed_trial = np.mean(speed) if len(speed) > 0 else 0
@@ -540,10 +530,7 @@ if __name__ == "__main__":
             norm_time_vec = np.linspace(0, 1, len(speed)) if len(speed) > 1 else np.array([0.0])
 
             speed_vis = speed_raw_smooth.copy()
-            speed_vis[speed_vis > 1] = 1 
-            
-            if appended_goal:
-                speed_vis = np.append(speed_vis, 0.0)
+            speed_vis[speed_vis > 1] = 1
 
             bins_x, bins_y = 50, 30
             range_map = [[0, 9], [0, 5]]
@@ -561,15 +548,11 @@ if __name__ == "__main__":
             
             # 1. Physical Dist Calculation for SCORING
             if goal_reached_naturally and first_goal_visit_idx > 0:
-                # Truncate path for scoring only
                 actual_dist_score_basis = compute_path_length(x_raw[:first_goal_visit_idx+1], y_raw[:first_goal_visit_idx+1])
                 score_note = "(Start->FirstGoal)"
             else:
                 actual_dist_score_basis = compute_path_length(x_raw, y_raw)
-                if appended_goal:
-                     added_dist = np.sqrt((x_raw[-1] - gx_raw)**2 + (y_raw[-1] - gy_raw)**2)
-                     actual_dist_score_basis += added_dist
-                score_note = "(Full Path)"
+                score_note = "(Full Path — Failed)"
 
             # 2. Hops Calculation for SCORING
             actual_hops_score_basis = 0
@@ -655,7 +638,9 @@ if __name__ == "__main__":
             ax5 = fig.add_subplot(gs[5, :])
 
             wrapped_seq = textwrap.fill(seq_str, width=110)
+            failed_header = "*** FAILED — goal not reached ***\n" if trial_failed else ""
             summary_txt = (
+                f"{failed_header}"
                 f"Trial {trial_id} Summary: {score_note}\n"
                 f"Trial Type: {current_trial_type} | Target Goal: {end_node if end_node else 'Unknown'}\n"
                 f"Passed Nodes: {wrapped_seq}\n"
@@ -666,25 +651,29 @@ if __name__ == "__main__":
                 f"Physical Distance | {actual_dist_score_basis:8.1f}  | {optimal_dist_raw:8.1f}  | {dist_score_msg}\n"
                 f"Topological Hops  | {actual_hops_score_basis:8d}  | {optimal_hops:8d}  | {hops_score_msg}"
             )
-            ax_text.text(0.5, 0.5, summary_txt, 
+            box_fc = "#ffe0e0" if trial_failed else "#f0f0f0"
+            box_ec = "red"     if trial_failed else "black"
+            ax_text.text(0.5, 0.5, summary_txt,
                          fontsize=11, verticalalignment='center', horizontalalignment='center', fontfamily='monospace',
-                         bbox=dict(boxstyle="round,pad=0.5", fc="#f0f0f0", ec="black", alpha=1.0))
+                         color="red" if trial_failed else "black",
+                         bbox=dict(boxstyle="round,pad=0.5", fc=box_fc, ec=box_ec, alpha=1.0))
 
-            # OPTIMIZATION: rasterized=True keeps vector text but rasterizes heavy dots
+            title_color = "red" if trial_failed else "black"
+            title_tag   = " [FAILED]" if trial_failed else ""
+
             sc = ax0.scatter(x_plot, y_plot, c=speed_vis, s=10, vmax=1, cmap='hot', rasterized=True)
             fig.colorbar(sc, ax=ax0, fraction=0.025, pad=0.02, label="Speed (m/s)")
-            ax0.set_title(f"Trial {trial_id}: Speed Track")
+            ax0.set_title(f"Trial {trial_id}{title_tag}: Speed Track", color=title_color)
 
             if len(x_plot) >= 2:
                 pts = np.column_stack([x_plot, y_plot])
                 segments = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_arr = np.linspace(0.0, 1.0, len(pts) - 1)
-                # OPTIMIZATION: rasterized=True
                 lc = LineCollection(segments, cmap="cool", norm=mpl.colors.Normalize(0, 1), linewidths=1.5, rasterized=True)
                 lc.set_array(t_arr)
                 ax1.add_collection(lc)
                 fig.colorbar(lc, ax=ax1, fraction=0.025, pad=0.02, label="Time (Norm)")
-            ax1.set_title(f"Trial {trial_id}: Actual Path")
+            ax1.set_title(f"Trial {trial_id}{title_tag}: Actual Path", color=title_color)
 
             if maze_graph and start_node and end_node:
                 all_segs_dist, label_dist, _ = get_all_shortest_paths_plot_data(maze_graph, start_node, end_node, 'weight')
