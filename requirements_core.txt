@@ -28,6 +28,7 @@ probeinterface
 pynwb
 neo
 numba
+mountainsort4
 
 # Data / numerics
 numpy
