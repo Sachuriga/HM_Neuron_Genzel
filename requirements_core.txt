@@ -17,7 +17,6 @@ ultralytics
 opencv-python
 sahi
 pillow
-deeplabcut
 
 # Neuroscience
 spikeinterface[full]
@@ -28,9 +27,10 @@ probeinterface
 pynwb
 neo
 numba
+mountainsort4
 
 # Data / numerics
-numpy
+numpy>=1.24,<2   # 1.24 is the minimum for numba 0.64; stay on 1.x to avoid numpy 2 API breaks
 scipy
 pandas
 matplotlib
