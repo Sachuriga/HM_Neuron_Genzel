@@ -80,19 +80,19 @@ For sessions where a **barrier** is present in the maze, fill in the following e
 
 | Column | Format | Example | Description |
 |---|---|---|---|
-| `Training_Order` | integer | `1` | The order in which this trial was presented to the rat within the barrier training sequence. Trial 1 is the first trial the rat ran in this session, trial 2 is the second, and so on. Fill in sequentially — do not skip numbers. |
+| `Training_Order` | integer | `1` | this is the index for specify the training type for each trial, for example 17 refers to New Bar. build-up. |
 
-**When to fill this in:** every barrier session row must have a `Training_Order` value. Leave the column blank (or omit it entirely) for non-barrier sessions.
+**When to fill this in:** every barrier session row must have a `Training_Order` value (detail please refer to the worksheet index). Leave the column blank (or omit it entirely) for non-barrier sessions.
 
 **Example — a 5-trial barrier session:**
 
 | Trial row | `Start_Nodes` | `Goal_Node` | `Trial_Type` | `Training_Order` |
 |---|---|---|---|---|
-| 1 | 101 | 312 | 1 | 1 |
-| 2 | 101 | 312 | 1 | 2 |
-| 3 | 101 | 312 | 1 | 3 |
-| 4 | 101 | 312 | 1 | 4 |
-| 5 | 101 | 312 | 1 | 5 |
+| 1 | 101 | 312 | 1 | 17 |
+| 2 | 101 | 312 | 1 | 17 |
+| 3 | 101 | 312 | 1 | 17 |
+| 4 | 101 | 312 | 1 | 17 |
+| 5 | 101 | 312 | 1 | 17 |
 
 ---
 
