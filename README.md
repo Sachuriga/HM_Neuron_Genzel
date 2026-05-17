@@ -1,6 +1,6 @@
 # HM Tracker 2025
 
-**Author:** Sachuriga
+**Author:** Sachuriga S.
 
 A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Mountainsort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
