@@ -468,7 +468,7 @@ class Tracker:
     def find_start(self, center_rat):
         node = self.start_nodes_locations[self.counter]
         self.locked_to_head = False 
-        if points_dist(center_rat, node) < 60:
+        if points_dist(center_rat, node) < 30:
             self.logger.info('Recording Trial {}'.format(self.trial_num))
             
             # --- RECORD TRIAL START TIME ---
@@ -605,14 +605,25 @@ class Tracker:
         if researcher_candidates:
             self.all_researchers = [pos for _, pos, *_ in researcher_candidates]
 
-        # --- RAT SELECTION: highest-confidence body that doesn't overlap a researcher ---
-        RAT_OVERLAP_THRESHOLD = 0.3  # reject rat if >30 % of its box is covered by a researcher box
+        # --- RAT SELECTION: highest-confidence body not overlapping or inside a researcher ---
+        RAT_OVERLAP_THRESHOLD = 0.1  # reject if >10 % of rat box is covered by a researcher box
         if rat_candidates:
             rat_candidates.sort(key=lambda x: x[0], reverse=True)
             for conf, centroid, rx1, ry1, rx2, ry2 in rat_candidates:
                 rat_box = (rx1, ry1, rx2, ry2)
-                if not any(self._box_overlap_ratio(rat_box, rb) > RAT_OVERLAP_THRESHOLD
-                           for rb in researcher_boxes):
+                cx, cy = centroid
+                rejected = False
+                for rb in researcher_boxes:
+                    # centroid inside researcher box → rat is being held
+                    rbx1, rby1, rbx2, rby2 = rb
+                    if rbx1 <= cx <= rbx2 and rby1 <= cy <= rby2:
+                        rejected = True
+                        break
+                    # significant box overlap
+                    if self._box_overlap_ratio(rat_box, rb) > RAT_OVERLAP_THRESHOLD:
+                        rejected = True
+                        break
+                if not rejected:
                     self.Rat = centroid
                     break
 
