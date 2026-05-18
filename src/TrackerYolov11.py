@@ -118,6 +118,8 @@ class Tracker:
         print("Caching node dictionary...")
         self.nodes_dict = mask.create_node_dict(self.node_list)
 
+        self._load_maze_roi(metadata.get('input_folder', out))
+
         self.start_nodes_locations, self.goal_locations = self.find_location(self.start_nodes, self.goal_nodes)
         print('\n  ________  SUMMARY SESSION  ________  ')
         print('\nPath video file:', self.save_video)
@@ -525,6 +527,27 @@ class Tracker:
             return None
         return min(self.all_researchers, key=lambda r: points_dist(r, point))
 
+    def _load_maze_roi(self, _unused):
+        """Load src/tools/maze_roi.txt (committed to repo, shared by all users)."""
+        roi_path = Path(__file__).parent / "tools" / "maze_roi.txt"
+        if roi_path.exists():
+            try:
+                points = []
+                for line in roi_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    x, y = line.split(",")
+                    points.append((int(x), int(y)))
+                self.maze_roi = np.array(points, dtype=np.int32)
+                print(f"Maze ROI loaded: {len(points)} vertices from {roi_path}")
+            except Exception as e:
+                print(f"Warning: could not load maze_roi.txt: {e}")
+                self.maze_roi = None
+        else:
+            self.maze_roi = None
+            print("No maze_roi.txt found — rat detection not spatially restricted.")
+
     @staticmethod
     def _box_overlap_ratio(box_a, box_b):
         """Fraction of box_a's area that is covered by box_b (0.0–1.0)."""
@@ -620,6 +643,11 @@ class Tracker:
                     if self._box_overlap_ratio(rat_box, rb) > RAT_OVERLAP_THRESHOLD:
                         rejected = True
                         break
+                if not rejected and self.maze_roi is not None:
+                    # reject rat whose centroid is outside the maze polygon
+                    if cv2.pointPolygonTest(self.maze_roi, (float(cx), float(cy)), False) < 0:
+                        rejected = True
+
                 if not rejected:
                     self.Rat = centroid
                     break
@@ -1484,6 +1512,7 @@ if __name__ == "__main__":
         xlsx_file = meta_files[0]
         metadata = parse_metadata_xlsx(xlsx_file)
         metadata['xlsx_src_path'] = xlsx_file
+        metadata['input_folder'] = in_p
 
         # 3. Start Tracker
         tracker = Tracker(vp=vid_p, nl=node_list, out=out_p, metadata=metadata, onnx_weight=model_path)
