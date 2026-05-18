@@ -38,7 +38,8 @@ networkx
 shapely
 polars
 h5py
-zarr
+zarr<3             # zarr 2.x requires numcodecs<0.13; cbuffer_sizes was removed in numcodecs 0.13
+numcodecs<0.13     # 0.13 dropped cbuffer_sizes from numcodecs.blosc, breaking zarr 2.x
 faiss-cpu
 scikit-learn
 openpyxl
