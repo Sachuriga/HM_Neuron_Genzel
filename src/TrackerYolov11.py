@@ -470,7 +470,7 @@ class Tracker:
     def find_start(self, center_rat):
         node = self.start_nodes_locations[self.counter]
         self.locked_to_head = False 
-        if points_dist(center_rat, node) < 30:
+        if points_dist(center_rat, node) < 60:
             self.logger.info('Recording Trial {}'.format(self.trial_num))
             
             # --- RECORD TRIAL START TIME ---
