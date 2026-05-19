@@ -148,14 +148,21 @@ def _compute(exc_path):
     for col in COMPUTED_COLS:
         df[col] = np.nan if col not in ('flag', 'node_choices_binary') else ''
 
+    if 'path_to_reach' not in df.columns:
+        print(f"  WARNING: column 'path_to_reach' not found — all rows flagged, skipping computation.")
+        for i in df.index:
+            df.at[i, 'flag'] = 'missing path_to_reach column'
+        return df, sheet
+
     for i, row in df.iterrows():
-        if pd.isna(row['path_to_reach']) or str(row['path_to_reach']).strip() == '':
+        path_val = row.get('path_to_reach')
+        if path_val is None or pd.isna(path_val) or str(path_val).strip() == '':
             comment = str(row.get('comment', '')) if pd.notna(row.get('comment')) else ''
             df.at[i, 'flag'] = comment.strip() if comment.strip() else 'unknown error'
             continue
 
         try:
-            path       = [int(float(x)) for x in str(row['path_to_reach']).split(',') if x.strip()]
+            path       = [int(float(x)) for x in str(path_val).split(',') if x.strip()]
             start_node = int(row['start_node_n'])
             goal_node  = int(row['goal_node_n'])
 
