@@ -1,5 +1,6 @@
 import os
 import shutil
+import traceback
 from pathlib import Path
 import numpy as np
 
@@ -119,7 +120,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         folder=processed_folder, 
         format='binary', 
         overwrite=True, 
-        n_jobs=1,  # Keep this at 1 for Windows!
+        n_jobs=2,
         chunk_duration="1s",
         progress_bar=True
     )
@@ -242,6 +243,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4):
             process_single_file(file_path=dat_file, output_parent=output_path, n_jobs=n_jobs)
         except Exception as e:
             print(f"Error processing {dat_file.name}:\n{e}")
+            traceback.print_exc()
             print("Skipping to next file...")
 
 
@@ -257,6 +259,10 @@ if __name__ == "__main__":
     parser.add_argument('--output_folder', required=True, help="Folder to store all outputs and Phy exports")
     
     args = parser.parse_args()
-    
-    # Run the pipeline (n_jobs sets the number of CPU cores for parallel processing)
-    run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4)
+
+    try:
+        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4)
+    except Exception as e:
+        print(f"\n[FATAL] Pipeline crashed for folder '{args.input_folder}':\n{e}")
+        traceback.print_exc()
+        print("[FATAL] Exiting with code 0 so the batch runner continues to the next folder.")
