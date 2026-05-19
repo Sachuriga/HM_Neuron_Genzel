@@ -134,8 +134,6 @@ for /d %%D in ("%ROOT_DIR%\ip*") do (
     )
 )
 
-echo [DEBUG] Scan complete: count=!count! sort_count=!sort_count! HAS_SORT=!HAS_SORT! PARALLEL_STEPS_TRIM=[!PARALLEL_STEPS_TRIM!]
-
 :: Wait for all parallel workers to finish before running sorting
 if !count! gtr 0 (
     echo.
@@ -147,24 +145,18 @@ if !count! gtr 0 (
 )
 
 :: Run sorting sequentially — one folder at a time
-echo [DEBUG] HAS_SORT=!HAS_SORT! ^| sort_count=!sort_count!
 if !HAS_SORT!==1 (
     echo.
     echo ========================================================
     echo [MASTER] Running SORTING sequentially ^(1 folder at a time^)...
     echo ========================================================
-    echo [DEBUG] Entering sort loop with sort_count=!sort_count!
     for /l %%i in (1,1,!sort_count!) do (
         set "CUR_IP=!SORT_IP_%%i!"
         set "CUR_OP=!SORT_OP_%%i!"
         echo.
-        echo [DEBUG] Loop iteration %%i: CUR_IP=[!CUR_IP!] CUR_OP=[!CUR_OP!]
         echo [SORT %%i/!sort_count!] Processing: !CUR_IP!
         if exist ".\src\sorter\sorting.py" (
-            echo [DEBUG] sorting.py found, running python...
             python -u ./src/sorter/sorting.py --input_folder "!CUR_IP!" --output_folder "!CUR_OP!"
-        ) else (
-            echo [DEBUG] sorting.py NOT found at: %CD%\src\sorter\sorting.py
         )
     )
     echo.
