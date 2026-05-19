@@ -120,7 +120,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         folder=processed_folder, 
         format='binary', 
         overwrite=True, 
-        n_jobs=2,
+        n_jobs=1,  # Keep this at 1 for Windows!
         chunk_duration="1s",
         progress_bar=True
     )
@@ -147,6 +147,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         grouping_property='group',
         folder=sorter_work_folder,
         verbose=True,
+        engine="joblib",
+        engine_kwargs={"n_jobs": 4, "backend": "loky"},
         **para
     )
 
