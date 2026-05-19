@@ -1163,14 +1163,12 @@ class Tracker:
             curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
             sync_time = self.sync_ts_dict.get(self.ts_column_name, {}).get(curr_idx, self.converted_time)
 
+            # Goal gets a wider detect radius (26 px) so the trial-ending check
+            # (25 px on self.goal_location) is guaranteed to be preceded by the
+            # goal being recorded into saved_nodes. Other nodes stay at 20 px.
+            goal_key = str(getattr(self, 'current_goal_name', '')) if getattr(self, 'current_goal_name', None) is not None else None
             for node_name in nodes_dict:
-                # Use the goal radius for the active goal so a successful trial
-                # always captures the goal node in the path. Other nodes use
-                # the normal 20 px detection radius.
-                if node_name == getattr(self, 'current_goal_name', None):
-                    detect_radius = self.goal_node_radius
-                else:
-                    detect_radius = 20
+                detect_radius = 26 if (goal_key is not None and str(node_name) == goal_key) else 20
                 if points_dist(self.pos_centroid, nodes_dict[node_name]) <= detect_radius:
                     self.saved_nodes.append(node_name)
                     self.node_pos.append(nodes_dict[node_name])
