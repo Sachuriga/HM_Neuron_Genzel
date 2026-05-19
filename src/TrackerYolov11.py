@@ -1164,7 +1164,14 @@ class Tracker:
             sync_time = self.sync_ts_dict.get(self.ts_column_name, {}).get(curr_idx, self.converted_time)
 
             for node_name in nodes_dict:
-                if points_dist(self.pos_centroid, nodes_dict[node_name]) <= 20:
+                # Use the goal radius for the active goal so a successful trial
+                # always captures the goal node in the path. Other nodes use
+                # the normal 20 px detection radius.
+                if node_name == getattr(self, 'current_goal_name', None):
+                    detect_radius = self.goal_node_radius
+                else:
+                    detect_radius = 20
+                if points_dist(self.pos_centroid, nodes_dict[node_name]) <= detect_radius:
                     self.saved_nodes.append(node_name)
                     self.node_pos.append(nodes_dict[node_name])
 

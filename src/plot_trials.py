@@ -669,10 +669,19 @@ if __name__ == "__main__":
                 pts = np.column_stack([x_plot, y_plot])
                 segments = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_arr = np.linspace(0.0, 1.0, len(pts) - 1)
-                lc = LineCollection(segments, cmap="cool", norm=mpl.colors.Normalize(0, 1), linewidths=1.5, rasterized=True)
-                lc.set_array(t_arr)
-                ax1.add_collection(lc)
-                fig.colorbar(lc, ax=ax1, fraction=0.025, pad=0.02, label="Time (Norm)")
+                # Skip segments where consecutive points jump too far apart
+                # (tracking dropouts leave gaps that would otherwise draw a straight
+                # line across the maze, often start→goal).
+                seg_lengths = np.hypot(np.diff(x_plot), np.diff(y_plot))
+                JUMP_THRESHOLD = 0.5  # scaled units (~65 raw px, ~one node spacing)
+                valid_mask = seg_lengths < JUMP_THRESHOLD
+                segments = segments[valid_mask]
+                t_arr = t_arr[valid_mask]
+                if len(segments) > 0:
+                    lc = LineCollection(segments, cmap="cool", norm=mpl.colors.Normalize(0, 1), linewidths=1.5, rasterized=True)
+                    lc.set_array(t_arr)
+                    ax1.add_collection(lc)
+                    fig.colorbar(lc, ax=ax1, fraction=0.025, pad=0.02, label="Time (Norm)")
             ax1.set_title(f"Trial {trial_id}{title_tag}: Actual Path", color=title_color)
 
             if maze_graph and start_node and end_node:
