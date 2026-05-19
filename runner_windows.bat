@@ -87,8 +87,11 @@ if %errorlevel% equ 0 (
     set "HAS_CLEAN=1"
     call set "PARALLEL_STEPS=%%PARALLEL_STEPS:9=%%"
 )
-:: Trim spaces so empty-check works
-set "PARALLEL_STEPS_TRIM=!PARALLEL_STEPS: =!"
+:: Trim spaces so empty-check works (must guard against undefined var:
+:: `set "X="` deletes the variable, and `!X: =!` on an undefined X returns
+:: literal `!X: =!`, which is non-empty and falsely passes the check below)
+set "PARALLEL_STEPS_TRIM="
+if defined PARALLEL_STEPS set "PARALLEL_STEPS_TRIM=!PARALLEL_STEPS: =!"
 
 pushd "%~1"
 set "ROOT_DIR=%CD%"
@@ -138,16 +141,7 @@ if !count! gtr 0 (
     echo ========================================================
     echo [MASTER] Launched !count! parallel job(s). Waiting for all to finish...
     echo ========================================================
-    :WAIT_ALL_WORKERS
-    set "ALL_DONE=1"
-    for /l %%i in (1,1,!sort_count!) do (
-        set "_CHK_DIR=!SORT_DIR_%%i!"
-        if exist "%TEMP%\hm_worker_!_CHK_DIR!.pending" set "ALL_DONE=0"
-    )
-    if !ALL_DONE!==0 (
-        timeout /t 15 /nobreak >nul
-        goto :WAIT_ALL_WORKERS
-    )
+    call :WAIT_ALL_WORKERS
     echo [MASTER] All parallel workers have completed.
 )
 
@@ -245,15 +239,39 @@ exit /b
 exit /b
 
 :: ========================================================
+::            WAIT FOR ALL WORKERS SUBROUTINE
+:: ========================================================
+:WAIT_ALL_WORKERS
+    set "ALL_DONE=1"
+    for /l %%i in (1,1,!sort_count!) do (
+        set "_CHK_DIR=!SORT_DIR_%%i!"
+        if exist "%TEMP%\hm_worker_!_CHK_DIR!.pending" set "ALL_DONE=0"
+    )
+    if !ALL_DONE!==0 (
+        timeout /t 15 /nobreak >nul
+        goto :WAIT_ALL_WORKERS
+    )
+exit /b
+
+:: ========================================================
 ::                THE WORKER SUBROUTINE
 :: ========================================================
 :WORKER_ROUTINE
 set "IP=%~2"
 set "OP=%~3"
-color 0A 
+color 0A
 
 echo.
 echo [INFO] Running steps [%STEPS_TO_RUN%] for !IP!
+
+:: Guard against empty STEPS_TO_RUN — `echo %EMPTY%` would print the
+:: localized "ECHO is on/off." status line, which can contain step letters
+:: (notably "n") and falsely trigger steps via findstr.
+if not defined STEPS_TO_RUN (
+    echo [WORKER] No steps to run, exiting.
+    if not "!PENDING_FILE!"=="" if exist "!PENDING_FILE!" del /q "!PENDING_FILE!"
+    exit /b
+)
 
 :: --- STEP 1 (DIO/Raw only) ---
 echo %STEPS_TO_RUN% | findstr "1" >nul
