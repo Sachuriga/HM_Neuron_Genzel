@@ -109,30 +109,28 @@ for /d %%D in ("%ROOT_DIR%\ip*") do (
     set "NUM=!DIR_NAME:ip=!"
     set "OP_PATH=%ROOT_DIR%\op!NUM!"
 
-    if exist "!OP_PATH!\" (
-        :: Collect every ip/op pair for sequential sorting later
-        set /a sort_count+=1
-        set "SORT_IP_!sort_count!=!IP_PATH!"
-        set "SORT_OP_!sort_count!=!OP_PATH!"
-        set "SORT_DIR_!sort_count!=!DIR_NAME!"
+    :: Collect unconditionally — sorting.py creates op* if it doesn't exist yet
+    set /a sort_count+=1
+    set "SORT_IP_!sort_count!=!IP_PATH!"
+    set "SORT_OP_!sort_count!=!OP_PATH!"
+    set "SORT_DIR_!sort_count!=!DIR_NAME!"
 
-        :: Only launch a parallel worker if there are non-sort steps to run
-        if not "!PARALLEL_STEPS_TRIM!"=="" (
-            echo.
-            echo [QUEUE] Preparing: !DIR_NAME!
+    :: Only launch a parallel worker if there are non-sort steps to run
+    if not "!PARALLEL_STEPS_TRIM!"=="" (
+        echo.
+        echo [QUEUE] Preparing: !DIR_NAME!
 
-            call :WAIT_FOR_RESOURCES
+        call :WAIT_FOR_RESOURCES
 
-            set /a count+=1
-            :: Create a pending sentinel file; worker deletes it when done
-            set "PENDING_FILE=%TEMP%\hm_worker_!DIR_NAME!.pending"
-            echo . > "!PENDING_FILE!"
+        set /a count+=1
+        :: Create a pending sentinel file; worker deletes it when done
+        set "PENDING_FILE=%TEMP%\hm_worker_!DIR_NAME!.pending"
+        echo . > "!PENDING_FILE!"
 
-            start "Job-!DIR_NAME!" cmd /k call "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!" "!PARALLEL_STEPS!" "!PENDING_FILE!"
+        start "Job-!DIR_NAME!" cmd /k call "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!" "!PARALLEL_STEPS!" "!PENDING_FILE!"
 
-            echo [MASTER] Job launched. Waiting 20s for stability...
-            timeout /t 20 /nobreak >nul
-        )
+        echo [MASTER] Job launched. Waiting 20s for stability...
+        timeout /t 20 /nobreak >nul
     )
 )
 
@@ -367,16 +365,6 @@ if %errorlevel% equ 0 (
     ) else (
         echo [WARNING] No valid .mp4 file found in "!OP!" to compress.
     )
-)
-
-:: --- STEP 7 ---
-echo %STEPS_TO_RUN% | findstr "7" >nul
-if %errorlevel% equ 0 (
-    echo [STEP 7] Running Sorting...
-    if exist ".\src\sorter\sorting.py" (
-        python -u ./src/sorter/sorting.py --input_folder "%IP%" --output_folder "%OP%"
-    )
-
 )
 
 :: --- STEP 8 ---
