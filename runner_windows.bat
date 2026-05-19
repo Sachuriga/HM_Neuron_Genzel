@@ -87,9 +87,10 @@ if %errorlevel% equ 0 (
     set "HAS_CLEAN=1"
     call set "PARALLEL_STEPS=%%PARALLEL_STEPS:9=%%"
 )
-:: Trim spaces so empty-check works (must guard against undefined var:
-:: `set "X="` deletes the variable, and `!X: =!` on an undefined X returns
-:: literal `!X: =!`, which is non-empty and falsely passes the check below)
+REM Trim spaces so empty-check works. Guard against undefined PARALLEL_STEPS:
+REM set "X=" deletes the variable, and substring substitution on an undefined
+REM variable can return literal text instead of empty, falsely passing the
+REM emptiness check that gates worker spawning.
 set "PARALLEL_STEPS_TRIM="
 if defined PARALLEL_STEPS set "PARALLEL_STEPS_TRIM=!PARALLEL_STEPS: =!"
 
@@ -264,9 +265,9 @@ color 0A
 echo.
 echo [INFO] Running steps [%STEPS_TO_RUN%] for !IP!
 
-:: Guard against empty STEPS_TO_RUN — `echo %EMPTY%` would print the
-:: localized "ECHO is on/off." status line, which can contain step letters
-:: (notably "n") and falsely trigger steps via findstr.
+REM Guard against empty STEPS_TO_RUN. With an empty variable, echo emits
+REM the localized "ECHO is on/off." status line, which can contain step
+REM letters (notably n) and falsely trigger steps via findstr below.
 if not defined STEPS_TO_RUN (
     echo [WORKER] No steps to run, exiting.
     if not "!PENDING_FILE!"=="" if exist "!PENDING_FILE!" del /q "!PENDING_FILE!"
