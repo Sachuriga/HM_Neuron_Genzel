@@ -76,27 +76,34 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # 5.1. Bandpass filter
     rec_filtered = spre.bandpass_filter(rec, freq_min=300, freq_max=6000)
     
-    # 5.2. Bad Channel Detection
-    bad_channel_ids=[0,1,2,3,
-                     4,5,6,7,
-                     28,29,30,31,
-                     36,37,38,39,
-                     41,42,43,
-                     44,45,46,47,51,
-                     56,59,
-                     68,69,70,71,
-                     80,92,93,94,95,
-                     96,97,98,99,
-                     100,101,102,103,
-                     108,109,110,111,
-                     124,125,126,127]
+    # 5.2. Bad Channel Detection (Rat1-specific list; others use none)
+    if file_stem.lower().startswith("rat1"):
+        bad_channel_ids = [0,1,2,3,
+                           4,5,6,7,
+                           28,29,30,31,
+                           36,37,38,39,
+                           41,42,43,
+                           44,45,46,47,51,
+                           56,59,
+                           68,69,70,71,
+                           80,92,93,94,95,
+                           96,97,98,99,
+                           100,101,102,103,
+                           108,109,110,111,
+                           124,125,126,127]
+    else:
+        bad_channel_ids = []
 
     # 5.3. Bad Channel Interpolation
-    print("Interpolating bad channels (50 µm radius)...")
-    rec_interpolated = spre.interpolate_bad_channels(
-        rec_filtered, 
-        bad_channel_ids=bad_channel_ids
-    )
+    if bad_channel_ids:
+        print(f"Interpolating {len(bad_channel_ids)} bad channels (50 µm radius)...")
+        rec_interpolated = spre.interpolate_bad_channels(
+            rec_filtered,
+            bad_channel_ids=bad_channel_ids
+        )
+    else:
+        print("No bad channels configured for this rat — skipping interpolation.")
+        rec_interpolated = rec_filtered
 
     # 5.4. Common Average Reference
     rec_cmr = spre.common_reference(rec_interpolated, reference='global', operator='median')
