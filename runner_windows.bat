@@ -39,6 +39,7 @@ set FREQ=30000
 :: If a 4th argument exists, it's the user's selection passed from Master
 if "%~1"==":WORKER" (
     set "STEPS_TO_RUN=%~4"
+    set "PENDING_FILE=%~5"
     goto :WORKER_ROUTINE
 )
 
@@ -71,6 +72,24 @@ echo [n] Node Analysis
 echo.
 set /p "MY_SELECTION=Enter steps: "
 
+:: --- Steps 7 and 9 run after all parallel steps, sequentially ---
+:: Strip "7" and "9" from the selection passed to parallel workers
+set "PARALLEL_STEPS=%MY_SELECTION%"
+set "HAS_SORT=0"
+set "HAS_CLEAN=0"
+echo %MY_SELECTION% | findstr "7" >nul
+if %errorlevel% equ 0 (
+    set "HAS_SORT=1"
+    call set "PARALLEL_STEPS=%%PARALLEL_STEPS:7=%%"
+)
+echo %MY_SELECTION% | findstr "9" >nul
+if %errorlevel% equ 0 (
+    set "HAS_CLEAN=1"
+    call set "PARALLEL_STEPS=%%PARALLEL_STEPS:9=%%"
+)
+:: Trim spaces so empty-check works
+set "PARALLEL_STEPS_TRIM=!PARALLEL_STEPS: =!"
+
 pushd "%~1"
 set "ROOT_DIR=%CD%"
 popd
@@ -78,6 +97,7 @@ echo [DEBUG] Target Root Directory: [%ROOT_DIR%]
 
 :: 4. Scan Loop (Master Mode)
 set count=0
+set sort_count=0
 
 for /d %%D in ("%ROOT_DIR%\ip*") do (
     set "IP_PATH=%%~fD"
@@ -86,24 +106,94 @@ for /d %%D in ("%ROOT_DIR%\ip*") do (
     set "OP_PATH=%ROOT_DIR%\op!NUM!"
 
     if exist "!OP_PATH!\" (
-        echo.
-        echo [QUEUE] Preparing: !DIR_NAME!
-        
-        call :WAIT_FOR_RESOURCES
-        
-        set /a count+=1
-        :: Pass the %MY_SELECTION% as the 4th parameter to the worker
-        start "Job-!DIR_NAME!" cmd /k call "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!" "%MY_SELECTION%"
-        
-        :: 3. UPDATED: Wait exactly 15 seconds before the next loop iteration
-        echo [MASTER] Job launched. Waiting 15s for stability...
-        timeout /t 20 /nobreak >nul
+        :: Collect every ip/op pair for sequential sorting later
+        set /a sort_count+=1
+        set "SORT_IP_!sort_count!=!IP_PATH!"
+        set "SORT_OP_!sort_count!=!OP_PATH!"
+        set "SORT_DIR_!sort_count!=!DIR_NAME!"
+
+        :: Only launch a parallel worker if there are non-sort steps to run
+        if not "!PARALLEL_STEPS_TRIM!"=="" (
+            echo.
+            echo [QUEUE] Preparing: !DIR_NAME!
+
+            call :WAIT_FOR_RESOURCES
+
+            set /a count+=1
+            :: Create a pending sentinel file; worker deletes it when done
+            set "PENDING_FILE=%TEMP%\hm_worker_!DIR_NAME!.pending"
+            echo . > "!PENDING_FILE!"
+
+            start "Job-!DIR_NAME!" cmd /k call "%~f0" :WORKER "!IP_PATH!" "!OP_PATH!" "!PARALLEL_STEPS!" "!PENDING_FILE!"
+
+            echo [MASTER] Job launched. Waiting 20s for stability...
+            timeout /t 20 /nobreak >nul
+        )
     )
+)
+
+:: Wait for all parallel workers to finish before running sorting
+if !count! gtr 0 (
+    echo.
+    echo ========================================================
+    echo [MASTER] Launched !count! parallel job(s). Waiting for all to finish...
+    echo ========================================================
+    :WAIT_ALL_WORKERS
+    set "ALL_DONE=1"
+    for /l %%i in (1,1,!sort_count!) do (
+        set "_CHK_DIR=!SORT_DIR_%%i!"
+        if exist "%TEMP%\hm_worker_!_CHK_DIR!.pending" set "ALL_DONE=0"
+    )
+    if !ALL_DONE!==0 (
+        timeout /t 15 /nobreak >nul
+        goto :WAIT_ALL_WORKERS
+    )
+    echo [MASTER] All parallel workers have completed.
+)
+
+:: Run sorting sequentially — one folder at a time
+if !HAS_SORT!==1 (
+    echo.
+    echo ========================================================
+    echo [MASTER] Running SORTING sequentially ^(1 folder at a time^)...
+    echo ========================================================
+    for /l %%i in (1,1,!sort_count!) do (
+        set "CUR_IP=!SORT_IP_%%i!"
+        set "CUR_OP=!SORT_OP_%%i!"
+        echo.
+        echo [SORT %%i/!sort_count!] Processing: !CUR_IP!
+        if exist ".\src\sorter\sorting.py" (
+            python -u ./src/sorter/sorting.py --input_folder "!CUR_IP!" --output_folder "!CUR_OP!"
+        )
+    )
+    echo.
+    echo [MASTER] Sorting complete for all !sort_count! folder(s).
+)
+
+:: Run cleaning sequentially after sorting — one folder at a time
+if !HAS_CLEAN!==1 (
+    echo.
+    echo ========================================================
+    echo [MASTER] Running CLEANING sequentially ^(after sorting^)...
+    echo ========================================================
+    for /l %%i in (1,1,!sort_count!) do (
+        set "CUR_IP=!SORT_IP_%%i!"
+        echo.
+        echo [CLEAN %%i/!sort_count!] Cleaning: !CUR_IP!
+        for /d %%D in ("!CUR_IP!\*.DIO" "!CUR_IP!\*.raw" "!CUR_IP!\*timestampoffset*") do (
+            if exist "%%D" (
+                echo     Deleting: %%~nxD
+                rmdir /s /q "%%D"
+            )
+        )
+    )
+    echo.
+    echo [MASTER] Cleaning complete for all !sort_count! folder(s).
 )
 
 echo.
 echo ========================================================
-echo [MASTER] Launched !count! jobs with steps: %MY_SELECTION%
+echo [MASTER] Done. Parallel jobs: !count! ^| Sorting: !HAS_SORT!
 echo ========================================================
 pause
 exit /b
@@ -309,6 +399,11 @@ if %errorlevel% equ 0 (
     if exist ".\src\node_analysis\hex_maze_analysis.py" (
         python -u ./src/node_analysis/hex_maze_analysis.py --input_folder "%IP%" --output_folder "%OP%"
     )
+)
+
+:: Signal master that this worker is done
+if not "!PENDING_FILE!"=="" (
+    if exist "!PENDING_FILE!" del /q "!PENDING_FILE!"
 )
 
 echo.
