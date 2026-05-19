@@ -140,7 +140,7 @@ echo [DEBUG] Scan complete: count=!count! sort_count=!sort_count! HAS_SORT=!HAS_
 if !count! gtr 0 (
     echo.
     echo ========================================================
-    echo [MASTER] Launched !count! parallel job(s). Waiting for all to finish...
+    echo [MASTER] Launched !count! parallel job^(s^). Waiting for all to finish...
     echo ========================================================
     call :WAIT_ALL_WORKERS
     echo [MASTER] All parallel workers have completed.
