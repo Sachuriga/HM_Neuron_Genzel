@@ -168,7 +168,7 @@ if !HAS_SORT!==1 (
         )
     )
     echo.
-    echo [MASTER] Sorting complete for all !sort_count! folder(s).
+    echo [MASTER] Sorting complete for all !sort_count! folder^(s^).
 )
 
 :: Run cleaning sequentially after sorting — one folder at a time
@@ -189,7 +189,7 @@ if !HAS_CLEAN!==1 (
         )
     )
     echo.
-    echo [MASTER] Cleaning complete for all !sort_count! folder(s).
+    echo [MASTER] Cleaning complete for all !sort_count! folder^(s^).
 )
 
 echo.
