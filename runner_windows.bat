@@ -157,6 +157,11 @@ if !HAS_SORT!==1 (
         echo [SORT %%i/!sort_count!] Processing: !CUR_IP!
         if exist ".\src\sorter\sorting.py" (
             python -u ./src/sorter/sorting.py --input_folder "!CUR_IP!" --output_folder "!CUR_OP!"
+            if errorlevel 1 (
+                echo [SORT %%i/!sort_count!] Python exited with error ^(errorlevel=!errorlevel!^). Continuing to next folder...
+            ) else (
+                echo [SORT %%i/!sort_count!] Done.
+            )
         )
     )
     echo.
