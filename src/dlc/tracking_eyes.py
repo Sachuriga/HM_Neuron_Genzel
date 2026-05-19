@@ -142,7 +142,7 @@ def process_tracking_data(
         df.at[row_idx, 'extracted_frame_idx'] = int(row_idx)
 
         if int(region_id) > 5:
-            frame = cv2.flip(frame, 0)
+            frame = cv2.flip(frame, -1)  # -1 = flip both vertically and horizontally
 
         if writer is None:
             h, w = frame.shape[:2]
