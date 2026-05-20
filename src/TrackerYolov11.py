@@ -964,16 +964,30 @@ class Tracker:
               f'frame_time={self.frame_time/1000:.2f}s '
               f'normal={self.normal_trial} NGL={self.NGL} probe={self.probe} immune={self.check_immunity()}')
 
+        # Decide BEFORE we overwrite pos_centroid whether the rat actually
+        # reached the goal this trial. Two sources of truth:
+        #   (a) reason string is one of the "rat reached goal" branches
+        #   (b) rat's real position right now is within goal_node_radius of goal
+        # (b) catches cases where the researcher-proximity check fires before
+        # the goal-reached check (researcher walks in to pick rat up at goal).
+        SUCCESS_REASONS = ("normal reached goal", "probe complete", "NGL 10min timeout")
+        rat_reached_goal = reason in SUCCESS_REASONS
+        dist_to_goal_at_end = None
+        if self.goal_location is not None and self.pos_centroid is not None:
+            dist_to_goal_at_end = points_dist(self.pos_centroid, self.goal_location)
+            if not rat_reached_goal and dist_to_goal_at_end <= self.goal_node_radius:
+                rat_reached_goal = True
+
         self.pos_centroid = self.goal_location
         self.centroid_list.append(self.pos_centroid)
 
-        # If this trial ended because the rat actually reached the goal,
-        # ensure the goal node is recorded in the path. Without this, the
-        # node-detection loop in annotate_frame is skipped on the trial-ending
-        # frame (record_detections is about to be False), so the goal node
-        # often never appears in saved_nodes even though the rat reached it.
-        SUCCESS_REASONS = ("normal reached goal", "probe complete", "NGL 10min timeout")
-        if reason in SUCCESS_REASONS:
+        # If the rat reached the goal, force-record the goal node in the path.
+        # Without this, the node-detection loop in annotate_frame is skipped
+        # (record_detections is about to be False), so the goal node often
+        # never appears in saved_nodes even though the rat reached it.
+        goal_injected = False
+        last_saved_before = self.saved_nodes[-1] if self.saved_nodes else None
+        if rat_reached_goal:
             goal_name_str = (str(self.current_goal_name)
                              if getattr(self, 'current_goal_name', None) is not None else None)
             if goal_name_str is not None and (not self.saved_nodes or self.saved_nodes[-1] != goal_name_str):
@@ -982,6 +996,18 @@ class Tracker:
                 self.saved_nodes.append(goal_name_str)
                 self.node_pos.append(self.goal_location)
                 self.time_points.append([sync_time, goal_name_str])
+                goal_injected = True
+
+        # Capture debug info for save_to_file to write into the .txt summary.
+        self._last_trial_debug = {
+            'reason': reason,
+            'dist_to_goal_px': (round(dist_to_goal_at_end, 1) if dist_to_goal_at_end is not None else None),
+            'goal_radius_px': self.goal_node_radius,
+            'rat_reached_goal': rat_reached_goal,
+            'goal_name': (str(self.current_goal_name) if getattr(self, 'current_goal_name', None) is not None else None),
+            'last_node_before_inject': last_saved_before,
+            'goal_injected': goal_injected,
+        }
 
         self.record_detections = False  # disable detections before annotate_frame so post-end frames don't get injected
         self.annotate_frame(self.disp_frame)
@@ -1282,6 +1308,18 @@ class Tracker:
             
             file.write('\nSummary Trial {}\n'.format(self.trial_num))
             file.write('Trial End (Sync Seconds): {}\n'.format(trial_end_sync))
+
+            # Debug: end-trial decision + goal-injection outcome
+            dbg = getattr(self, '_last_trial_debug', None)
+            if dbg is not None:
+                file.write(
+                    '[DEBUG] reason="{reason}" | goal_node={goal_name} | '
+                    'dist_to_goal_px={dist_to_goal_px} (radius={goal_radius_px}) | '
+                    'rat_reached_goal={rat_reached_goal} | '
+                    'last_node_before={last_node_before_inject} | '
+                    'goal_injected={goal_injected}\n'.format(**dbg)
+                )
+
             file.write('Start-Next Nodes // Sync Time (s) // Diff (s) // Length (m) // Velocity (m/s)\n')
             
             for i in range(0, len(self.summary_trial)):
