@@ -28,8 +28,14 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # 1. SETUP PATHS
     output_parent_obj = Path(output_parent)
     output_dir = output_parent_obj / f"{file_stem}_sorting_output"
+
+    # Wipe any leftover artifacts from a previous (possibly failed) run so
+    # nothing collides with this attempt.
+    if output_dir.exists():
+        print(f"Cleaning previous output: {output_dir}")
+        shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"\n--- Processing {file_stem} ---")
     print(f"Output folder: {output_dir}")
 
@@ -147,8 +153,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         grouping_property='group',
         folder=sorter_work_folder,
         verbose=True,
-        engine="joblib",
-        engine_kwargs={"n_jobs": 2, "backend": "multiprocessing"},
+        engine="loop",
+        engine_kwargs={},
         **para
     )
 
