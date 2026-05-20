@@ -966,7 +966,24 @@ class Tracker:
 
         self.pos_centroid = self.goal_location
         self.centroid_list.append(self.pos_centroid)
-        self.record_detections = False  # must be False before annotate_frame so the goal location is not injected into saved_nodes
+
+        # If this trial ended because the rat actually reached the goal,
+        # ensure the goal node is recorded in the path. Without this, the
+        # node-detection loop in annotate_frame is skipped on the trial-ending
+        # frame (record_detections is about to be False), so the goal node
+        # often never appears in saved_nodes even though the rat reached it.
+        SUCCESS_REASONS = ("normal reached goal", "probe complete", "NGL 10min timeout")
+        if reason in SUCCESS_REASONS:
+            goal_name_str = (str(self.current_goal_name)
+                             if getattr(self, 'current_goal_name', None) is not None else None)
+            if goal_name_str is not None and (not self.saved_nodes or self.saved_nodes[-1] != goal_name_str):
+                _curr_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                sync_time = self.sync_ts_dict.get(self.ts_column_name, {}).get(_curr_idx, self.converted_time)
+                self.saved_nodes.append(goal_name_str)
+                self.node_pos.append(self.goal_location)
+                self.time_points.append([sync_time, goal_name_str])
+
+        self.record_detections = False  # disable detections before annotate_frame so post-end frames don't get injected
         self.annotate_frame(self.disp_frame)
 
         self.calculate_velocity(self.time_points)
