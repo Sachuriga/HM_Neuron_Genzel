@@ -148,7 +148,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         folder=sorter_work_folder,
         verbose=True,
         engine="joblib",
-        engine_kwargs={"n_jobs": 4, "backend": "loky"},
+        engine_kwargs={"n_jobs": 2, "backend": "multiprocessing"},
         **para
     )
 
