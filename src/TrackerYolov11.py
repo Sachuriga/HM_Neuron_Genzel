@@ -374,11 +374,14 @@ class Tracker:
                 break
             # ----------------------------------
             
-            rat_x = self.pos_centroid[0] if self.pos_centroid else np.nan
-            rat_y = self.pos_centroid[1] if self.pos_centroid else np.nan
+            # Use `is not None` (not truthy) because pos_centroid / Researcher
+            # can be a numpy array; truthy check raises ValueError on multi-
+            # element arrays which would kill the loop and leave an empty CSV.
+            rat_x = self.pos_centroid[0] if self.pos_centroid is not None else np.nan
+            rat_y = self.pos_centroid[1] if self.pos_centroid is not None else np.nan
 
-            res_x = self.Researcher[0] if self.Researcher else np.nan
-            res_y = self.Researcher[1] if self.Researcher else np.nan
+            res_x = self.Researcher[0] if self.Researcher is not None else np.nan
+            res_y = self.Researcher[1] if self.Researcher is not None else np.nan
 
             jp_s_x, jp_s_y = np.nan, np.nan
             jp_l_x, jp_l_y = np.nan, np.nan
@@ -430,42 +433,71 @@ class Tracker:
 
     def export_tracking_data(self):
         print("\n>> Compiling tracking data to CSV...")
-        
+
         df_tracking = pd.DataFrame(self.frame_data_log)
-        
+        print(f"   frame_data_log rows: {len(df_tracking)}")
+
+        if df_tracking.empty:
+            print("   WARNING: frame_data_log is empty — the main loop never recorded any frame.")
+            print("            CSV will contain only the header row.")
+
         if not df_tracking.empty:
             df_tracking['Frame_Index'] = df_tracking['Frame_Index'].astype(int)
 
         if self.ts_file_loaded:
             try:
-                raw_ts_data = self.sync_ts_dict.get('Corrected Time Stamp', self.sync_ts_dict)
+                # Pick the right inner dict. sync_ts_dict is shaped {col: {idx: val}}.
+                # Prefer 'Corrected Time Stamp', else fall back to the column the
+                # rest of the code is using (self.ts_column_name), else any column.
+                ts_col_candidates = ['Corrected Time Stamp', getattr(self, 'ts_column_name', None)]
+                raw_ts_data = None
+                for c in ts_col_candidates:
+                    if c and isinstance(self.sync_ts_dict, dict) and c in self.sync_ts_dict:
+                        raw_ts_data = self.sync_ts_dict[c]
+                        print(f"   Using timestamp column: {c}")
+                        break
+                if raw_ts_data is None and isinstance(self.sync_ts_dict, dict) and self.sync_ts_dict:
+                    # Last resort: grab the first sub-dict
+                    first_key = next(iter(self.sync_ts_dict))
+                    candidate = self.sync_ts_dict[first_key]
+                    if isinstance(candidate, dict):
+                        raw_ts_data = candidate
+                        print(f"   Falling back to timestamp column: {first_key}")
+
+                if not isinstance(raw_ts_data, dict) or not raw_ts_data:
+                    raise ValueError("No usable timestamp column found in sync_ts_dict")
+
                 df_master = pd.DataFrame.from_dict(raw_ts_data, orient='index', columns=['Timestamp'])
                 df_master.index.name = 'Frame_Index'
                 df_master.index = df_master.index.astype(int)
                 df_master.sort_index(inplace=True)
+                # Promote Frame_Index from index to column so `merge(on=...)` works
+                # consistently across pandas versions.
+                df_master = df_master.reset_index()
 
                 df_final = pd.merge(df_master, df_tracking, on='Frame_Index', how='left')
 
                 if 'Timestamp_y' in df_final.columns:
                     df_final.rename(columns={'Timestamp_x': 'Timestamp'}, inplace=True)
                     df_final.drop(columns=['Timestamp_y'], inplace=True)
-                
+
                 df_tracking = df_final
+                print(f"   After merge: {len(df_tracking)} rows, columns: {list(df_tracking.columns)}")
 
             except Exception as e:
-                print(f"Warning: Merge failed, saving partial data only. Error: {e}")
-        
-        cols = ['Frame_Index', 'Timestamp', 'Trial_Num', 'Rat_X', 'Rat_Y', 
+                print(f"   Warning: Merge failed, saving partial data only. Error: {e}")
+
+        cols = ['Frame_Index', 'Timestamp', 'Trial_Num', 'Rat_X', 'Rat_Y',
                 'Researcher_X', 'Researcher_Y', 'JP_S_X', 'JP_S_Y', 'JP_L_X', 'JP_L_Y']
-        
+
         cols = [c for c in cols if c in df_tracking.columns]
         df_tracking = df_tracking[cols]
-        
+
         filename = f"{self.date}_Rat{self.rat}_Coordinates_Full.csv"
         save_path = os.path.join(self.out_path, filename)
-        
+
         df_tracking.to_csv(save_path, index=False)
-        print(f">> Full coordinate data saved to: {save_path}")
+        print(f">> Full coordinate data saved to: {save_path}  ({len(df_tracking)} rows, {len(df_tracking.columns)} cols)")
 
     def find_start(self, center_rat):
         node = self.start_nodes_locations[self.counter]
