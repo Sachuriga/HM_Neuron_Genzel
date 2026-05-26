@@ -491,6 +491,32 @@ INTER-TRIAL  (start_trial=False, record_detections=False)
 
 **Inter-trial lockout** — After a type-4/5/6 trial, the next trial cannot start until 10 minutes have elapsed **from the start of the special trial** (not from when it ended). A countdown overlay shows the remaining time; the researcher-proximity trigger is blocked until the lockout expires.
 
+#### Time-locked special trials
+
+A row's `Special_Trials` cell can specify when a particular trial unlocks, using the format `trial_num@MM:SS` (e.g. `3@5:30`). The schedule check runs every frame **before** any other trial logic, so it takes precedence over researcher-proximity, DNR, and goal-reach checks.
+
+| Phase | Behavior |
+|---|---|
+| Before unlock time | Trial N's start node is gated — even if the rat sits on it, `find_start` returns without triggering. The previously-active trial keeps running with its normal end conditions. |
+| Unlock time arrives, earlier trial still active | The earlier trial is force-ended with reason `"forced by special trial schedule"` regardless of why it was running. |
+| After force-end | Trial counter advances; on the next frame the gate condition is satisfied, so trial N's start node becomes triggerable normally. |
+
+Multiple time-locked trials can be defined in the same session. A plain trial number with no `@TIME` is accepted as a marker but has no runtime effect.
+
+Console output at session start lists the loaded schedule:
+
+```
+Special trial schedule (trial_num → session seconds):
+   Trial 3 → 05:30.00
+   Trial 7 → 12:00.00
+```
+
+Each force-end logs:
+
+```
+[SCHEDULE] Trial 3 unlock time 330.00s reached at session 330.13s — force-ending active trial 2.
+```
+
 ---
 
 ### Node Logging
@@ -635,7 +661,7 @@ Rows with missing or unparseable `path_to_reach` are flagged in a `flag` column 
 | `Start_Nodes` | Per-row start node IDs |
 | `Goal_Node` | Per-row goal node IDs |
 | `Trial_Type` | Per-row trial type (1–6) |
-| `Special_Trials` | Per-row special trial flags |
+| `Special_Trials` | Per-row special trial flags. Accepts a plain trial number (`3`) or the time-locked form `trial_num@MM:SS` (e.g. `3@5:30`) — the trial's start node won't trigger until the given session time, and any earlier active trial is force-ended when that time arrives. See [Time-locked special trials](#time-locked-special-trials). |
 | `Did_Not_Reach` | `1` if rat did not reach the goal for this trial (read by the tracker but currently has no effect on trial end logic) |
 | `Unnormal_Intervals` | Immunity windows per trial (`trial:start_min-end_min`) |
 

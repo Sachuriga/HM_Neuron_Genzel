@@ -237,6 +237,13 @@ class Tracker:
         # -------------------------
         
         self.special_trials = self.metadata['special_trials_list']
+        self.special_start_seconds = self.metadata.get('special_start_seconds', {}) or {}
+        if self.special_start_seconds:
+            print("Special trial schedule (trial_num → session seconds):")
+            for t_num, t_secs in sorted(self.special_start_seconds.items()):
+                mm = int(t_secs // 60)
+                ss = t_secs - mm * 60
+                print(f"   Trial {t_num} → {mm:02d}:{ss:05.2f}")
         self.did_not_reach_list = self.metadata.get('did_not_reach_list', [])
         self.xlsx_src_path = self.metadata.get('xlsx_src_path', None)
         self.repeat = self.metadata['repeat']
@@ -360,7 +367,8 @@ class Tracker:
             self.disp_frame = cv2.resize(self.frame, (1176, 712))
             
             self.t1 = time.time()
-            self.cnn(self.disp_frame) 
+            self.cnn(self.disp_frame)
+            self.check_special_schedule()
             self.annotate_frame(self.disp_frame)
             
             self.out.write(self.disp_frame)
@@ -499,9 +507,34 @@ class Tracker:
         df_tracking.to_csv(save_path, index=False)
         print(f">> Full coordinate data saved to: {save_path}  ({len(df_tracking)} rows, {len(df_tracking.columns)} cols)")
 
+    def check_special_schedule(self):
+        """If a time-locked special trial's unlock time has arrived while an
+        earlier trial is still active, force-end the earlier trial so the
+        special trial's start_node becomes triggerable on the next frame."""
+        if not self.special_start_seconds or not self.record_detections:
+            return
+        elapsed_s = self.frame_time / 1000.0
+        # Find the earliest scheduled trial that is still in the future of
+        # the current active trial and whose unlock time has been reached.
+        for sp_trial_num, sp_unlock_s in self.special_start_seconds.items():
+            if sp_trial_num <= self.trial_num:
+                continue  # past or current
+            if elapsed_s >= sp_unlock_s:
+                print(f"\n[SCHEDULE] Trial {sp_trial_num} unlock time {sp_unlock_s:.2f}s "
+                      f"reached at session {elapsed_s:.2f}s — force-ending active trial {self.trial_num}.")
+                self.end_trial(reason="forced by special trial schedule")
+                return
+
     def find_start(self, center_rat):
+        # Time-locked special trial: its start_node won't trigger before
+        # the scheduled session time. The trial is "hidden" until then.
+        if self.trial_num in self.special_start_seconds:
+            elapsed_s = self.frame_time / 1000.0
+            if elapsed_s < self.special_start_seconds[self.trial_num]:
+                return
+
         node = self.start_nodes_locations[self.counter]
-        self.locked_to_head = False 
+        self.locked_to_head = False
         if points_dist(center_rat, node) < 60:
             self.logger.info('Recording Trial {}'.format(self.trial_num))
             
@@ -1526,9 +1559,37 @@ def parse_metadata_xlsx(xlsx_path):
         if 'Trial_Type' in df.columns:
             t_types = df['Trial_Type'].dropna().astype(int).tolist()
 
+        # Special_Trials cells accept either a plain trial number ("3"),
+        # or "trial_num@MM:SS" (e.g. "3@5:30") to mark the trial as a
+        # scheduled / time-locked trial: its start_node won't trigger until
+        # the given session time, and any earlier active trial gets
+        # force-ended when that time arrives.
         sp_trials = []
+        special_start_seconds = {}  # {trial_num (1-based): seconds_from_session_start}
         if 'Special_Trials' in df.columns:
-             sp_trials = df['Special_Trials'].dropna().astype(int).tolist()
+            for raw in df['Special_Trials'].dropna().tolist():
+                s = str(raw).strip()
+                if not s:
+                    continue
+                if '@' in s:
+                    try:
+                        trial_part, time_part = s.split('@', 1)
+                        t_num = int(float(trial_part.strip()))
+                        time_part = time_part.strip()
+                        if ':' in time_part:
+                            mm, ss = time_part.split(':', 1)
+                            t_secs = int(mm) * 60 + float(ss)
+                        else:
+                            t_secs = float(time_part)
+                        sp_trials.append(t_num)
+                        special_start_seconds[t_num] = t_secs
+                    except (ValueError, IndexError) as e:
+                        print(f"Warning: bad Special_Trials entry '{s}': {e}")
+                else:
+                    try:
+                        sp_trials.append(int(float(s)))
+                    except ValueError:
+                        print(f"Warning: bad Special_Trials entry '{s}'")
 
         did_not_reach = []
         dnr_col = [c for c in df.columns if c.lower() == 'did_not_reach']
@@ -1561,6 +1622,7 @@ def parse_metadata_xlsx(xlsx_path):
             'goal_nodes_list': g_nodes,
             'trial_types_list': t_types,
             'special_trials_list': sp_trials,
+            'special_start_seconds': special_start_seconds,
             'did_not_reach_list': did_not_reach,
             'unnormal_intervals': un_dict
         }
