@@ -511,12 +511,11 @@ class Tracker:
         """If a time-locked special trial's unlock time has arrived while an
         earlier trial is still active, force-end the earlier trial.
 
-        After force-ending the normal post-trial flow applies: the
-        researcher-proximity trigger and the 10-min inter-trial lockout
-        (for type-4/5/6 trials) are preserved. The special trial's start
-        node only becomes triggerable once those normal conditions are met,
-        AND its own scheduled unlock time has been reached (gated in
-        find_start)."""
+        After force-ending we arm `start_trial` directly to bypass the
+        TrigA/TrigB researcher-proximity triggers — but the inter-trial
+        lockout is preserved separately inside `find_start` so the next
+        trial still can't actually begin within the 10-minute window after
+        a type-4/5/6 trial's start."""
         if not self.special_start_seconds or not self.record_detections:
             return
         elapsed_s = self.frame_time / 1000.0
@@ -527,6 +526,8 @@ class Tracker:
                 print(f"\n[SCHEDULE] Trial {sp_trial_num} unlock time {sp_unlock_s:.2f}s "
                       f"reached at session {elapsed_s:.2f}s — force-ending active trial {self.trial_num}.")
                 self.end_trial(reason="forced by special trial schedule")
+                self.start_trial = True
+                self.check = False
                 return
 
     def find_start(self, center_rat):
@@ -536,6 +537,18 @@ class Tracker:
             elapsed_s = self.frame_time / 1000.0
             if elapsed_s < self.special_start_seconds[self.trial_num]:
                 return
+
+        # Inter-trial lockout: if the previous trial was a special-NGL type
+        # (4/5/6), the next trial cannot actually begin until 10 minutes have
+        # elapsed since the previous trial's start. This is enforced here so
+        # the lockout still applies even when `check_special_schedule` armed
+        # start_trial directly (bypassing the TrigA/TrigB researcher block).
+        if self.counter > 0 and (self.counter - 1) < len(self.trial_types):
+            prev_type = int(self.trial_types[self.counter - 1])
+            if prev_type in (4, 5, 6):
+                time_since_prev_start = self.frame_time - getattr(self, 'last_trial_start_time_ms', -1e9)
+                if time_since_prev_start < self.lockout_duration_ms:
+                    return
 
         node = self.start_nodes_locations[self.counter]
         self.locked_to_head = False
