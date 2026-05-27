@@ -1344,8 +1344,8 @@ class Tracker:
         for text, color in lines:
             cv2.putText(frame, text, (60, y), fontFace=FONT, fontScale=0.5, color=color, thickness=1)
             y += 16
-        # Console: print on phase change OR once every 10 seconds
-        sec_bucket = int(self.frame_time / 10000)
+        # Console: print on phase change OR once every 30 seconds
+        sec_bucket = int(self.frame_time / 30000)
         prev_phase = getattr(self, '_last_phase_dbg', None)
         prev_bucket = getattr(self, '_last_phase_sec', -1)
         if phase != prev_phase or sec_bucket != prev_bucket:
