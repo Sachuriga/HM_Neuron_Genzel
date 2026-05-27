@@ -1218,18 +1218,154 @@ class Tracker:
                         fontScale=0.5, fontFace=FONT, color=(0, 0, 255), thickness=1,
                         lineType=cv2.LINE_AA)
 
+    def _phase_debug_lines(self):
+        """Return a list of (text, color) lines describing the current state
+        machine phase and the blocking conditions (if any). Used for the
+        per-frame debug HUD and for console state-transition prints."""
+        lines = []
+        WHITE = (255, 255, 255)
+        GREEN = (0, 220, 0)
+        YELLOW = (60, 220, 255)
+        RED = (60, 60, 255)
+        GREY = (180, 180, 180)
+
+        # 1. Determine phase
+        if self.end_session:
+            phase = "ENDED"
+        elif self.record_detections:
+            phase = "ACTIVE"
+        elif self.start_trial:
+            phase = "WAITING_START"
+        else:
+            phase = "INTER_TRIAL"
+
+        elapsed_s = self.frame_time / 1000.0
+        lines.append((f"[PHASE] {phase}  T#{self.trial_num}  session={elapsed_s:.1f}s", WHITE))
+
+        # 2. Per-phase blocking conditions
+        if phase == "ACTIVE":
+            _type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
+            t_in = (self.frame_time - getattr(self, 'last_trial_start_time_ms', self.frame_time)) / 1000.0
+            schedule_only = (self.trial_num + 1) in self.special_start_seconds
+            lines.append((
+                f"  type={_type} NGL={int(self.NGL)} probe={int(self.probe)} normal={int(self.normal_trial)} "
+                f"t_in_trial={t_in:.1f}s schedule_only_end={int(schedule_only)}",
+                YELLOW))
+            if schedule_only:
+                sp_unlock = self.special_start_seconds.get(self.trial_num + 1)
+                remaining = sp_unlock - elapsed_s if sp_unlock is not None else None
+                if remaining is not None:
+                    color = GREEN if remaining <= 0 else YELLOW
+                    lines.append((
+                        f"  → only end path: schedule T#{self.trial_num + 1} at {sp_unlock:.1f}s  "
+                        f"(remaining {remaining:+.1f}s)",
+                        color))
+            else:
+                # normal end conditions visible
+                if self.NGL:
+                    ngl_min = self.timer(start=self.start_time) if hasattr(self, 'timer') else 0
+                    lines.append((f"  NGL: {ngl_min}min elapsed (end at 10min, reached={int(self.reached)})", GREY))
+                if self.probe:
+                    lines.append((f"  PROBE: probe_researcher_signalled={int(self.probe_researcher_signalled)}", GREY))
+                if self.normal_trial:
+                    lines.append((f"  NORMAL: goal_node={self.current_goal_name} (end when ≤{self.goal_node_radius}px)", GREY))
+
+        elif phase == "WAITING_START":
+            blocks = []
+            # Special trial unlock gate
+            if self.trial_num in self.special_start_seconds:
+                unlock = self.special_start_seconds[self.trial_num]
+                if elapsed_s < unlock:
+                    blocks.append(f"special_unlock(T#{self.trial_num} @ {unlock:.1f}s, remaining {unlock - elapsed_s:.1f}s)")
+            # Inter-trial 10-min lockout (prev was type 4/5/6)
+            if self.counter > 0 and (self.counter - 1) < len(self.trial_types):
+                prev_type = int(self.trial_types[self.counter - 1])
+                if prev_type in (4, 5, 6):
+                    since = self.frame_time - getattr(self, 'last_trial_start_time_ms', -1e9)
+                    if since < self.lockout_duration_ms:
+                        rem = (self.lockout_duration_ms - since) / 1000.0
+                        blocks.append(f"lockout(prev_type={prev_type}, {rem:.1f}s left)")
+            # Rat-distance gate (only effective check left if no blocks)
+            rat_pos = getattr(self, 'last_rat_pos', None)
+            if rat_pos and self.counter < len(self.start_nodes_locations):
+                sn = self.start_nodes_locations[self.counter]
+                d = points_dist(rat_pos, sn)
+                blocks.append(f"rat→start_node={d:.0f}px (need ≤60)")
+            if blocks:
+                lines.append((f"  blocking: {' | '.join(blocks)}", YELLOW))
+            else:
+                lines.append((f"  no blocks — find_start should fire", GREEN))
+
+        elif phase == "INTER_TRIAL":
+            # TrigA: researcher within 300px of rat
+            rat_pos = getattr(self, 'last_rat_pos', None)
+            trig_a_status = "no rat"
+            if rat_pos:
+                cr = self.closest_researcher_to(rat_pos)
+                if cr is None:
+                    trig_a_status = "no researcher"
+                else:
+                    d = points_dist(rat_pos, cr)
+                    trig_a_status = f"{d:.0f}px (need ≤300)"
+            # TrigB: researcher within 40px of start_node for cover_required_time
+            trig_b_status = "no start_node"
+            if self.counter < len(self.start_nodes_locations):
+                sn = self.start_nodes_locations[self.counter]
+                cr = self.closest_researcher_to(sn)
+                if cr is None:
+                    trig_b_status = "no researcher"
+                else:
+                    d = points_dist(cr, sn)
+                    cover_t = getattr(self, 'cover_start_timer', 0)
+                    trig_b_status = f"{d:.0f}px (need ≤40), covered={cover_t:.0f}ms/{self.cover_required_time}ms"
+            # Lockout
+            lockout_str = "lockout=off"
+            if self.counter > 0 and (self.counter - 1) < len(self.trial_types):
+                prev_type = int(self.trial_types[self.counter - 1])
+                if prev_type in (4, 5, 6):
+                    since = self.frame_time - getattr(self, 'last_trial_start_time_ms', -1e9)
+                    if since < self.lockout_duration_ms:
+                        rem = (self.lockout_duration_ms - since) / 1000.0
+                        lockout_str = f"lockout(prev={prev_type}, {rem:.1f}s left)"
+                    else:
+                        lockout_str = f"lockout(prev={prev_type}, passed)"
+            lines.append((f"  TrigA: {trig_a_status}", GREY))
+            lines.append((f"  TrigB: {trig_b_status}", GREY))
+            lines.append((f"  {lockout_str}", GREY))
+
+        return phase, lines
+
+    def _emit_phase_debug(self, frame):
+        """Render the phase debug overlay on `frame` and print to console on
+        phase transitions / once per second."""
+        phase, lines = self._phase_debug_lines()
+        # Overlay (top of frame, below FPS)
+        y = 235
+        for text, color in lines:
+            cv2.putText(frame, text, (60, y), fontFace=FONT, fontScale=0.5, color=color, thickness=1)
+            y += 16
+        # Console: print on phase change OR once per second
+        sec_bucket = int(self.frame_time / 1000)
+        prev_phase = getattr(self, '_last_phase_dbg', None)
+        prev_bucket = getattr(self, '_last_phase_sec', -1)
+        if phase != prev_phase or sec_bucket != prev_bucket:
+            self._last_phase_dbg = phase
+            self._last_phase_sec = sec_bucket
+            print(f"[DEBUG-PHASE t={self.frame_time/1000:.1f}s] " + " || ".join(t for t, _ in lines))
+
     def annotate_frame(self, frame):
-        nodes_dict = self.nodes_dict 
-        
+        nodes_dict = self.nodes_dict
+
         cv2.putText(frame, str(self.converted_time), (970, 670),
                     fontFace=FONT, fontScale=0.75, color=(240, 240, 240), thickness=1)
-        
+
         time_diff = time.time() - self.t1
-        fps = 1.0 / max(time_diff, 0.001) 
-        
+        fps = 1.0 / max(time_diff, 0.001)
+
         self.store_fps.append(fps)
         cv2.putText(frame, "FPS: {:.2f}".format(fps), (970, 650), fontFace=FONT, fontScale=0.75, color=(240, 240, 240),
                     thickness=1)
+        self._emit_phase_debug(frame)
         
         if self.counter < len(self.goal_locations):
             active_goal_loc = self.goal_locations[self.counter]
