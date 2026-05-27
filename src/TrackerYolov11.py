@@ -1257,7 +1257,7 @@ class Tracker:
                 if remaining is not None:
                     color = GREEN if remaining <= 0 else YELLOW
                     lines.append((
-                        f"  → only end path: schedule T#{self.trial_num + 1} at {sp_unlock:.1f}s  "
+                        f"  -> only end path: schedule T#{self.trial_num + 1} at {sp_unlock:.1f}s  "
                         f"(remaining {remaining:+.1f}s)",
                         color))
             else:
@@ -1268,7 +1268,7 @@ class Tracker:
                 if self.probe:
                     lines.append((f"  PROBE: probe_researcher_signalled={int(self.probe_researcher_signalled)}", GREY))
                 if self.normal_trial:
-                    lines.append((f"  NORMAL: goal_node={self.current_goal_name} (end when ≤{self.goal_node_radius}px)", GREY))
+                    lines.append((f"  NORMAL: goal_node={self.current_goal_name} (end when <={self.goal_node_radius}px)", GREY))
 
         elif phase == "WAITING_START":
             blocks = []
@@ -1290,11 +1290,11 @@ class Tracker:
             if rat_pos and self.counter < len(self.start_nodes_locations):
                 sn = self.start_nodes_locations[self.counter]
                 d = points_dist(rat_pos, sn)
-                blocks.append(f"rat→start_node={d:.0f}px (need ≤60)")
+                blocks.append(f"rat->start_node={d:.0f}px (need <=60)")
             if blocks:
                 lines.append((f"  blocking: {' | '.join(blocks)}", YELLOW))
             else:
-                lines.append((f"  no blocks — find_start should fire", GREEN))
+                lines.append((f"  no blocks - find_start should fire", GREEN))
 
         elif phase == "INTER_TRIAL":
             # TrigA: researcher within 300px of rat
@@ -1306,7 +1306,7 @@ class Tracker:
                     trig_a_status = "no researcher"
                 else:
                     d = points_dist(rat_pos, cr)
-                    trig_a_status = f"{d:.0f}px (need ≤300)"
+                    trig_a_status = f"{d:.0f}px (need <=300)"
             # TrigB: researcher within 40px of start_node for cover_required_time
             trig_b_status = "no start_node"
             if self.counter < len(self.start_nodes_locations):
@@ -1317,7 +1317,7 @@ class Tracker:
                 else:
                     d = points_dist(cr, sn)
                     cover_t = getattr(self, 'cover_start_timer', 0)
-                    trig_b_status = f"{d:.0f}px (need ≤40), covered={cover_t:.0f}ms/{self.cover_required_time}ms"
+                    trig_b_status = f"{d:.0f}px (need <=40), covered={cover_t:.0f}ms/{self.cover_required_time}ms"
             # Lockout
             lockout_str = "lockout=off"
             if self.counter > 0 and (self.counter - 1) < len(self.trial_types):
