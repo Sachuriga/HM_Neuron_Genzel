@@ -509,16 +509,20 @@ class Tracker:
 
     def check_special_schedule(self):
         """If a time-locked special trial's unlock time has arrived while an
-        earlier trial is still active, force-end the earlier trial so the
-        special trial's start_node becomes triggerable on the next frame."""
+        earlier trial is still active, force-end the earlier trial.
+
+        After force-ending the normal post-trial flow applies: the
+        researcher-proximity trigger and the 10-min inter-trial lockout
+        (for type-4/5/6 trials) are preserved. The special trial's start
+        node only becomes triggerable once those normal conditions are met,
+        AND its own scheduled unlock time has been reached (gated in
+        find_start)."""
         if not self.special_start_seconds or not self.record_detections:
             return
         elapsed_s = self.frame_time / 1000.0
-        # Find the earliest scheduled trial that is still in the future of
-        # the current active trial and whose unlock time has been reached.
         for sp_trial_num, sp_unlock_s in self.special_start_seconds.items():
             if sp_trial_num <= self.trial_num:
-                continue  # past or current
+                continue
             if elapsed_s >= sp_unlock_s:
                 print(f"\n[SCHEDULE] Trial {sp_trial_num} unlock time {sp_unlock_s:.2f}s "
                       f"reached at session {elapsed_s:.2f}s — force-ending active trial {self.trial_num}.")
@@ -735,7 +739,12 @@ class Tracker:
             self.Researcher = None
 
         # --- UNNORMAL INTERVAL FORCE-END ---
-        if not self.start_trial and not self.end_session and self.trial_num in self.unnormal_intervals:
+        # Skipped only when a special_trials schedule will end this trial
+        # (i.e. the NEXT trial has an unlock time in special_start_seconds).
+        _schedule_only_uni = (self.trial_num + 1) in self.special_start_seconds
+        if (not self.start_trial and not self.end_session
+                and self.trial_num in self.unnormal_intervals
+                and not _schedule_only_uni):
             _, end_block_abs = self.unnormal_intervals[self.trial_num]
             current_abs_minutes = (self.frame_time / (1000 * 60)) % 60
 
@@ -796,7 +805,10 @@ class Tracker:
 
                 # Re-check record_detections AFTER object_detection,
                 # because object_detection -> end_trial() may have set it to False.
-                if self.record_detections and self.goal_location is not None:
+                # Only suppress the researcher-at-goal force-end when the
+                # NEXT trial is special-scheduled (schedule will end this one).
+                _schedule_only_ann = (self.trial_num + 1) in self.special_start_seconds
+                if self.record_detections and self.goal_location is not None and not _schedule_only_ann:
                     # Use closest researcher to the GOAL for 10s force-end
                     closest_to_goal = self.closest_researcher_to(self.goal_location)
 
@@ -817,7 +829,9 @@ class Tracker:
                             self.researcher_goal_timer = 0.0
 
         # --- RESEARCHER AT GOAL: 30-second force-end (closest to GOAL) ---
-        if self.record_detections and self.goal_location is not None:
+        # Skip only when the next trial is special-scheduled.
+        _schedule_only_30 = (self.trial_num + 1) in self.special_start_seconds
+        if self.record_detections and self.goal_location is not None and not _schedule_only_30:
             closest_to_goal = self.closest_researcher_to(self.goal_location)
 
             if closest_to_goal is not None:
@@ -949,12 +963,21 @@ class Tracker:
         is_did_not_reach = (self.counter < len(self.did_not_reach_list) and
                             self.did_not_reach_list[self.counter] == 1)
 
+        _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
+
+        # Only the special_trials schedule may end the trial when the NEXT
+        # trial has a scheduled unlock time. In that case suppress the normal
+        # end conditions (10-min NGL timeout, researcher-proximity, etc.).
+        # Trial-type 4/5/6 without a scheduled successor keeps original
+        # behavior (10-min NGL fixed end, etc.).
+        is_schedule_only_type = (self.trial_num + 1) in self.special_start_seconds
+
         if self.NGL:
             minutes = self.timer(start=self.start_time)
             if not self.reached:
                 if points_dist(self.pos_centroid, self.goal_location) <= 20:
                     self.reached = True
-            if minutes >= 10:
+            if minutes >= 10 and not is_schedule_only_type:
                 print('\n\n >>> Ten minute passed... Goal location reached:', self.reached)
                 if self.reached:
                     if not is_immune:
@@ -968,8 +991,7 @@ class Tracker:
         researcher_trigger_allowed = trial_elapsed_ms >= 5_000
 
         # For all trial types except 3, 4, 5, 6: end trial when researcher is within 150px of the rat
-        if researcher_trigger_allowed:
-            _curr_type = int(self.trial_types[self.counter]) if self.counter < len(self.trial_types) else 1
+        if researcher_trigger_allowed and not is_schedule_only_type:
             if _curr_type not in (3, 4, 5, 6):
                 _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
                 if _closest_to_rat is not None:

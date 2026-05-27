@@ -499,7 +499,9 @@ A row's `Special_Trials` cell can specify when a particular trial unlocks, using
 |---|---|
 | Before unlock time | Trial N's start node is gated — even if the rat sits on it, `find_start` returns without triggering. The previously-active trial keeps running with its normal end conditions. |
 | Unlock time arrives, earlier trial still active | The earlier trial is force-ended with reason `"forced by special trial schedule"` regardless of why it was running. |
-| After force-end | Trial counter advances; on the next frame the gate condition is satisfied, so trial N's start node becomes triggerable normally. |
+| After force-end | The normal post-trial flow applies — researcher-proximity trigger and (for type 4/5/6) the 10-min inter-trial lockout are preserved. Trial N's start node only becomes triggerable once those conditions are met AND its own scheduled unlock time has passed (gated inside `find_start`). |
+
+**Schedule-only end mode.** When a trial's *next* trial number is in the schedule list, the current trial enters "schedule-only end" mode: every other end path (NGL 10-min timeout, researcher-near-rat 150 px, researcher-at-goal 10 s / 30 s, unnormal-interval timeout) is suppressed for it. Only the schedule force-end can terminate that trial. Trials whose successor is NOT scheduled keep their original end conditions — in particular, a type 4/5/6 NGL trial without a scheduled successor still ends at its 10-minute timer as before.
 
 Multiple time-locked trials can be defined in the same session. A plain trial number with no `@TIME` is accepted as a marker but has no runtime effect.
 
