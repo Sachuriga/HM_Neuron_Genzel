@@ -419,8 +419,6 @@ if __name__ == "__main__":
 
     if args.session_folder is not None:
         session_folder, note = parse_folder_name(Path(args.session_folder).name)
-        print(session_folder)
-        print(note)
         notes = [note]
         session_folders = [Path(root + input_folder + session_folder)]
 
@@ -428,7 +426,6 @@ if __name__ == "__main__":
         print("Found session folders: \n")
 
     for i, session_dir in enumerate(session_folders):
-        print(i, session_dir)
         # this appends the paths, in each session directory, to a list of all paths
         if notes[i] != "":
             session_dir = session_dir.with_name(session_dir.name + notes[i]) # reconstruct full folder name
