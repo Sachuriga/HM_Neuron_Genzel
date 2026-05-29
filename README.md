@@ -425,6 +425,19 @@ python hex_maze_analysis.py --input_folder <ip> --output_folder <op>
 
 Reads all `.xlsx` files in the input folder and computes behavioral metrics from trial node sequences. Each input file produces a `*_results.xlsx` in the output folder. See [Node Analysis — Computed Metrics](#node-analysis--computed-metrics) for a full reference of every computed column.
 
+### Step w — NWB / LFP Package
+
+**Key:** `w` (labelled `nwblfp` in the menu)
+**Script:** `src/nwb/create_nwb.py`
+**Command** (run once at the master level, after every parallel/sequential step has completed):
+```
+python create_nwb.py --rat_nr %NWB_RAT_NR% --noroot --ip <ROOT_DIR> --op <ROOT_DIR>
+```
+
+Packages the rat's processed data (Coordinates CSVs, paths TXT, tracker log, optional LFP `.npy` files) into [NWB (Neurodata Without Borders)](https://www.nwb.org/) files — one `.nwb` per session, written to `ROOT_DIR`.
+
+This step is not parallelized: it runs once at the master level after sorting and cleaning, because `create_nwb.py` scans the whole rat directory in one pass. The rat number is read from `NWB_RAT_NR` in `hm_tracker_paths.txt` (default `1`). The auxiliary helpers live in `src/tools/` (`pathnames.py`, `process_log.py`, `process_txt.py`, `process_dataframe.py`).
+
 ---
 
 ## Tracker — How It Works
