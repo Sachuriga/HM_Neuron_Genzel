@@ -6,3 +6,7 @@
 FFMPEG_CMD=C:\Users\YOUR_NAME\Desktop\ffmpeg-...\bin\ffmpeg.exe
 ONNX_WEIGHTS_PATH=C:\Users\YOUR_NAME\Desktop\data\yolov\bests_1280_mosiac_close.pt
 TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport.exe
+
+# NWB step (menu [w] nwblfp): rat number passed as --rat_nr to create_nwb.py.
+# Defaults to 1 if not set.
+NWB_RAT_NR=1

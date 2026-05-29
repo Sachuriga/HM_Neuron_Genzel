@@ -69,14 +69,16 @@ echo [8] LFP
 echo [d] deeplabcut
 echo [9] Cleaning
 echo [n] Node Analysis
+echo [w] nwblfp (NWB / LFP package)
 echo.
 set /p "MY_SELECTION=Enter steps: "
 
-:: --- Steps 7 and 9 run after all parallel steps, sequentially ---
-:: Strip "7" and "9" from the selection passed to parallel workers
+:: --- Steps 7, 9 and w run after all parallel steps, sequentially ---
+:: Strip "7", "9", and "w" from the selection passed to parallel workers
 set "PARALLEL_STEPS=%MY_SELECTION%"
 set "HAS_SORT=0"
 set "HAS_CLEAN=0"
+set "HAS_NWB=0"
 echo %MY_SELECTION% | findstr "7" >nul
 if %errorlevel% equ 0 (
     set "HAS_SORT=1"
@@ -86,6 +88,11 @@ echo %MY_SELECTION% | findstr "9" >nul
 if %errorlevel% equ 0 (
     set "HAS_CLEAN=1"
     call set "PARALLEL_STEPS=%%PARALLEL_STEPS:9=%%"
+)
+echo %MY_SELECTION% | findstr "w" >nul
+if %errorlevel% equ 0 (
+    set "HAS_NWB=1"
+    call set "PARALLEL_STEPS=%%PARALLEL_STEPS:w=%%"
 )
 REM Trim spaces so empty-check works. Guard against undefined PARALLEL_STEPS:
 REM set "X=" deletes the variable, and substring substitution on an undefined
@@ -189,9 +196,33 @@ if !HAS_CLEAN!==1 (
     echo [MASTER] Cleaning complete for all !sort_count! folder^(s^).
 )
 
+:: Run NWB packaging at the master level. The create_nwb.py script expects
+:: ROOT_DIR to be the input folder containing per-session subfolders (the
+:: op*/ip* folders), and processes them in one shot. NWB_RAT_NR can be set
+:: in the hm_tracker_paths.txt config file; defaults to 1.
+if !HAS_NWB!==1 (
+    if not defined NWB_RAT_NR set "NWB_RAT_NR=1"
+    echo.
+    echo ========================================================
+    echo [MASTER] Running NWB / LFP packaging ^(rat_nr=!NWB_RAT_NR!^)...
+    echo ========================================================
+    if exist ".\src\nwb\create_nwb.py" (
+        pushd ".\src\nwb"
+        python -u create_nwb.py --rat_nr !NWB_RAT_NR! --noroot --ip "!ROOT_DIR!" --op "!ROOT_DIR!"
+        if errorlevel 1 (
+            echo [NWB] Python exited with error ^(errorlevel=!errorlevel!^).
+        ) else (
+            echo [NWB] Done.
+        )
+        popd
+    ) else (
+        echo [NWB] create_nwb.py NOT found at: %CD%\src\nwb\create_nwb.py
+    )
+)
+
 echo.
 echo ========================================================
-echo [MASTER] Done. Parallel jobs: !count! ^| Sorting: !HAS_SORT!
+echo [MASTER] Done. Parallel jobs: !count! ^| Sorting: !HAS_SORT! ^| NWB: !HAS_NWB!
 echo ========================================================
 pause
 exit /b
