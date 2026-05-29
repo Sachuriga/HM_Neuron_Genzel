@@ -417,28 +417,24 @@ if __name__ == "__main__":
 
     # --- END Filenames --- #
 
+    if args.session_folder is not None:
+        session_folder, note = parse_folder_name(Path(args.session_folder).name)
+        print(session_folder)
+        print(note)
+        notes = [note]
+        session_folders = [Path(root + input_folder + session_folder)]
+
     if args.sf:
         print("Found session folders: \n")
-    if args.session_folder is None:
-        for i, session_dir in enumerate(session_folders):
-            # this appends the paths, in each session directory, to a list of all paths
-            if notes[i] != "":
-                session_dir = session_dir.with_name(session_dir.name + notes[i]) # reconstruct full folder name
-            paths = find_paths(session_dir)
-            session_paths.append(paths)
-            
-            # optionally prints this based on arg "--sf"
-            if args.sf:
-                print(f"    Session {session_dir.name}:")
-                print(paths, '\n')
-    else:
-        session_folder, note = parse_folder_name(args.session_folder)
-        notes = [note]
-        print(type(root), type(input_folder), type(session_folder), type(note))
-        session_folders = [Path(root + input_folder + session_folder + note)] #reconstruct whole folder name
-        session_dir = session_folders[0]
+
+    for i, session_dir in enumerate(session_folders):
+        print(i, session_dir)
+        # this appends the paths, in each session directory, to a list of all paths
+        if notes[i] != "":
+            session_dir = session_dir.with_name(session_dir.name + notes[i]) # reconstruct full folder name
         paths = find_paths(session_dir)
         session_paths.append(paths)
+        
         # optionally prints this based on arg "--sf"
         if args.sf:
             print(f"    Session {session_dir.name}:")
