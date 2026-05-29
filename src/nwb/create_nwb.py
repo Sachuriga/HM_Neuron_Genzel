@@ -52,7 +52,7 @@ from hdmf.common import VectorData, DynamicTable
 from hdmf.container import Container
 
 # imported from self coded tools
-from tools.pathnames import find_paths, find_session_folders
+from tools.pathnames import find_paths, parse_folder_name, find_session_folders
 from tools.process_log import process_log
 from tools.process_txt import process_txt
 import tools.process_dataframe as pdf
@@ -292,7 +292,7 @@ def create_trials_table(df, table_name, description):
     return table
 
 # creates metadata object to hold extra information about positional data in the form of TimeSeries
-# takes str(pos_name) and dataframe with original data
+# takes dataframe and outputs the start and end frames of the trials
 def extract_trials(df):
     # previous and next values
     prev_trial = df["Trial_Num"].shift(1)
@@ -337,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--op", action = "store", type=str, required=False, help = "Specify output folder (e.g. python file.py op='output_folder' \n If not given op is same as ip")
     parser.add_argument("--sess_i", action = "store", type=int, required=False, default=1, help = "Specify what session should be selected (int)")
     parser.add_argument("--sess_f", action = "store", type=int, required=False, help = "Specify what session should be selected (int)")
+    parser.add_argument("--session_folder", action="store", type=str, required=False, help = "Optional: Specify exact session folder name to process")
     args = parser.parse_args()
 
     if args.noprint:
@@ -390,7 +391,7 @@ if __name__ == "__main__":
     if args.op is not None:
         output_folder = args.op + "/"
         # store specified op to dictionary
-        ip_op_folders["op"] = input_folder
+        ip_op_folders["op"] = output_folder
     # if dictionary contains the filepath for op
     elif "op" in ip_op_folders:
         output_folder = ip_op_folders["op"]
@@ -418,19 +419,31 @@ if __name__ == "__main__":
 
     if args.sf:
         print("Found session folders: \n")
-    
-    for i, session_dir in enumerate(session_folders):
-        # this appends the paths, in each session directory, to a list of all paths
-        if notes[i] != "":
-            session_dir = session_dir.with_name(session_dir.name + notes[i]) # reconstruct full folder name
+    if args.session_folder is None:
+        for i, session_dir in enumerate(session_folders):
+            # this appends the paths, in each session directory, to a list of all paths
+            if notes[i] != "":
+                session_dir = session_dir.with_name(session_dir.name + notes[i]) # reconstruct full folder name
+            paths = find_paths(session_dir)
+            session_paths.append(paths)
+            
+            # optionally prints this based on arg "--sf"
+            if args.sf:
+                print(f"    Session {session_dir.name}:")
+                print(paths, '\n')
+    else:
+        session_folder, note = parse_folder_name(args.session_folder)
+        notes = [note]
+        print(type(root), type(input_folder), type(session_folder), type(note))
+        session_folders = [Path(root + input_folder + session_folder + note)] #reconstruct whole folder name
+        session_dir = session_folders[0]
         paths = find_paths(session_dir)
         session_paths.append(paths)
-        
         # optionally prints this based on arg "--sf"
         if args.sf:
             print(f"    Session {session_dir.name}:")
             print(paths, '\n')
-    
+
     if args.sess_f is None:
         args.sess_f = session_folders.__len__() # if no session end is given, set it to the total number of sessions, meaning only the session specified by --sess_i will be selected
 

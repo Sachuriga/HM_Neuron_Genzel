@@ -123,10 +123,45 @@ def find_paths(work_dir: Path) -> SessionPaths:
         maze_merged_rec=maze_merged_rec,
     )
 
+# Parse a folder name string to extract session identifier and notes
+# Looks for 8 consecutive digits (typically a date like 20210612)
+# If found: session_part = everything up to and including the 8 digits, note = everything after
+# If not found: session_part = entire folder name, note = empty string
+def parse_folder_name(folder_name: str) -> tuple[str, str]:
+    """
+    Parse a folder name to extract the session identifier and notes.
+    
+    Looks for 8 consecutive digits (date) in the folder name.
+    - If found: session part includes everything up to and including those 8 digits
+    - If not found: session part is the entire folder name
+    
+    Args:
+        folder_name: The name of the folder to parse
+    
+    Returns:
+        tuple[str, str]: (session_identifier, notes)
+        
+    Examples:
+        "20210612_Rat5" -> ("20210612", "_Rat5")
+        "session_1" -> ("session_1", "")
+        "20210612_missing_lfp" -> ("20210612", "_missing_lfp")
+        "some_folder" -> ("some_folder", "")
+    """
+    # Look for 8 consecutive digits (date) anywhere in the folder name
+    for i in range(len(folder_name) - 7):
+        if all(c.isdigit() for c in folder_name[i:i+8]):
+            # Found 8 consecutive digits
+            session_part = folder_name[:i+8]
+            note = folder_name[i+8:]  # Keep everything after to allow perfect reconstruction
+            return session_part, note
+    
+    # If no 8 digits found, return the whole name as session_part
+    return folder_name, ""
+
 # function to read multiple folders containing data for each session
-# Returns a tuple of (session_folders, notes) where session_folders contains paths with just the session number
-# and notes contains any text after the session number
-# Full folder name can be reconstructed as: session_folders[i].name + " " + notes[i]
+# Returns a tuple of (session_folders, notes) where session_folders contains paths with the session identifier
+# and notes contains any text after the session identifier
+# If no 8-digit pattern is found, the full folder name becomes the session identifier
 def find_session_folders(sessions_dir: Path) -> tuple[list[Path], list[str]]:
     if not sessions_dir.exists():
         sys.exit(f"Error: sessions directory does not exist: {sessions_dir}")
@@ -136,42 +171,12 @@ def find_session_folders(sessions_dir: Path) -> tuple[list[Path], list[str]]:
         if p.is_dir()
     )
 
-    # Extract notes (anything after the session number) for each folder
     session_folders = []
     notes = []
     
     for folder in session_folders_raw:
-        folder_name = folder.name
-        
-        # Try to find where the number ends
-        # Handle cases like: "session_1", "session_20200914", "20200914", "20200914 missing lfp"
-        note = ""
-        
-        # Remove "session_" prefix if it exists
-        if folder_name.lower().startswith("session_"):
-            remainder = folder_name[8:]  # Skip "session_"
-        else:
-            remainder = folder_name
-        
-        # Find where the leading digits end
-        i = 0
-        while i < len(remainder) and remainder[i].isdigit():
-            i += 1
-        
-        # Everything after the digits is the note
-        if i < len(remainder):
-            note = remainder[i:]
-            session_num = remainder[:i]
-            # Reconstruct the path with just the session number part
-            if folder_name.lower().startswith("session_"):
-                session_name = f"session_{session_num}"
-            else:
-                session_name = session_num
-            session_path = folder.parent / session_name
-        else:
-            # No note, keep the original path
-            session_path = folder
-        
+        session_name, note = parse_folder_name(folder.name)
+        session_path = folder.parent / session_name
         session_folders.append(session_path)
         notes.append(note)
 
