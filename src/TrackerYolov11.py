@@ -294,9 +294,15 @@ class Tracker:
         self.center_researcher = None
         
         # --- TIMER FIXES ---
-        self.last_trial_end_time = -1e9  
+        self.last_trial_end_time = -1e9
         self.last_trial_start_time_ms = -1e9  # Added
-        self.lockout_duration_ms = 10 * 60 * 1000  
+        self.lockout_duration_ms = 10 * 60 * 1000
+        # A scheduled (special) trial cannot be ended by ANY trigger within this
+        # many milliseconds (video time) of starting. The researcher who places
+        # the rat at the start node is necessarily right next to it, so without
+        # this guard the researcher-proximity end trigger fires immediately and
+        # skips the trial. Increase if researchers linger longer at placement.
+        self.special_trial_min_duration_ms = 5_000
         
         self.last_rat_pos = None
         self.last_researcher_pos = None
@@ -1016,6 +1022,15 @@ class Tracker:
         # Trial-type 4/5/6 without a scheduled successor keeps original
         # behavior (10-min NGL fixed end, etc.).
         is_schedule_only_type = (self.trial_num + 1) in self.special_start_seconds
+
+        # Minimum-duration guard for the scheduled trial itself: block every end
+        # trigger for the first few seconds so the researcher who just placed the
+        # rat at the start node can't immediately end it and skip to the next
+        # trial. Position recording above still runs; only the end checks below
+        # are deferred.
+        if self.trial_num in self.special_start_seconds:
+            if (self.frame_time - self.last_trial_start_time_ms) < self.special_trial_min_duration_ms:
+                return
 
         if self.NGL:
             minutes = self.timer(start=self.start_time)
