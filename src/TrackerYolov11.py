@@ -351,6 +351,11 @@ class Tracker:
         
         self.researcher_goal_timer = 0.0
         self.pickup_timer = 0.0
+        # The "researcher within 150px of rat" end trigger only arms once the rat
+        # has separated from every researcher during the current trial, so the
+        # researcher who just placed the rat at the start node (e.g. on a
+        # schedule-forced trial) can't immediately end it. Reset each trial start.
+        self.researcher_rat_end_armed = False
         self.last_detection_boxes = []  # cached boxes for skipped frames
 
     def run_vid(self):
@@ -616,6 +621,7 @@ class Tracker:
 
             self.researcher_goal_timer = 0.0
             self.pickup_timer = 0.0
+            self.researcher_rat_end_armed = False  # re-arm only after rat separates from researchers this trial
             
             self.pos_centroid = node
             self.centroid_list.append(self.pos_centroid)
@@ -1035,7 +1041,12 @@ class Tracker:
                 _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
                 if _closest_to_rat is not None:
                     _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
-                    if _res_rat_dist <= 150:
+                    # Arm only after the rat has moved clear of every researcher
+                    # this trial; until then a researcher lingering from placing
+                    # the rat (common on schedule-forced trials) must not end it.
+                    if _res_rat_dist > 150:
+                        self.researcher_rat_end_armed = True
+                    if _res_rat_dist <= 150 and self.researcher_rat_end_armed:
                         print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 150px of rat ({_res_rat_dist:.0f}px), ending trial')
                         self.normal_trial = False
                         self.NGL = False
