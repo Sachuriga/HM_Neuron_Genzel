@@ -54,6 +54,32 @@ def convert_milli(time):
     hr = (time / (1000 * 60 * 60)) % 24
     return f'{int(hr):02d}:{int(minute):02d}:{sec:.3f}'
 
+def parse_schedule_seconds(time_part):
+    """Parse the time portion of a Special_Trials 'trial_num@MM:SS' entry into
+    seconds-from-session-start.
+
+    The documented format is MM:SS, so '12:05' -> 12*60 + 5 = 725s.
+
+    Excel tends to auto-convert a typed '12:05' into a real time value, which
+    pandas/openpyxl then render as 'MM:SS:00' (a trailing seconds field gets
+    appended). To stay robust we always interpret the FIRST two colon-separated
+    fields as minutes and seconds and ignore any trailing field, so both
+    '12:05' and '12:05:00' yield 725s. A single field (no colon) is treated as
+    bare seconds.
+
+    Returns float seconds. Raises ValueError on anything unparseable so the
+    caller can surface a loud warning instead of silently dropping the entry.
+    """
+    time_part = str(time_part).strip()
+    if not time_part:
+        raise ValueError("empty time")
+    fields = time_part.split(':')
+    if len(fields) == 1:
+        return float(fields[0])           # bare seconds
+    minutes = int(fields[0])
+    seconds = float(fields[1])            # honours the seconds, e.g. '05' -> 5.0
+    return minutes * 60 + seconds         # any further fields (Excel's ':00') ignored
+
 def safe_int_str(val):
     """Converts float/int to string without .0 for integers"""
     try:
@@ -1735,6 +1761,12 @@ def parse_metadata_xlsx(xlsx_path):
         # scheduled / time-locked trial: its start_node won't trigger until
         # the given session time, and any earlier active trial gets
         # force-ended when that time arrives.
+        #
+        # IMPORTANT: enter timed cells as TEXT so Excel keeps the literal
+        # "trial_num@MM:SS" (otherwise Excel may turn "12:05" into a time value
+        # and the trial number is lost). The parser below tolerates the
+        # "MM:SS:00" form Excel sometimes produces, but it CANNOT recover a
+        # plain time value that has no "trial_num@" prefix.
         sp_trials = []
         special_start_seconds = {}  # {trial_num (1-based): seconds_from_session_start}
         if 'Special_Trials' in df.columns:
@@ -1746,21 +1778,26 @@ def parse_metadata_xlsx(xlsx_path):
                     try:
                         trial_part, time_part = s.split('@', 1)
                         t_num = int(float(trial_part.strip()))
-                        time_part = time_part.strip()
-                        if ':' in time_part:
-                            mm, ss = time_part.split(':', 1)
-                            t_secs = int(mm) * 60 + float(ss)
-                        else:
-                            t_secs = float(time_part)
+                        t_secs = parse_schedule_seconds(time_part)
                         sp_trials.append(t_num)
                         special_start_seconds[t_num] = t_secs
                     except (ValueError, IndexError) as e:
-                        print(f"Warning: bad Special_Trials entry '{s}': {e}")
+                        # Loud, actionable: a dropped schedule entry otherwise
+                        # silently falls back to the 10-min lockout, making a
+                        # time-locked trial start at the wrong (earlier) time.
+                        print(f"\n*** WARNING: could not parse timed Special_Trials entry "
+                              f"'{s}' ({e}). This trial will NOT be time-locked. "
+                              f"Use the text format 'trial_num@MM:SS', e.g. '2@12:05'. ***\n")
                 else:
                     try:
                         sp_trials.append(int(float(s)))
                     except ValueError:
-                        print(f"Warning: bad Special_Trials entry '{s}'")
+                        # A bare time value (e.g. '12:05:00') with no 'trial_num@'
+                        # prefix means Excel ate the trial number on entry.
+                        print(f"\n*** WARNING: Special_Trials entry '{s}' has no "
+                              f"'trial_num@' prefix and was ignored. If you meant a "
+                              f"timed trial, format the cell as Text and enter "
+                              f"'trial_num@MM:SS', e.g. '2@12:05'. ***\n")
 
         did_not_reach = []
         dnr_col = [c for c in df.columns if c.lower() == 'did_not_reach']
