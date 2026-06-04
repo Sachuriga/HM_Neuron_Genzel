@@ -601,7 +601,18 @@ class Tracker:
             current_trial_type = int(self.trial_types[self.counter])
             self.goal_location = self.goal_locations[self.counter]
             self.current_goal_name = self.goal_nodes[self.counter]
-            
+
+            # Clear per-trial state BEFORE re-deriving it from this trial's type.
+            # end_trial() does not reset these, and some end paths (notably the
+            # special-trial force-end) leave them set — without this reset a
+            # leaked NGL/probe flag (with a stale start_time) makes the next
+            # trial end instantly with e.g. "NGL 10min timeout".
+            self.NGL = False
+            self.probe = False
+            self.normal_trial = False
+            self.reached = False
+            self.probe_researcher_signalled = False
+
             if self.trial_num == 1 and current_trial_type != 1:
                 self.start_time = (self.frame_time / (1000 * 60)) % 60
                 if current_trial_type == 3:
