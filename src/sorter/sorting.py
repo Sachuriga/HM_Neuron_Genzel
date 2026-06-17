@@ -113,7 +113,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         rec_interpolated = rec_filtered
 
     # 5.4. Common Average Reference
-    rec_cmr = spre.common_reference(rec_interpolated, reference='global', operator='average')
+    rec_cmr = spre.common_reference(rec_interpolated, reference='global', operator='median')
     
     # 5.5. Whiten (Highly recommended for MountainSort)
     rec_preprocessed = spre.whiten(rec_cmr, dtype='float32')
@@ -136,9 +136,12 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     win_temp.mkdir(exist_ok=True)
     os.environ['TEMPDIR'] = str(win_temp)
 
-    sorter_name = 'mountainsort4' 
+    sorter_name = 'mountainsort5' 
     para = si.get_default_sorter_params(sorter_name)
     para['adjacency_radius']=50
+    para['scheme']=2
+    para['detect_sign']=0
+    #para['adjacency_radius']=50
     para['filter']=False
     para['whiten']=True
     
