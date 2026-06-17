@@ -139,7 +139,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     sorter_name = 'mountainsort5' 
     para = si.get_default_sorter_params(sorter_name)
     #para['adjacency_radius']=50
-    para['scheme']=2
+    para['scheme']='2'
     para['detect_sign']=0
     #para['adjacency_radius']=50
     para['filter']=False
