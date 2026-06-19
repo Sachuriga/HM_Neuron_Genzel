@@ -449,8 +449,8 @@ if __name__ == "__main__":
         # Try to load framewise files; if they don't exist, they'll be None
         df_framewise_ts = safe_read('framewise_ts', paths.csv_paths, 'csv')
         df_framewise_seconds = safe_read('stitched_framewise_seconds', paths.csv_paths, 'csv')
-        df_log = safe_read(next(iter(paths.log_paths)), paths.log_paths, 'log')
-        df_txt = safe_read(next(iter(paths.txt_paths)), paths.txt_paths, 'txt')
+        df_log = safe_read(next(iter(paths.log_paths)), paths.log_paths, 'log') if paths.log_paths else None
+        df_txt = safe_read(next(iter(paths.txt_paths)), paths.txt_paths, 'txt') if paths.txt_paths else None
 
         # Try to load LFP files; if they don't exist, they'll be None
         lfp_channels = safe_read('lfp_channels', paths.numpy_paths, 'npy')
@@ -510,9 +510,8 @@ if __name__ == "__main__":
         dropbox_URL = "https://www.dropbox.com/scl/fi/0rkk028xb77zxn182nlnr/Hexmaze_Baseline_Ephys-1_R1-2_alldata_work.xlsx?rlkey=n1egmdsb86r48yw8tq7w07ih2&st=zpbtjn3u&dl=1"
         dropbox_df = pd.read_excel(dropbox_URL, engine="openpyxl")
         # match session date to dropbox metadata to extract more information about the session
-        current_session_mask = dropbox_df['Date'] == f"{str(nwb_session_start_time.day).zfill(2)}.{
-                                                        str(nwb_session_start_time.month).zfill(2)}.{
-                                                            nwb_session_start_time.year}"
+        session_date_str = f"{str(nwb_session_start_time.day).zfill(2)}.{str(nwb_session_start_time.month).zfill(2)}.{nwb_session_start_time.year}"
+        current_session_mask = dropbox_df['Date'] == session_date_str
         
         if current_session_mask.any():
             nwb_experimenter = dropbox_df[current_session_mask]['Experimenter'].values[0]
