@@ -349,8 +349,8 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
    - Bandpass filter: **300–6 000 Hz**
    - Bad-channel interpolation (**50 µm** radius): a per-rat list of bad channels (see config below) is interpolated from their neighbours
    - Common reference: optional reference channel(s) per rat, followed by a global median common-average reference
-   - Whitening (float32)
-4. **Sorting** — **Mountainsort4** is run via SpikeInterface (`adjacency_radius=50 µm`, pre-filtering and whitening disabled since already done).
+   - No manual whitening — the sorter whitens internally (`whiten=True`), so it is not applied a second time here
+4. **Sorting** — **MountainSort5** (default) or **MountainSort4** is run via SpikeInterface, selectable with the `SORTER` config key. Pre-filtering is disabled (already band-pass filtered above) and the sorter does its own whitening.
 5. **Analysis** — Waveforms extracted (1 ms before, 2 ms after spike peak), 3-component PCA per channel, quality metrics (SNR, ISI violation, firing rate).
 6. **Export** — Results exported to `phy_export/` for manual curation in Phy. All intermediate files are deleted; only `phy_export/` is retained.
 
@@ -359,12 +359,16 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
 Bad channels and reference channels are read from `hm_tracker_paths.txt` (the same Desktop config file used by the runner; pass it with `--config`, or it falls back to `~/Desktop/hm_tracker_paths.txt`). The rat is matched against the start of each recording's file name (e.g. `rat1_..._group0.dat` → the `RAT1` keys).
 
 ```
+# sorter selection (applies to all rats); mountainsort5 (default) or mountainsort4
+SORTER=mountainsort5
+
 # space- or comma-separated; plain ids and NT notation can be mixed
 BAD_CHANNELS_RAT1=0 1 2 3 NT8ch1 NT8ch2
 REF_CHANNEL_RAT1=NT17ch1
 EEG_TETRODES_RAT1=NT1 NT32
 ```
 
+- **`SORTER`** — which spike sorter to run for all rats: `mountainsort5` (default) or `mountainsort4`. If omitted or unrecognised, `mountainsort5` is used. The sorter name is included in each recording's output folder (e.g. `rat1_..._mountainsort5_sorting_output`).
 - **`BAD_CHANNELS_<RAT>`** — channels to interpolate. Omit/leave empty for none.
 - **`REF_CHANNEL_<RAT>`** — channel(s) referenced against *before* the global median CAR (several ids are averaged together). If omitted, only the global median CAR is applied.
 - **`EEG_TETRODES_<RAT>`** — whole tetrodes used for EEG, written as `NT<t>` or just the number `<t>` (1–32). All four channels of each listed tetrode are **removed from the recording before sorting** (e.g. `NT5` drops channels 16 17 18 19). Any bad/ref channels that fall on an excluded tetrode are dropped automatically. Omit/leave empty to sort every tetrode.

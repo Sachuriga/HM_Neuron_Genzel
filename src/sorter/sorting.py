@@ -25,6 +25,23 @@ DEFAULT_BAD_CHANNELS = {
 
 import re
 
+# Sorter selection. Stored in the config dict under a reserved key that can
+# never collide with a rat token (rat keys are matched against file stems).
+SORTER_CONFIG_KEY = "__sorter__"
+DEFAULT_SORTER = "mountainsort5"
+SUPPORTED_SORTERS = ("mountainsort5", "mountainsort4")
+
+
+def resolve_sorter(config):
+    """Return the configured sorter name, falling back to the default."""
+    sorter = (config or {}).get(SORTER_CONFIG_KEY, DEFAULT_SORTER)
+    if sorter not in SUPPORTED_SORTERS:
+        print(f"Warning: unsupported sorter '{sorter}' in config; "
+              f"using {DEFAULT_SORTER}. Supported: {', '.join(SUPPORTED_SORTERS)}.")
+        sorter = DEFAULT_SORTER
+    return sorter
+
+
 # 128 channels are wired as 32 tetrodes of 4: NT1..NT32, each with ch1..ch4.
 # A token like "NT5ch3" maps to hardware channel (5-1)*4 + (3-1) = 18.
 N_TETRODES = 32
@@ -112,6 +129,8 @@ def load_sorting_config(config_path):
     Read per-rat sorting settings from an hm_tracker_paths.txt style file.
 
     Recognised keys (RAT token is anything, e.g. RAT1, RAT2, MOUSEA):
+        SORTER=mountainsort5             spike sorter for all rats
+                                         (mountainsort5 or mountainsort4)
         BAD_CHANNELS_<RAT>=0 1 2 3 ...   channels to interpolate
         REF_CHANNEL_<RAT>=64             single (or space separated) reference
                                          channel(s) for common_reference.
@@ -146,7 +165,9 @@ def load_sorting_config(config_path):
             key, value = line.split("=", 1)
             key = key.strip().upper()
             value = value.strip()
-            if key.startswith("BAD_CHANNELS_"):
+            if key == "SORTER":
+                config[SORTER_CONFIG_KEY] = value.lower()
+            elif key.startswith("BAD_CHANNELS_"):
                 rat = key[len("BAD_CHANNELS_"):].lower()
                 _entry(rat)["bad_channels"] = _parse_channel_list(value)
             elif key.startswith("REF_CHANNEL_"):
@@ -156,8 +177,11 @@ def load_sorting_config(config_path):
                 rat = key[len("EEG_TETRODES_"):].lower()
                 _entry(rat)["eeg_channels"] = _parse_tetrode_list(value)
 
-    if config:
-        print(f"Loaded sorting config for rats: {', '.join(sorted(config))}")
+    rats = [k for k in config if k != SORTER_CONFIG_KEY]
+    if rats:
+        print(f"Loaded sorting config for rats: {', '.join(sorted(rats))}")
+    if SORTER_CONFIG_KEY in config:
+        print(f"Sorter selected in config: {config[SORTER_CONFIG_KEY]}")
     return config
 
 
@@ -211,7 +235,8 @@ except ImportError:
 
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
-                        bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None):
+                        bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
+                        sorter_name=DEFAULT_SORTER):
     """
     Runs the spike sorting pipeline on a single .dat file.
     Plotting is disabled, progress bars are enabled for all computations.
@@ -222,7 +247,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
 
     # 1. SETUP PATHS
     output_parent_obj = Path(output_parent)
-    output_dir = output_parent_obj / f"{file_stem}_sorting_output"
+    output_dir = output_parent_obj / f"{file_stem}_{sorter_name}_sorting_output"
 
     # Wipe any leftover artifacts from a previous (possibly failed) run so
     # nothing collides with this attempt.
@@ -324,9 +349,10 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     else:
         rec_ref = rec_interpolated
     rec_cmr = spre.common_reference(rec_ref, reference='global', operator='median')
-    
-    # 5.5. Whiten (Highly recommended for MountainSort)
-    rec_preprocessed = spre.whiten(rec_cmr, dtype='float32')
+
+    # 5.5. No manual whitening here — MountainSort does its own whitening
+    #      (para['whiten']=True below), so whitening twice would be wrong.
+    rec_preprocessed = rec_cmr
 
     processed_folder = output_dir / 'processed_binary'
     if processed_folder.exists():
@@ -341,20 +367,21 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         progress_bar=True
     )
 
-    # 6. SPIKE SORTING (Mountainsort4)
+    # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
     win_temp.mkdir(exist_ok=True)
     os.environ['TEMPDIR'] = str(win_temp)
 
-    sorter_name = 'mountainsort5' 
     para = si.get_default_sorter_params(sorter_name)
-    #para['adjacency_radius']=50
-    para['scheme']='2'
-    para['detect_sign']=0
-    #para['adjacency_radius']=50
-    para['filter']=False
-    para['whiten']=True
-    
+    # We've already band-pass filtered above, so let the sorter skip filtering
+    # but still do its own whitening. Detect both spike polarities.
+    para['filter'] = False
+    para['whiten'] = True
+    para['detect_sign'] = 0
+    if sorter_name == 'mountainsort5':
+        # scheme '2' is MS5's recommended multi-pass clustering scheme.
+        para['scheme'] = '2'
+
     sorter_work_folder = output_dir / 'sorting_work_folder'
     if sorter_work_folder.exists():
         shutil.rmtree(sorter_work_folder)
@@ -445,6 +472,8 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     channels and reference channels are resolved from it by file stem.
     """
     config = config or {}
+    sorter_name = resolve_sorter(config)
+    print(f"Using sorter: {sorter_name}")
     base_path = Path(base_data_folder)
     output_path = Path(output_data_folder)
 
@@ -474,6 +503,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
                 bad_channel_ids=bad_channel_ids,
                 ref_channels=ref_channels,
                 eeg_channel_ids=eeg_channel_ids,
+                sorter_name=sorter_name,
             )
         except Exception as e:
             print(f"Error processing {dat_file.name}:\n{e}")

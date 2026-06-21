@@ -12,6 +12,15 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 NWB_RAT_NR=1
 
 # -------------------------------------------------------------------
+# Spike sorter selection (menu [7] sorting).
+# SORTER : which spike sorter to run for ALL rats. Options:
+#            mountainsort5  (default)
+#            mountainsort4
+#          If omitted or unrecognised, mountainsort5 is used.
+# -------------------------------------------------------------------
+SORTER = mountainsort5
+
+# -------------------------------------------------------------------
 # Spike sorting (menu [7] sorting): per-rat channel settings.
 # The rat is matched against the start of each recording file name,
 # e.g. "rat1_2024..._group0.dat" matches the RAT1 keys below.
