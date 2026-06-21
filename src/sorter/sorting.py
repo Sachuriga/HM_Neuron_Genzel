@@ -42,6 +42,26 @@ def resolve_sorter(config):
     return sorter
 
 
+# Global numeric sorting settings. Stored in the config dict under a reserved
+# key. Maps the config-file key (upper case) -> (internal name, converter,
+# default value).
+SORTING_PARAMS_KEY = "__params__"
+SORTING_PARAM_SPEC = {
+    "FREQ_MIN": ("freq_min", float, 600.0),          # band-pass high-pass cutoff (Hz)
+    "FREQ_MAX": ("freq_max", float, 8000.0),         # band-pass low-pass cutoff (Hz)
+    "DETECT_THRESHOLD": ("detect_threshold", float, 5.0),  # spike detection threshold
+    "DETECT_SIGN": ("detect_sign", int, 0),          # -1 neg, 0 both, 1 pos
+}
+
+
+def resolve_sorting_params(config):
+    """Return the numeric sorting settings, filling in defaults for any
+    keys not present in the config file."""
+    stored = (config or {}).get(SORTING_PARAMS_KEY, {})
+    return {name: stored.get(name, default)
+            for (name, _conv, default) in SORTING_PARAM_SPEC.values()}
+
+
 # 128 channels are wired as 32 tetrodes of 4: NT1..NT32, each with ch1..ch4.
 # A token like "NT5ch3" maps to hardware channel (5-1)*4 + (3-1) = 18.
 N_TETRODES = 32
@@ -131,6 +151,10 @@ def load_sorting_config(config_path):
     Recognised keys (RAT token is anything, e.g. RAT1, RAT2, MOUSEA):
         SORTER=mountainsort5             spike sorter for all rats
                                          (mountainsort5 or mountainsort4)
+        FREQ_MIN=600                     band-pass high-pass cutoff (Hz)
+        FREQ_MAX=8000                    band-pass low-pass cutoff (Hz)
+        DETECT_THRESHOLD=5               spike detection threshold
+        DETECT_SIGN=0                    -1 neg, 0 both, 1 pos
         BAD_CHANNELS_<RAT>=0 1 2 3 ...   channels to interpolate
         REF_CHANNEL_<RAT>=64             single (or space separated) reference
                                          channel(s) for common_reference.
@@ -167,6 +191,15 @@ def load_sorting_config(config_path):
             value = value.strip()
             if key == "SORTER":
                 config[SORTER_CONFIG_KEY] = value.lower()
+            elif key in SORTING_PARAM_SPEC:
+                name, conv, default = SORTING_PARAM_SPEC[key]
+                if value == "":
+                    continue  # empty -> keep default
+                try:
+                    config.setdefault(SORTING_PARAMS_KEY, {})[name] = conv(value)
+                except ValueError:
+                    print(f"Warning: invalid value '{value}' for {key}; "
+                          f"using default {default}.")
             elif key.startswith("BAD_CHANNELS_"):
                 rat = key[len("BAD_CHANNELS_"):].lower()
                 _entry(rat)["bad_channels"] = _parse_channel_list(value)
@@ -177,11 +210,13 @@ def load_sorting_config(config_path):
                 rat = key[len("EEG_TETRODES_"):].lower()
                 _entry(rat)["eeg_channels"] = _parse_tetrode_list(value)
 
-    rats = [k for k in config if k != SORTER_CONFIG_KEY]
+    rats = [k for k in config if not k.startswith("__")]
     if rats:
         print(f"Loaded sorting config for rats: {', '.join(sorted(rats))}")
     if SORTER_CONFIG_KEY in config:
         print(f"Sorter selected in config: {config[SORTER_CONFIG_KEY]}")
+    if SORTING_PARAMS_KEY in config:
+        print(f"Sorting params from config: {config[SORTING_PARAMS_KEY]}")
     return config
 
 
@@ -236,14 +271,23 @@ except ImportError:
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
-                        sorter_name=DEFAULT_SORTER):
+                        sorter_name=DEFAULT_SORTER, sorting_params=None):
     """
     Runs the spike sorting pipeline on a single .dat file.
     Plotting is disabled, progress bars are enabled for all computations.
     All intermediate files are deleted at the end, leaving only phy_export.
     """
     file_path_obj = Path(file_path)
-    file_stem = file_path_obj.stem 
+    file_stem = file_path_obj.stem
+
+    # Resolve numeric sorting settings (band-pass cutoffs, detection params),
+    # falling back to the built-in defaults for anything not supplied.
+    if sorting_params is None:
+        sorting_params = resolve_sorting_params(None)
+    freq_min = sorting_params.get('freq_min', 600.0)
+    freq_max = sorting_params.get('freq_max', 8000.0)
+    detect_threshold = sorting_params.get('detect_threshold', 5.0)
+    detect_sign = sorting_params.get('detect_sign', 0)
 
     # 1. SETUP PATHS
     output_parent_obj = Path(output_parent)
@@ -318,7 +362,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     print("Preprocessing and saving binary...")
     
     # 5.1. Bandpass filter
-    rec_filtered = spre.bandpass_filter(rec, freq_min=300, freq_max=6000)
+    print(f"Bandpass filter: {freq_min}-{freq_max} Hz")
+    rec_filtered = spre.bandpass_filter(rec, freq_min=freq_min, freq_max=freq_max)
     
     # 5.2. Bad Channel Detection (per-rat list from hm_tracker_paths.txt)
     bad_channel_ids = list(bad_channel_ids) if bad_channel_ids else []
@@ -377,7 +422,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # but still do its own whitening. Detect both spike polarities.
     para['filter'] = False
     para['whiten'] = True
-    para['detect_sign'] = 0
+    para['detect_sign'] = detect_sign
+    para['detect_threshold'] = detect_threshold
     if sorter_name == 'mountainsort5':
         # scheme '2' is MS5's recommended multi-pass clustering scheme.
         para['scheme'] = '2'
@@ -473,6 +519,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     """
     config = config or {}
     sorter_name = resolve_sorter(config)
+    sorting_params = resolve_sorting_params(config)
     print(f"Using sorter: {sorter_name}")
     base_path = Path(base_data_folder)
     output_path = Path(output_data_folder)
@@ -504,6 +551,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
                 ref_channels=ref_channels,
                 eeg_channel_ids=eeg_channel_ids,
                 sorter_name=sorter_name,
+                sorting_params=sorting_params,
             )
         except Exception as e:
             print(f"Error processing {dat_file.name}:\n{e}")

@@ -359,8 +359,12 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
 Bad channels and reference channels are read from `hm_tracker_paths.txt` (the same Desktop config file used by the runner; pass it with `--config`, or it falls back to `~/Desktop/hm_tracker_paths.txt`). The rat is matched against the start of each recording's file name (e.g. `rat1_..._group0.dat` → the `RAT1` keys).
 
 ```
-# sorter selection (applies to all rats); mountainsort5 (default) or mountainsort4
+# sorter selection + numeric settings (apply to all rats)
 SORTER=mountainsort5
+FREQ_MIN=600
+FREQ_MAX=8000
+DETECT_THRESHOLD=5
+DETECT_SIGN=0
 
 # space- or comma-separated; plain ids and NT notation can be mixed
 BAD_CHANNELS_RAT1=0 1 2 3 NT8ch1 NT8ch2
@@ -369,6 +373,10 @@ EEG_TETRODES_RAT1=NT1 NT32
 ```
 
 - **`SORTER`** — which spike sorter to run for all rats: `mountainsort5` (default) or `mountainsort4`. If omitted or unrecognised, `mountainsort5` is used. The sorter name is included in each recording's output folder (e.g. `rat1_..._mountainsort5_sorting_output`).
+- **`FREQ_MIN` / `FREQ_MAX`** — band-pass filter cutoffs in Hz (high-pass / low-pass). Defaults `600` / `8000`.
+- **`DETECT_THRESHOLD`** — spike detection threshold passed to the sorter. Default `5`.
+- **`DETECT_SIGN`** — spikes to detect: `-1` negative, `0` both, `1` positive. Default `0`.
+- These four numeric settings apply to **all** rats; omit a line (or leave it empty) to use its default.
 - **`BAD_CHANNELS_<RAT>`** — channels to interpolate. Omit/leave empty for none.
 - **`REF_CHANNEL_<RAT>`** — channel(s) referenced against *before* the global median CAR (several ids are averaged together). If omitted, only the global median CAR is applied.
 - **`EEG_TETRODES_<RAT>`** — whole tetrodes used for EEG, written as `NT<t>` or just the number `<t>` (1–32). All four channels of each listed tetrode are **removed from the recording before sorting** (e.g. `NT5` drops channels 16 17 18 19). Any bad/ref channels that fall on an excluded tetrode are dropped automatically. Omit/leave empty to sort every tetrode.

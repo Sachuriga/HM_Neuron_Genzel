@@ -17,8 +17,19 @@ NWB_RAT_NR=1
 #            mountainsort5  (default)
 #            mountainsort4
 #          If omitted or unrecognised, mountainsort5 is used.
+#
+# These numeric settings apply to ALL rats. Omit a line (or leave it empty)
+# to use the built-in default shown in [brackets].
+# FREQ_MIN         : band-pass high-pass cutoff in Hz  [600]
+# FREQ_MAX         : band-pass low-pass cutoff in Hz   [8000]
+# DETECT_THRESHOLD : spike detection threshold         [5]
+# DETECT_SIGN      : spikes to detect: -1 negative, 0 both, 1 positive  [0]
 # -------------------------------------------------------------------
 SORTER = mountainsort5
+FREQ_MIN = 600
+FREQ_MAX = 8000
+DETECT_THRESHOLD = 5
+DETECT_SIGN = -1
 
 # -------------------------------------------------------------------
 # Spike sorting (menu [7] sorting): per-rat channel settings.
