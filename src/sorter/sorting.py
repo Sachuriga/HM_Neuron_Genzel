@@ -4,6 +4,150 @@ import traceback
 from pathlib import Path
 import numpy as np
 
+# Built-in fallback used only when the config file has no entry for a rat.
+# Keys are matched against the lowercased file stem prefix (e.g. "rat1").
+DEFAULT_BAD_CHANNELS = {
+    "rat1": [0, 1, 2, 3,
+             4, 5, 6, 7,
+             28, 29, 30, 31,
+             36, 37, 38, 39,
+             41, 42, 43,
+             44, 45, 46, 47, 51,
+             56, 59,
+             68, 69, 70, 71,
+             80, 92, 93, 94, 95,
+             96, 97, 98, 99,
+             100, 101, 102, 103,
+             108, 109, 110, 111,
+             124, 125, 126, 127],
+}
+
+
+import re
+
+# 128 channels are wired as 32 tetrodes of 4: NT1..NT32, each with ch1..ch4.
+# A token like "NT5ch3" maps to hardware channel (5-1)*4 + (3-1) = 18.
+N_TETRODES = 32
+CH_PER_TETRODE = 4
+_NT_RE = re.compile(r"^nt(\d+)ch(\d+)$", re.IGNORECASE)
+
+
+def nt_to_channel(tetrode, ch):
+    """Map a 1-based NT tetrode / 1-based channel to a 0-based hardware id."""
+    if not (1 <= tetrode <= N_TETRODES):
+        raise ValueError(f"tetrode {tetrode} out of range 1..{N_TETRODES}")
+    if not (1 <= ch <= CH_PER_TETRODE):
+        raise ValueError(f"channel {ch} out of range 1..{CH_PER_TETRODE}")
+    return (tetrode - 1) * CH_PER_TETRODE + (ch - 1)
+
+
+def channel_to_nt(channel):
+    """Inverse of nt_to_channel: 0-based hardware id -> (tetrode, ch), 1-based."""
+    return channel // CH_PER_TETRODE + 1, channel % CH_PER_TETRODE + 1
+
+
+def _parse_one_channel(token):
+    """Parse a single token (plain int or NTxchY) into a 0-based channel id."""
+    m = _NT_RE.match(token)
+    if m:
+        return nt_to_channel(int(m.group(1)), int(m.group(2)))
+    return int(token)
+
+
+def _parse_channel_list(raw_value):
+    """
+    Parse a space/comma separated list of channel ids into a list of ints.
+    Each token may be a plain 0-based id (e.g. "18") or NT notation
+    (e.g. "NT5ch3"). The two styles can be mixed.
+    """
+    if raw_value is None:
+        return []
+    tokens = raw_value.replace(",", " ").split()
+    channels = []
+    for tok in tokens:
+        try:
+            channels.append(_parse_one_channel(tok))
+        except ValueError as e:
+            print(f"Warning: ignoring invalid channel token '{tok}' in config ({e}).")
+    return channels
+
+
+def load_sorting_config(config_path):
+    """
+    Read per-rat sorting settings from an hm_tracker_paths.txt style file.
+
+    Recognised keys (RAT token is anything, e.g. RAT1, RAT2, MOUSEA):
+        BAD_CHANNELS_<RAT>=0 1 2 3 ...   channels to interpolate
+        REF_CHANNEL_<RAT>=64             single (or space separated) reference
+                                         channel(s) for common_reference.
+                                         If omitted, global median is used.
+
+    Returns a dict like:
+        { "rat1": {"bad_channels": [...], "ref_channels": [...]}, ... }
+    Rat tokens are lowercased so they can be matched against the file stem.
+    """
+    config = {}
+    if not config_path:
+        return config
+    config_path = Path(config_path)
+    if not config_path.exists():
+        print(f"Sorting config not found at {config_path} — using built-in defaults.")
+        return config
+
+    def _entry(rat):
+        return config.setdefault(rat, {"bad_channels": [], "ref_channels": []})
+
+    with open(config_path, "r", encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().upper()
+            value = value.strip()
+            if key.startswith("BAD_CHANNELS_"):
+                rat = key[len("BAD_CHANNELS_"):].lower()
+                _entry(rat)["bad_channels"] = _parse_channel_list(value)
+            elif key.startswith("REF_CHANNEL_"):
+                rat = key[len("REF_CHANNEL_"):].lower()
+                _entry(rat)["ref_channels"] = _parse_channel_list(value)
+
+    if config:
+        print(f"Loaded sorting config for rats: {', '.join(sorted(config))}")
+    return config
+
+
+def resolve_rat_settings(file_stem, config):
+    """
+    Match a recording's file stem against the configured rats and return its
+    bad channels and reference channels. Falls back to DEFAULT_BAD_CHANNELS.
+    """
+    stem = file_stem.lower()
+
+    # Prefer the longest matching rat token so "rat10" beats "rat1".
+    matched = None
+    for rat in sorted(config, key=len, reverse=True):
+        if stem.startswith(rat):
+            matched = rat
+            break
+
+    if matched is not None:
+        settings = config[matched]
+        bad_channels = list(settings.get("bad_channels", []))
+        ref_channels = list(settings.get("ref_channels", []))
+        print(f"Using config for '{matched}': "
+              f"{len(bad_channels)} bad channel(s), "
+              f"ref={ref_channels if ref_channels else 'global median'}")
+        return bad_channels, ref_channels
+
+    # No config entry: fall back to built-in defaults (bad channels only).
+    for rat, channels in DEFAULT_BAD_CHANNELS.items():
+        if stem.startswith(rat):
+            print(f"No config entry for '{rat}'; using built-in default bad channels.")
+            return list(channels), []
+
+    return [], []
+
 import probeinterface as pi
 import spikeinterface.full as si
 import spikeinterface.preprocessing as spre
@@ -16,7 +160,8 @@ except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 
 
-def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4):
+def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
+                        bad_channel_ids=None, ref_channels=None):
     """
     Runs the spike sorting pipeline on a single .dat file.
     Plotting is disabled, progress bars are enabled for all computations.
@@ -83,23 +228,9 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # 5.1. Bandpass filter
     rec_filtered = spre.bandpass_filter(rec, freq_min=300, freq_max=6000)
     
-    # 5.2. Bad Channel Detection (Rat1-specific list; others use none)
-    if file_stem.lower().startswith("rat1"):
-        bad_channel_ids = [0,1,2,3,
-                           4,5,6,7,
-                           28,29,30,31,
-                           36,37,38,39,
-                           41,42,43,
-                           44,45,46,47,51,
-                           56,59,
-                           68,69,70,71,
-                           80,92,93,94,95,
-                           96,97,98,99,
-                           100,101,102,103,
-                           108,109,110,111,
-                           124,125,126,127]
-    else:
-        bad_channel_ids = []
+    # 5.2. Bad Channel Detection (per-rat list from hm_tracker_paths.txt)
+    bad_channel_ids = list(bad_channel_ids) if bad_channel_ids else []
+    ref_channels = list(ref_channels) if ref_channels else []
 
     # 5.3. Bad Channel Interpolation
     if bad_channel_ids:
@@ -112,8 +243,20 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         print("No bad channels configured for this rat — skipping interpolation.")
         rec_interpolated = rec_filtered
 
-    # 5.4. Common Average Reference
-    rec_cmr = spre.common_reference(rec_interpolated, reference='global', operator='median')
+    # 5.4. Common Reference
+    #   - If ref channel(s) are configured for this rat, first reference
+    #     against them ('single').
+    #   - Then always apply a global median common average reference.
+    if ref_channels:
+        print(f"Referencing against channel(s) {ref_channels}, then global median.")
+        rec_ref = spre.common_reference(
+            rec_interpolated,
+            reference='single',
+            ref_channel_ids=ref_channels,
+        )
+    else:
+        rec_ref = rec_interpolated
+    rec_cmr = spre.common_reference(rec_ref, reference='global', operator='median')
     
     # 5.5. Whiten (Highly recommended for MountainSort)
     rec_preprocessed = spre.whiten(rec_cmr, dtype='float32')
@@ -226,32 +369,43 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
 
 
-def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4):
+def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None):
     """
-    Scans the base_data_folder for .dat files inside .raw folders 
+    Scans the base_data_folder for .dat files inside .raw folders
     and processes each one, outputting strictly to output_data_folder.
+
+    `config` is the dict returned by load_sorting_config(); per-recording bad
+    channels and reference channels are resolved from it by file stem.
     """
+    config = config or {}
     base_path = Path(base_data_folder)
     output_path = Path(output_data_folder)
-    
+
     # Ensure the main output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     dat_files = list(base_path.glob("**/*.raw/*_group0.dat"))
-    
+
     if not dat_files:
         print(f"No .dat files found inside .raw folders under '{base_data_folder}'.")
         return
 
     print(f"Found {len(dat_files)} recording(s) to process.")
-    
+
     for i, dat_file in enumerate(dat_files, 1):
         print(f"\n{'='*60}")
         print(f"File {i}/{len(dat_files)}: {dat_file.name}")
         print(f"{'='*60}")
-        
+
+        bad_channel_ids, ref_channels = resolve_rat_settings(dat_file.stem, config)
         try:
-            process_single_file(file_path=dat_file, output_parent=output_path, n_jobs=n_jobs)
+            process_single_file(
+                file_path=dat_file,
+                output_parent=output_path,
+                n_jobs=n_jobs,
+                bad_channel_ids=bad_channel_ids,
+                ref_channels=ref_channels,
+            )
         except Exception as e:
             print(f"Error processing {dat_file.name}:\n{e}")
             traceback.print_exc()
@@ -268,11 +422,21 @@ if __name__ == "__main__":
     # Input and Output arguments
     parser.add_argument('--input_folder', required=True, help="Folder containing .raw folders")
     parser.add_argument('--output_folder', required=True, help="Folder to store all outputs and Phy exports")
-    
+    parser.add_argument('--config', default=None,
+                        help="Path to hm_tracker_paths.txt for per-rat bad/ref channel settings. "
+                             "Defaults to ~/Desktop/hm_tracker_paths.txt if present.")
+
     args = parser.parse_args()
 
+    config_path = args.config
+    if not config_path:
+        default_config = Path(os.path.expanduser("~")) / "Desktop" / "hm_tracker_paths.txt"
+        if default_config.exists():
+            config_path = str(default_config)
+    sorting_config = load_sorting_config(config_path)
+
     try:
-        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4)
+        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4, config=sorting_config)
     except Exception as e:
         print(f"\n[FATAL] Pipeline crashed for folder '{args.input_folder}':\n{e}")
         traceback.print_exc()
