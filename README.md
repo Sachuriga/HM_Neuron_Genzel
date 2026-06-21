@@ -362,10 +362,12 @@ Bad channels and reference channels are read from `hm_tracker_paths.txt` (the sa
 # space- or comma-separated; plain ids and NT notation can be mixed
 BAD_CHANNELS_RAT1=0 1 2 3 NT8ch1 NT8ch2
 REF_CHANNEL_RAT1=NT17ch1
+EEG_TETRODES_RAT1=NT1 NT32
 ```
 
 - **`BAD_CHANNELS_<RAT>`** — channels to interpolate. Omit/leave empty for none.
 - **`REF_CHANNEL_<RAT>`** — channel(s) referenced against *before* the global median CAR (several ids are averaged together). If omitted, only the global median CAR is applied.
+- **`EEG_TETRODES_<RAT>`** — whole tetrodes used for EEG, written as `NT<t>` or just the number `<t>` (1–32). All four channels of each listed tetrode are **removed from the recording before sorting** (e.g. `NT5` drops channels 16 17 18 19). Any bad/ref channels that fall on an excluded tetrode are dropped automatically. Omit/leave empty to sort every tetrode.
 - If a rat has no config entry, `RAT1` falls back to a built-in default bad-channel list; other rats default to none.
 
 #### Tetrode (NT) channel mapping

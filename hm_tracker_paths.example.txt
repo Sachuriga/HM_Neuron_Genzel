@@ -47,10 +47,27 @@ NWB_RAT_NR=1
 #                      averaged together). A global median CAR is always
 #                      applied afterwards. If omitted/empty, only the global
 #                      median CAR is used.
+# EEG_TETRODES_<RAT> : whole tetrodes used for EEG, written as "NT<t>" or just
+#                      the tetrode number "<t>" (1..32), space- or comma-
+#                      separated. ALL FOUR channels of each listed tetrode are
+#                      dropped from the recording before spike sorting (so e.g.
+#                      NT5 removes channels 16 17 18 19). Leave empty / omit
+#                      to keep every tetrode in the sort.
 # -------------------------------------------------------------------
-BAD_CHANNELS_RAT1=0 1 2 3 4 5 6 7 28 29 30 31 36 37 38 39 41 42 43 44 45 46 47 51 56 59 68 69 70 71 80 92 93 94 95 96 97 98 99 100 101 102 103 108 109 110 111 124 125 126 127
-REF_CHANNEL_RAT1=
+BAD_CHANNELS_RAT1 = 0 1 2 3 4 5 6 7 28 29 30 31 36 37 38 39 41 42 43 44 45 46 47 51 56 59 68 69 70 71 80 92 93 94 95 96 97 98 99 100 101 102 103 108 109 110 111 124 125 126 127
+REF_CHANNEL_RAT1 =
+EEG_TETRODES_RAT1 = 
+
+BAD_CHANNELS_RAT5 = 14 80 82 83 106 107 124
+REF_CHANNEL_RAT5 = 98
+EEG_TETRODES_RAT5 = NT12
+
+BAD_CHANNELS_RAT6 = 75 79
+REF_CHANNEL_RAT6 = 22
+EEG_TETRODES_RAT6 = NT12
+
 
 # Example for a second rat, using tetrode (NT) notation:
 # BAD_CHANNELS_RAT2=NT4ch1 NT4ch2 NT16ch1 NT16ch2
 # REF_CHANNEL_RAT2=NT17ch1
+# EEG_TETRODES_RAT2=NT1 NT2

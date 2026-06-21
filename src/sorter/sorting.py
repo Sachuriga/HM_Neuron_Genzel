@@ -72,6 +72,41 @@ def _parse_channel_list(raw_value):
     return channels
 
 
+# A whole-tetrode token: "NT5" or just "5" (1-based tetrode number).
+_NT_TETRODE_RE = re.compile(r"^(?:nt)?(\d+)$", re.IGNORECASE)
+
+
+def _parse_tetrode_token(token):
+    """Parse a tetrode token ("NT5" or "5") into its four 0-based channel ids."""
+    m = _NT_TETRODE_RE.match(token)
+    if not m:
+        raise ValueError(f"'{token}' is not a tetrode (expected NT<t> or <t>)")
+    tetrode = int(m.group(1))
+    if not (1 <= tetrode <= N_TETRODES):
+        raise ValueError(f"tetrode {tetrode} out of range 1..{N_TETRODES}")
+    base = (tetrode - 1) * CH_PER_TETRODE
+    return [base + c for c in range(CH_PER_TETRODE)]
+
+
+def _parse_tetrode_list(raw_value):
+    """
+    Parse a space/comma separated list of whole-tetrode tokens into the flat
+    list of 0-based channel ids they cover. Each token is "NT<t>" or "<t>"
+    (1-based tetrode number). Used for EEG tetrodes that are excluded from
+    spike sorting entirely.
+    """
+    if raw_value is None:
+        return []
+    tokens = raw_value.replace(",", " ").split()
+    channels = []
+    for tok in tokens:
+        try:
+            channels.extend(_parse_tetrode_token(tok))
+        except ValueError as e:
+            print(f"Warning: ignoring invalid tetrode token '{tok}' in config ({e}).")
+    return channels
+
+
 def load_sorting_config(config_path):
     """
     Read per-rat sorting settings from an hm_tracker_paths.txt style file.
@@ -81,9 +116,13 @@ def load_sorting_config(config_path):
         REF_CHANNEL_<RAT>=64             single (or space separated) reference
                                          channel(s) for common_reference.
                                          If omitted, global median is used.
+        EEG_TETRODES_<RAT>=NT5 17 ...    whole tetrodes ("NT<t>" or "<t>") used
+                                         for EEG; their channels are dropped
+                                         from the recording before sorting.
 
     Returns a dict like:
-        { "rat1": {"bad_channels": [...], "ref_channels": [...]}, ... }
+        { "rat1": {"bad_channels": [...], "ref_channels": [...],
+                   "eeg_channels": [...]}, ... }
     Rat tokens are lowercased so they can be matched against the file stem.
     """
     config = {}
@@ -95,7 +134,9 @@ def load_sorting_config(config_path):
         return config
 
     def _entry(rat):
-        return config.setdefault(rat, {"bad_channels": [], "ref_channels": []})
+        return config.setdefault(
+            rat, {"bad_channels": [], "ref_channels": [], "eeg_channels": []}
+        )
 
     with open(config_path, "r", encoding="utf-8-sig") as fh:
         for line in fh:
@@ -111,6 +152,9 @@ def load_sorting_config(config_path):
             elif key.startswith("REF_CHANNEL_"):
                 rat = key[len("REF_CHANNEL_"):].lower()
                 _entry(rat)["ref_channels"] = _parse_channel_list(value)
+            elif key.startswith("EEG_TETRODES_"):
+                rat = key[len("EEG_TETRODES_"):].lower()
+                _entry(rat)["eeg_channels"] = _parse_tetrode_list(value)
 
     if config:
         print(f"Loaded sorting config for rats: {', '.join(sorted(config))}")
@@ -120,7 +164,8 @@ def load_sorting_config(config_path):
 def resolve_rat_settings(file_stem, config):
     """
     Match a recording's file stem against the configured rats and return its
-    bad channels and reference channels. Falls back to DEFAULT_BAD_CHANNELS.
+    bad channels, reference channels and EEG channels (channels belonging to
+    EEG tetrodes, excluded from sorting). Falls back to DEFAULT_BAD_CHANNELS.
     """
     stem = file_stem.lower()
 
@@ -135,18 +180,23 @@ def resolve_rat_settings(file_stem, config):
         settings = config[matched]
         bad_channels = list(settings.get("bad_channels", []))
         ref_channels = list(settings.get("ref_channels", []))
+        eeg_channels = list(settings.get("eeg_channels", []))
+        eeg_note = ""
+        if eeg_channels:
+            eeg_note = f", {len(eeg_channels)} EEG channel(s) excluded"
         print(f"Using config for '{matched}': "
               f"{len(bad_channels)} bad channel(s), "
-              f"ref={ref_channels if ref_channels else 'global median'}")
-        return bad_channels, ref_channels
+              f"ref={ref_channels if ref_channels else 'global median'}"
+              f"{eeg_note}")
+        return bad_channels, ref_channels, eeg_channels
 
     # No config entry: fall back to built-in defaults (bad channels only).
     for rat, channels in DEFAULT_BAD_CHANNELS.items():
         if stem.startswith(rat):
             print(f"No config entry for '{rat}'; using built-in default bad channels.")
-            return list(channels), []
+            return list(channels), [], []
 
-    return [], []
+    return [], [], []
 
 import probeinterface as pi
 import spikeinterface.full as si
@@ -161,7 +211,7 @@ except ImportError:
 
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
-                        bad_channel_ids=None, ref_channels=None):
+                        bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None):
     """
     Runs the spike sorting pipeline on a single .dat file.
     Plotting is disabled, progress bars are enabled for all computations.
@@ -221,6 +271,23 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     rec = rec.set_probe(probe)
     rec.set_property("group", group_ids)
     print(f"Probe attached. Total Groups: {len(np.unique(group_ids))}")
+
+    # 4.1. Drop EEG tetrode channels — they are not spike-sorted.
+    eeg_channel_ids = list(eeg_channel_ids) if eeg_channel_ids else []
+    if eeg_channel_ids:
+        present = set(rec.get_channel_ids().tolist())
+        to_remove = [c for c in eeg_channel_ids if c in present]
+        if to_remove:
+            n_tetrodes = len(set((c // CH_PER_TETRODE) for c in to_remove))
+            print(f"Excluding {len(to_remove)} EEG channel(s) "
+                  f"({n_tetrodes} tetrode(s)) from sorting: {sorted(to_remove)}")
+            rec = rec.remove_channels(remove_channel_ids=to_remove)
+            print(f"Remaining channels: {rec.get_num_channels()}, "
+                  f"groups: {len(np.unique(rec.get_property('group')))}")
+        # Don't interpolate/reference against channels we just removed.
+        excluded = set(eeg_channel_ids)
+        bad_channel_ids = [c for c in (bad_channel_ids or []) if c not in excluded]
+        ref_channels = [c for c in (ref_channels or []) if c not in excluded]
 
     # 5. PREPROCESSING & SAVING
     print("Preprocessing and saving binary...")
@@ -397,7 +464,8 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
         print(f"File {i}/{len(dat_files)}: {dat_file.name}")
         print(f"{'='*60}")
 
-        bad_channel_ids, ref_channels = resolve_rat_settings(dat_file.stem, config)
+        bad_channel_ids, ref_channels, eeg_channel_ids = resolve_rat_settings(
+            dat_file.stem, config)
         try:
             process_single_file(
                 file_path=dat_file,
@@ -405,6 +473,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
                 n_jobs=n_jobs,
                 bad_channel_ids=bad_channel_ids,
                 ref_channels=ref_channels,
+                eeg_channel_ids=eeg_channel_ids,
             )
         except Exception as e:
             print(f"Error processing {dat_file.name}:\n{e}")
