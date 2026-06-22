@@ -1856,7 +1856,7 @@ def parse_metadata_xlsx(xlsx_path):
 
         metadata = {
             'start_point': start_pt,
-            'custom_trial': int(float(row0.get('Start_At_Trial_Num', 1))),
+            'custom_trial': (lambda v: int(float(v)) if not pd.isna(v) else 1)(row0.get('Start_At_Trial_Num', 1)),
             'rat': safe_int_str(row0['Rat_ID']),
             'date': safe_int_str(row0['Date']),
             'repeat': safe_int_str(row0['Repeat']),
