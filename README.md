@@ -1,6 +1,11 @@
 # HM Neuron Genzel
 
-**Author:** Sachuriga S.
+**Authors:**
+
+- **Sachuriga S.** — Set up the whole processing pipeline initially.
+- **Jacob van Rosmalen** — Set up the pipeline for integrating the behavioral and ephys data into `.nwb` (Neurodata Without Borders).
+- **Phan Minh** — Developed the DeepLabCut processing line for tracking the rat's keypoints.
+- **Jill Gerritsen** — Tested and validated the whole processing pipeline.
 
 A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Mountainsort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
