@@ -201,6 +201,15 @@ def split_labels(df):
         if col.endswith(('_X', '_Y'))
     })
 
+# splits DLC bodypart labels (lowercase _x/_y suffix) from loaded dataframe
+# e.g. "nose_x" -> nose ; ignores maze-frame columns like "Rat_X"
+def split_dlc_labels(df):
+    return list({
+        col.rsplit('_', 1)[0]
+        for col in df.columns
+        if col.endswith(('_x', '_y'))
+    })
+
 # creates position object to hold positional data in the form of SpatialSeries
 # takes str(pos_name) and dataframe with original data
 def create_position_obj(pos_name, df, rate=float(30)):
@@ -224,6 +233,33 @@ def create_position_obj(pos_name, df, rate=float(30)):
                 rate=rate,
                 unit = "pixels",
                 reference_frame="(0,0) is bottom left corner",
+            )
+        position_obj.add_spatial_series(spatial_series_obj)
+    return position_obj
+
+# creates position object to hold DLC bodypart data in the form of SpatialSeries
+# reads lowercase _x/_y columns; coordinates are head-centered on mid_brain
+def create_dlc_position_obj(pos_name, df, rate=float(30)):
+    position_obj = Position(name=pos_name)
+    labels = split_dlc_labels(df)
+    for label in labels:
+        if 'Time (seconds)' in df.columns:
+            spatial_series_obj = SpatialSeries(
+                name=label,
+                description=f"(x,y) {label} DLC position, centered on mid_brain",
+                data=np.array([df[f'{label}_x'].values, df[f'{label}_y'].values]).T,
+                timestamps=df['Time (seconds)'].values,
+                unit = "pixels",
+                reference_frame="(0,0) is mid_brain (head-centered)",
+            )
+        else:
+            spatial_series_obj = SpatialSeries(
+                name=label,
+                description=f"(x,y) {label} DLC position, centered on mid_brain",
+                data=np.array([df[f'{label}_x'].values, df[f'{label}_y'].values]).T,
+                rate=rate,
+                unit = "pixels",
+                reference_frame="(0,0) is mid_brain (head-centered)",
             )
         position_obj.add_spatial_series(spatial_series_obj)
     return position_obj
@@ -472,10 +508,12 @@ if __name__ == "__main__":
         no_timestamp_available = False
 
         if 'Time (seconds)' in df.columns:
-            # Use timestamps from dataframe
             index_time_zero = find_index_time_zero(df)
-            nwb_session_start_time = datetime.fromtimestamp(df_coordinates_with_frames['Timestamp'][index_time_zero])
+            ts = df_coordinates_with_frames['Timestamp'][index_time_zero]
+            from datetime import timedelta
+            nwb_session_start_time = datetime(1970, 1, 1) + timedelta(seconds=float(ts))
             nwb_session_start_time = nwb_session_start_time.replace(tzinfo=timezone)
+
         else:
             # No timestamps available, try to get session date from txt file
             session_date = None
@@ -543,6 +581,9 @@ if __name__ == "__main__":
         # position metadata
         position_name = "Position"
 
+        # dlc position metadata
+        dlc_position_name = "DLC_Position"
+
         # metrics metadata
         metrics_cols = ['region_id', 'extracted_frame_idx']
         metrics_descriptions = ["id of camera in which rat is positioned", "Extracted Frame Index"]
@@ -577,6 +618,12 @@ if __name__ == "__main__":
 
         # add position object to behavior module
         behavior_module.add(position_obj)
+
+        # create dlc position object (head-centered bodypart coordinates)
+        dlc_position_obj = create_dlc_position_obj(dlc_position_name, df)
+
+        # add dlc position object to behavior module
+        behavior_module.add(dlc_position_obj)
 
         # create metrics object
         df_filtered = df[[c for c in metrics_cols if c in df.columns]]
