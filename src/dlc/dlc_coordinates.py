@@ -39,6 +39,7 @@ def run_dlc(config_path: Path, video_path: Path, shuffle: int = 2) -> pd.DataFra
     return dlc_df
 
 
+<<<<<<< HEAD
 def center_on_mid_brain(df: pd.DataFrame, dlc_df: pd.DataFrame, written_rows: np.ndarray) -> pd.DataFrame:
     # subtract mid_brain x,y from every bodypart so mid_brain is the origin
     if 'mid_brain_x' not in df.columns or 'mid_brain_y' not in df.columns:
@@ -55,6 +56,8 @@ def center_on_mid_brain(df: pd.DataFrame, dlc_df: pd.DataFrame, written_rows: np
     return df
 
 
+=======
+>>>>>>> 0d9ab5dcaa07d4cf053d46a0eb3af56f124e4f19
 def merge_coordinates(df: pd.DataFrame, dlc_df: pd.DataFrame) -> pd.DataFrame:
     # written rows = rows put into the video, in DLC frame order
     written_mask = df['extracted_frame_idx'].notna()
@@ -76,6 +79,7 @@ def merge_coordinates(df: pd.DataFrame, dlc_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+<<<<<<< HEAD
 def make_labeled_video(config_path: Path, video_path: Path, shuffle: int = 2):
     # overlay predicted keypoints on the original video for visual QC
     deeplabcut.create_labeled_video(
@@ -86,6 +90,8 @@ def make_labeled_video(config_path: Path, video_path: Path, shuffle: int = 2):
     print(f"Labeled video written next to: {video_path}")
 
 
+=======
+>>>>>>> 0d9ab5dcaa07d4cf053d46a0eb3af56f124e4f19
 def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = None, shuffle: int = 2):
     op_path = Path(op_dir)
     config_path = Path(config)
@@ -108,8 +114,11 @@ def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = Non
     df.to_csv(csv_file, index=False)
     print(f"\nDone. Coordinates written back to: {csv_file}")
 
+<<<<<<< HEAD
     make_labeled_video(config_path, video_path, shuffle)
 
+=======
+>>>>>>> 0d9ab5dcaa07d4cf053d46a0eb3af56f124e4f19
 
 def main():
     parser = argparse.ArgumentParser(description="Run DLC on collected frames and merge coordinates back into the CSV.")

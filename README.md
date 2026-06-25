@@ -1,6 +1,11 @@
-# HM Tracker 2025
+# HM Neuron Genzel
 
-**Author:** Sachuriga S.
+**Authors:**
+
+- **Sachuriga S.** — Set up the whole processing pipeline initially.
+- **Jacob van Rosmalen** — Set up the pipeline for integrating the behavioral and ephys data into `.nwb` (Neurodata Without Borders).
+- **Phan Minh** — Developed the DeepLabCut processing line for tracking the rat's keypoints.
+- **Jill Gerritsen** — Tested and validated the whole processing pipeline.
 
 A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Mountainsort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
@@ -338,7 +343,7 @@ Compresses the annotated tracker output video using NVIDIA hardware encoding:
 **Script:** `src/sorter/sorting.py`  
 **Command:**
 ```
-python sorting.py --input_folder <ip> --output_folder <op>
+python sorting.py --input_folder <ip> --output_folder <op> [--config <hm_tracker_paths.txt>]
 ```
 
 Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via SpikeInterface + **Mountainsort4**:
@@ -347,12 +352,83 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
 2. **Probe geometry** — Attaches an **8 × 4 tetrode grid** (32 tetrodes, 128 channels total). Tetrodes are spaced **250 µm** apart; contacts within each tetrode are arranged in a ±10 µm diamond pattern. Contact shape: circle, radius 5 µm.
 3. **Preprocessing:**
    - Bandpass filter: **300–6 000 Hz**
-   - Bad-channel interpolation (**50 µm** radius): a fixed list of known bad channels is interpolated from their neighbours
-   - Common-average referencing per tetrode group
-   - Whitening (float32)
-4. **Sorting** — **Mountainsort4** is run via SpikeInterface (`adjacency_radius=50 µm`, pre-filtering and whitening disabled since already done).
+   - Bad-channel interpolation (**50 µm** radius): a per-rat list of bad channels (see config below) is interpolated from their neighbours
+   - Common reference: optional reference channel(s) per rat, followed by a global median common-average reference
+   - No manual whitening — the sorter whitens internally (`whiten=True`), so it is not applied a second time here
+4. **Sorting** — **MountainSort5** (default) or **MountainSort4** is run via SpikeInterface, selectable with the `SORTER` config key. Pre-filtering is disabled (already band-pass filtered above) and the sorter does its own whitening.
 5. **Analysis** — Waveforms extracted (1 ms before, 2 ms after spike peak), 3-component PCA per channel, quality metrics (SNR, ISI violation, firing rate).
 6. **Export** — Results exported to `phy_export/` for manual curation in Phy. All intermediate files are deleted; only `phy_export/` is retained.
+
+#### Per-rat channel configuration
+
+Bad channels and reference channels are read from `hm_tracker_paths.txt` (the same Desktop config file used by the runner; pass it with `--config`, or it falls back to `~/Desktop/hm_tracker_paths.txt`). The rat is matched against the start of each recording's file name (e.g. `rat1_..._group0.dat` → the `RAT1` keys).
+
+```
+# sorter selection + numeric settings (apply to all rats)
+SORTER=mountainsort5
+FREQ_MIN=600
+FREQ_MAX=8000
+DETECT_THRESHOLD=5
+DETECT_SIGN=0
+
+# space- or comma-separated; plain ids and NT notation can be mixed
+BAD_CHANNELS_RAT1=0 1 2 3 NT8ch1 NT8ch2
+REF_CHANNEL_RAT1=NT17ch1
+EEG_TETRODES_RAT1=NT1 NT32
+```
+
+- **`SORTER`** — which spike sorter to run for all rats: `mountainsort5` (default) or `mountainsort4`. If omitted or unrecognised, `mountainsort5` is used. The sorter name is included in each recording's output folder (e.g. `rat1_..._mountainsort5_sorting_output`).
+- **`FREQ_MIN` / `FREQ_MAX`** — band-pass filter cutoffs in Hz (high-pass / low-pass). Defaults `600` / `8000`.
+- **`DETECT_THRESHOLD`** — spike detection threshold passed to the sorter. Default `5`.
+- **`DETECT_SIGN`** — spikes to detect: `-1` negative, `0` both, `1` positive. Default `0`.
+- These four numeric settings apply to **all** rats; omit a line (or leave it empty) to use its default.
+- **`BAD_CHANNELS_<RAT>`** — channels to interpolate. Omit/leave empty for none.
+- **`REF_CHANNEL_<RAT>`** — channel(s) referenced against *before* the global median CAR (several ids are averaged together). If omitted, only the global median CAR is applied.
+- **`EEG_TETRODES_<RAT>`** — whole tetrodes used for EEG, written as `NT<t>` or just the number `<t>` (1–32). All four channels of each listed tetrode are **removed from the recording before sorting** (e.g. `NT5` drops channels 16 17 18 19). Any bad/ref channels that fall on an excluded tetrode are dropped automatically. Omit/leave empty to sort every tetrode.
+- If a rat has no config entry, `RAT1` falls back to a built-in default bad-channel list; other rats default to none.
+
+#### Tetrode (NT) channel mapping
+
+The 128 channels are wired as 32 tetrodes of 4. Channels may be written as plain 0-based ids (`0`–`127`) or as `NT<t>ch<c>` (`t` = 1–32, `c` = 1–4), which map by:
+
+```
+channel = (NT − 1) × 4 + (ch − 1)
+```
+
+| Tetrode | ch1 | ch2 | ch3 | ch4 |
+|---|---|---|---|---|
+| NT1  | 0   | 1   | 2   | 3   |
+| NT2  | 4   | 5   | 6   | 7   |
+| NT3  | 8   | 9   | 10  | 11  |
+| NT4  | 12  | 13  | 14  | 15  |
+| NT5  | 16  | 17  | 18  | 19  |
+| NT6  | 20  | 21  | 22  | 23  |
+| NT7  | 24  | 25  | 26  | 27  |
+| NT8  | 28  | 29  | 30  | 31  |
+| NT9  | 32  | 33  | 34  | 35  |
+| NT10 | 36  | 37  | 38  | 39  |
+| NT11 | 40  | 41  | 42  | 43  |
+| NT12 | 44  | 45  | 46  | 47  |
+| NT13 | 48  | 49  | 50  | 51  |
+| NT14 | 52  | 53  | 54  | 55  |
+| NT15 | 56  | 57  | 58  | 59  |
+| NT16 | 60  | 61  | 62  | 63  |
+| NT17 | 64  | 65  | 66  | 67  |
+| NT18 | 68  | 69  | 70  | 71  |
+| NT19 | 72  | 73  | 74  | 75  |
+| NT20 | 76  | 77  | 78  | 79  |
+| NT21 | 80  | 81  | 82  | 83  |
+| NT22 | 84  | 85  | 86  | 87  |
+| NT23 | 88  | 89  | 90  | 91  |
+| NT24 | 92  | 93  | 94  | 95  |
+| NT25 | 96  | 97  | 98  | 99  |
+| NT26 | 100 | 101 | 102 | 103 |
+| NT27 | 104 | 105 | 106 | 107 |
+| NT28 | 108 | 109 | 110 | 111 |
+| NT29 | 112 | 113 | 114 | 115 |
+| NT30 | 116 | 117 | 118 | 119 |
+| NT31 | 120 | 121 | 122 | 123 |
+| NT32 | 124 | 125 | 126 | 127 |
 
 ---
 
