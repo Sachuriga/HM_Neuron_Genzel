@@ -2,6 +2,11 @@ import re
 import argparse
 import numpy as np
 from pathlib import Path
+from fractions import Fraction
+from scipy.signal import resample_poly
+
+# Target rate so motion lines up with the 1000 Hz LFP export.
+TARGET_FS = 1000
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,15 +73,6 @@ def find_analog_file(input_folder, suffix):
     return None
 
 
-def find_timestamps_file(input_folder):
-    base = Path(input_folder)
-    for pat in ("*.analog/*timestamps*.dat", "*.analog/*.timestamps.dat"):
-        matches = list(base.glob(pat))
-        if matches:
-            return sorted(matches)[0]
-    return None
-
-
 def load_channel(dat_file):
     """Read a single analog .dat and return its 1-D data plus header dict."""
     result = readTrodesExtractedDataFile(str(dat_file))
@@ -89,13 +85,29 @@ def load_channel(dat_file):
     return values, result
 
 
+def get_source_fs(header):
+    """Native sample rate of an analog channel from its header."""
+    return float(header.get('samplingrate', header.get('clockrate', 30000)))
+
+
+def downsample(values, src_fs, target_fs):
+    """Anti-aliased resample of a 1-D signal from src_fs to target_fs."""
+    if abs(src_fs - target_fs) < 1e-6:
+        return values.astype('float32')
+    ratio = Fraction(target_fs).limit_denominator() / \
+        Fraction(src_fs).limit_denominator()
+    up, down = ratio.numerator, ratio.denominator
+    return resample_poly(values, up, down).astype('float32')
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run(input_folder, output_folder):
     base_path = Path(input_folder)
-    output_dir = Path(output_folder)
+    # Save alongside the LFP outputs so motion and LFP share one folder.
+    output_dir = Path(output_folder) / "LFP_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'─' * 60}")
@@ -106,12 +118,15 @@ def run(input_folder, output_folder):
     columns = []
     lengths = []
     found_axes = []
+    src_fs = None
     for axis in ACCEL_AXES:
         dat_file = find_analog_file(input_folder, axis)
         if dat_file is None:
             print(f"  ⚠  {axis} .dat not found — skipping.")
             continue
         values, header = load_channel(dat_file)
+        if src_fs is None:
+            src_fs = get_source_fs(header)
         print(f"  ✓ {axis}: {dat_file.name}  ({values.shape[0]} samples)")
         columns.append(values)
         lengths.append(values.shape[0])
@@ -127,26 +142,21 @@ def run(input_folder, output_folder):
     n = min(lengths)
     if len(set(lengths)) > 1:
         print(f"  ⚠  Axis lengths differ {lengths}; truncating to {n}.")
-    motion = np.column_stack([c[:n] for c in columns]).astype('float32')
+
+    # Downsample each axis from its native rate to TARGET_FS (1000 Hz).
+    print(f"  Downsampling {src_fs:g} Hz → {TARGET_FS} Hz")
+    down_cols = [downsample(c[:n], src_fs, TARGET_FS) for c in columns]
+    n_down = min(len(c) for c in down_cols)
+    motion = np.column_stack([c[:n_down] for c in down_cols]).astype('float32')
 
     out_file = output_dir / "motion.npy"
     np.save(out_file, motion)
-    print(f"  ✓ motion.npy  {motion.shape}  columns={found_axes}")
+    print(f"  ✓ motion.npy  {motion.shape}  columns={found_axes} @ {TARGET_FS} Hz")
 
-    # Timestamps (raw sample numbers + zero-referenced seconds), if available.
-    ts_file = find_timestamps_file(input_folder)
-    if ts_file is not None:
-        ts_values, ts_header = load_channel(ts_file)
-        ts_raw = ts_values[:n]
-        np.save(output_dir / "motion_timestamps_raw.npy", ts_raw)
-        clockrate = float(ts_header.get('clockrate', 30000))
-        ts_seconds = ts_raw.astype('float64') / clockrate
-        ts_seconds -= ts_seconds[0]
-        np.save(output_dir / "motion_timestamps.npy", ts_seconds)
-        print(f"  ✓ motion_timestamps.npy  ({ts_raw.shape[0]}) @ {clockrate} Hz")
-    else:
-        print("  ⚠  No analog timestamps file found — motion.npy saved "
-              "without a time axis.")
+    # Time axis at the downsampled rate, zero-referenced (seconds).
+    ts_seconds = (np.arange(n_down) / TARGET_FS).astype('float64')
+    np.save(output_dir / "motion_timestamps.npy", ts_seconds)
+    print(f"  ✓ motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
 
     print(f"{'=' * 60}")
     print(f"✅  Motion data → {out_file}")
