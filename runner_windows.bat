@@ -57,8 +57,8 @@ if "%~1"=="" (
 
 :: --- NEW: STEP SELECTION MENU ---
 echo Select steps to run (e.g., 123 for steps 1, 2, and 3):
-echo [1] Trodes Export (DIO/Raw)
-echo [e] Trodes Export LFP (per channel)
+echo [1] Trodes Export (DIO/Raw/Analog)
+echo [e] Trodes Export LFP + Analog (per channel)
 echo [2] Sync Script
 echo [3] Stitching
 echo [4] Tracker
@@ -313,7 +313,7 @@ echo %STEPS_TO_RUN% | findstr "1" >nul
 if %errorlevel% equ 0 (
     echo [STEP 1] Running Trodes DIO/Raw Export...
     if exist "%TRODES_EXPORT_CMD%" (
-        for %%F in ("%IP%\*.rec") do ("%TRODES_EXPORT_CMD%" -dio -raw -rec "%%F")
+        for %%F in ("%IP%\*.rec") do ("%TRODES_EXPORT_CMD%" -dio -raw -analog -rec "%%F")
     ) else (
         echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
     )
@@ -330,6 +330,15 @@ if %errorlevel% equ 0 (
         )
     ) else (
         echo [WARNING] exportLFP not found at: %TRODES_EXPORT_LFP%
+    )
+    echo [STEP e] Exporting Analog/AUX ^(headstage IMU^)...
+    if exist "%TRODES_EXPORT_CMD%" (
+        for %%F in ("%IP%\*.rec") do (
+            echo     Exporting analog from %%~nxF
+            "%TRODES_EXPORT_CMD%" -analog -rec "%%F"
+        )
+    ) else (
+        echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
     )
 )
 
