@@ -313,7 +313,7 @@ echo %STEPS_TO_RUN% | findstr "1" >nul
 if %errorlevel% equ 0 (
     echo [STEP 1] Running Trodes DIO/Raw Export...
     if exist "%TRODES_EXPORT_CMD%" (
-        for %%F in ("%IP%\*.rec") do ("%TRODES_EXPORT_CMD%" -dio -raw -analog -rec "%%F")
+        for %%F in ("%IP%\*.rec") do ("%TRODES_EXPORT_CMD%" -dio -raw -analogio -rec "%%F")
     ) else (
         echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
     )
@@ -335,7 +335,7 @@ if %errorlevel% equ 0 (
     if exist "%TRODES_EXPORT_CMD%" (
         for %%F in ("%IP%\*.rec") do (
             echo     Exporting analog from %%~nxF
-            "%TRODES_EXPORT_CMD%" -analog -rec "%%F"
+            "%TRODES_EXPORT_CMD%" -analogio -rec "%%F"
         )
     ) else (
         echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
