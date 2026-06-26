@@ -65,7 +65,7 @@ echo [4] Tracker
 echo [5] Plotting
 echo [6] Compression
 echo [7] Sorting
-echo [8] LFP
+echo [8] LFP + Motion (IMU Accel)
 echo [d] deeplabcut
 echo [9] Cleaning
 echo [n] Node Analysis
@@ -418,6 +418,10 @@ if %errorlevel% equ 0 (
     echo [STEP 8] Running LFP Extraction...
     if exist ".\src\sorter\export_lfp.py" (
         python -u ./src/sorter/export_lfp.py --input_folder "%IP%" --output_folder "%OP%"
+    )
+    echo [STEP 8] Running Motion ^(IMU Accel^) Extraction...
+    if exist ".\src\sorter\export_motion.py" (
+        python -u ./src/sorter/export_motion.py --input_folder "%IP%" --output_folder "%OP%"
     )
 
 )
