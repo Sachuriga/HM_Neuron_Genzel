@@ -313,7 +313,16 @@ echo %STEPS_TO_RUN% | findstr "1" >nul
 if %errorlevel% equ 0 (
     echo [STEP 1] Running Trodes DIO/Raw Export...
     if exist "%TRODES_EXPORT_CMD%" (
-        for %%F in ("%IP%\*.rec") do ("%TRODES_EXPORT_CMD%" -dio -raw -analogio -rec "%%F")
+        set "REC_ARGS="
+        for /f "delims=" %%F in ('dir /b /on "%IP%\*.rec" 2^>nul') do (
+            echo     Adding %%F
+            set "REC_ARGS=!REC_ARGS! -rec "%IP%\%%F""
+        )
+        if not defined REC_ARGS (
+            echo [WARNING] No .rec files found in "%IP%"
+        ) else (
+            "%TRODES_EXPORT_CMD%" -dio -raw -analogio !REC_ARGS!
+        )
     ) else (
         echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
     )
@@ -322,23 +331,26 @@ if %errorlevel% equ 0 (
 :: --- STEP e (LFP export) ---
 echo %STEPS_TO_RUN% | findstr "e" >nul
 if %errorlevel% equ 0 (
-    echo [STEP e] Running Trodes LFP Export ^(1000Hz, LP 500Hz^)...
-    if exist "%TRODES_EXPORT_LFP%" (
-        for %%F in ("%IP%\*.rec") do (
-            echo     Exporting LFP from %%~nxF
-            "%TRODES_EXPORT_LFP%" -rec "%%F" -outputrate 1000 -lfplowpass 500
-        )
-    ) else (
-        echo [WARNING] exportLFP not found at: %TRODES_EXPORT_LFP%
+    set "REC_ARGS="
+    for /f "delims=" %%F in ('dir /b /on "%IP%\*.rec" 2^>nul') do (
+        echo     Adding %%F
+        set "REC_ARGS=!REC_ARGS! -rec "%IP%\%%F""
     )
-    echo [STEP e] Exporting Analog/AUX ^(headstage IMU^)...
-    if exist "%TRODES_EXPORT_CMD%" (
-        for %%F in ("%IP%\*.rec") do (
-            echo     Exporting analog from %%~nxF
-            "%TRODES_EXPORT_CMD%" -analogio -rec "%%F"
-        )
+    if not defined REC_ARGS (
+        echo [WARNING] No .rec files found in "%IP%"
     ) else (
-        echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
+        echo [STEP e] Running Trodes LFP Export ^(1000Hz, LP 500Hz^)...
+        if exist "%TRODES_EXPORT_LFP%" (
+            "%TRODES_EXPORT_LFP%" !REC_ARGS! -outputrate 1000 -lfplowpass 500
+        ) else (
+            echo [WARNING] exportLFP not found at: %TRODES_EXPORT_LFP%
+        )
+        echo [STEP e] Exporting Analog/AUX ^(headstage IMU^)...
+        if exist "%TRODES_EXPORT_CMD%" (
+            "%TRODES_EXPORT_CMD%" -analogio !REC_ARGS!
+        ) else (
+            echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
+        )
     )
 )
 
