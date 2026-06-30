@@ -296,8 +296,19 @@ def create_metrics_object(timeseries_list, metrics_name):
         metrics_obj.add_timeseries(ts)
     return metrics_obj
 
+# reads the per-session Goal_Node scalar from RecordingMeta.xlsx inside the session folder
+# returns the goal node as an int, or None if no meta file / column is found
+def read_goal_node(session_dir):
+    meta_paths = list(Path(session_dir).glob("RecordingMeta.xlsx"))
+    if not meta_paths:
+        return None
+    df = pd.read_excel(meta_paths[0], sheet_name=0)
+    if "Goal_Node" not in df.columns:
+        return None
+    return int(df.iloc[0]["Goal_Node"])
+
 # creates a DynamicTable from a pandas DataFrame
-def create_trials_table(df, table_name, description):
+def create_trials_table(df, table_name, description, goal_node=None):
     """
     Converts a pandas DataFrame to a DynamicTable for NWB storage.
     
@@ -318,6 +329,14 @@ def create_trials_table(df, table_name, description):
             data=df[col].values,
         )
         columns.append(vector)
+    
+    # add per-trial Goal_node column (single session value repeated across rows, stored as bytes)
+    if goal_node is not None:
+        columns.append(VectorData(
+            name="Goal_node",
+            description="Column: Goal_node",
+            data=np.array([str(goal_node).encode()] * len(df), dtype=object),
+        ))
     
     table = DynamicTable(
         name=table_name,
@@ -590,6 +609,9 @@ if __name__ == "__main__":
         # trials table metadata (txt file)
         table_name ="Trials_Data"
         table_description = "Trial transition and speed data from txt file"
+
+        # goal node metadata (read from RecordingMeta.xlsx in the session folder)
+        goal_node = read_goal_node(session_folders[session_i])
         # --- END METADATA --- #
 
 
@@ -637,7 +659,8 @@ if __name__ == "__main__":
             trials_table = create_trials_table(
                 df_txt,
                 table_name,
-                table_description
+                table_description,
+                goal_node
             )
 
         # add trials table to behavior module
