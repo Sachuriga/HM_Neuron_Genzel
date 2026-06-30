@@ -55,34 +55,115 @@ def _parseFields(fieldstr):
 # DISCOVER & LOAD TRODES LFP .dat FILES
 # ──────────────────────────────────────────────────────────────────────────────
 
-def find_lfp_dat_files(input_folder):
+def find_lfp_sessions(input_folder):
     """
-    Find all Trodes-exported LFP .dat files under input_folder.
-    Expects:  <recording>.LFP/<recording>.LFP_nt<N>ch<C>.dat
-    Also finds the timestamps file: <recording>.timestamps.dat
+    Find Trodes-exported LFP sessions under input_folder.
+
+    Each .rec recording exports into its own '<recording>.LFP' folder:
+        <recording>.LFP/<recording>.LFP_nt<N>ch<C>.dat
+        <recording>.LFP/<recording>.timestamps.dat
+
+    When a folder holds several recordings (separate sessions), each one
+    becomes its own session here, returned in chronological order (the Trodes
+    name embeds YYYYMMDD_HHMMSS, so sorting by name == sorting by time).
+
+    Returns a list of dicts: {'name', 'lfp_files', 'ts_file'}.
     """
     base = Path(input_folder)
 
-    # Find channel data files (exclude timestamps)
-    lfp_files = sorted(
-        (f for f in base.glob("*.LFP/*.dat")
-         if 'timestamps' not in f.name.lower()),
-        key=lambda f: parse_channel_info(f)
-    )
-    if not lfp_files:
+    sessions = []
+    for d in sorted((d for d in base.glob("*.LFP") if d.is_dir()),
+                    key=lambda d: d.name):
         lfp_files = sorted(
+            (f for f in d.glob("*.dat")
+             if 'timestamps' not in f.name.lower()),
+            key=lambda f: parse_channel_info(f)
+        )
+        if not lfp_files:
+            continue
+        ts_list = (list(d.glob("*.timestamps.dat"))
+                   or list(d.glob("*timestamps*.dat")))
+        sessions.append({
+            'name': d.stem,
+            'lfp_files': lfp_files,
+            'ts_file': ts_list[0] if ts_list else None,
+        })
+
+    # Fallback: flat *LFP*.dat files directly under input_folder (one session).
+    if not sessions:
+        flat = sorted(
             (f for f in base.glob("*LFP*.dat")
              if 'timestamps' not in f.name.lower()),
             key=lambda f: parse_channel_info(f)
         )
+        if flat:
+            ts_list = list(base.glob("*timestamps*.dat"))
+            sessions.append({
+                'name': base.name,
+                'lfp_files': flat,
+                'ts_file': ts_list[0] if ts_list else None,
+            })
 
-    # Find timestamps file
-    ts_files = list(base.glob("*.LFP/*.timestamps.dat"))
-    if not ts_files:
-        ts_files = list(base.glob("*.LFP/*timestamps*.dat"))
-    ts_file = ts_files[0] if ts_files else None
+    return sessions
 
-    return lfp_files, ts_file
+
+def load_and_concat_sessions(sessions):
+    """
+    Load every session and concatenate channels across sessions in order.
+
+    Sessions are joined sample-after-sample per channel, matched by
+    (ntrode, channel). Only channels common to all sessions are kept.
+
+    Returns (channels, fs, boundaries) where:
+      - channels: list of {'data', 'ntrode', 'channel', 'file'} (concatenated)
+      - fs: sampling rate (Hz) from the first session header
+      - boundaries: list of {'name', 'start', 'n'} marking each session's
+        sample range within the concatenated arrays.
+    """
+    fs = None
+    loaded = []
+    for s in sessions:
+        chans, _ts, this_fs = load_lfp_channels(s['lfp_files'], s['ts_file'])
+        if fs is None:
+            fs = this_fs
+        cmap = {(c['ntrode'], c['channel']): c['data'] for c in chans}
+        fmap = {(c['ntrode'], c['channel']): c['file'] for c in chans}
+        loaded.append({
+            'name': s['name'],
+            'cmap': cmap,
+            'fmap': fmap,
+            'n': chans[0]['data'].shape[0] if chans else 0,
+        })
+
+    # Channels common to every session (sorted by ntrode, then channel).
+    common = set(loaded[0]['cmap'])
+    for sm in loaded[1:]:
+        common &= set(sm['cmap'])
+    if not common:
+        raise RuntimeError("No channels common to all LFP sessions.")
+    keys = sorted(common, key=lambda k: (k[0] is None, k[0] or 0, k[1] or 0))
+
+    if len(loaded) > 1:
+        names = ", ".join(f"{sm['name']} ({sm['n']} samples)" for sm in loaded)
+        tqdm.write(f"  Concatenating {len(loaded)} session(s): {names}")
+
+    channels = []
+    for k in keys:
+        data = np.concatenate([sm['cmap'][k] for sm in loaded])
+        channels.append({
+            'data': data,
+            'ntrode': k[0],
+            'channel': k[1],
+            'file': loaded[0]['fmap'][k],
+        })
+
+    boundaries = []
+    start = 0
+    for sm in loaded:
+        boundaries.append({'name': sm['name'], 'start': start, 'n': sm['n']})
+        start += sm['n']
+
+    return channels, fs, boundaries
 
 
 def parse_channel_info(filename):
@@ -276,17 +357,20 @@ def run_pipeline(input_folder, output_folder):
         tqdm.write(f"▶  Input: {base_path}")
         tqdm.write("Step 1/5 — Finding Trodes-exported LFP .dat files")
 
-        lfp_files, ts_file = find_lfp_dat_files(input_folder)
-        if not lfp_files:
+        sessions = find_lfp_sessions(input_folder)
+        if not sessions:
             tqdm.write("❌  No LFP .dat files found! Check your input folder.")
             tqdm.write("    Expected: <recording>.LFP/<recording>.LFP_nt*ch*.dat")
             return
 
-        tqdm.write(f"  Found {len(lfp_files)} LFP channel file(s)")
-        if ts_file:
-            tqdm.write(f"  Found timestamps: {ts_file.name}")
+        total_files = sum(len(s['lfp_files']) for s in sessions)
+        tqdm.write(f"  Found {len(sessions)} session(s), "
+                   f"{total_files} LFP channel file(s) total")
+        for s in sessions:
+            ts_name = s['ts_file'].name if s['ts_file'] else "(none)"
+            tqdm.write(f"    • {s['name']}: {len(s['lfp_files'])} ch, ts={ts_name}")
 
-        channels, timestamps_raw, fs = load_lfp_channels(lfp_files, ts_file)
+        channels, fs, boundaries = load_and_concat_sessions(sessions)
         tqdm.write(f"  Sampling rate from header: {fs} Hz")
         advance(1)
 
@@ -314,20 +398,19 @@ def run_pipeline(input_folder, output_folder):
         lfp_array = np.column_stack([ch['data'] for ch in channels])
         np.save(output_dir / "lfp_data.npy", lfp_array)
 
-        # Save timestamps
-        if timestamps_raw is not None:
-            np.save(output_dir / "lfp_timestamps_raw.npy", timestamps_raw)
-            # Convert to seconds using clockrate
-            clockrate = float(channels[0].get('clockrate', fs) if isinstance(channels[0], dict) else fs)
-            # Re-read clockrate from first file header
-            first_result = readTrodesExtractedDataFile(str(lfp_files[0]))
-            clockrate = float(first_result.get('clockrate', fs))
-            ts_seconds = (timestamps_raw.astype('float64') / clockrate)
-            ts_seconds -= ts_seconds[0]  # zero-referenced
-            np.save(output_dir / "lfp_timestamps.npy", ts_seconds)
-        else:
-            ts_seconds = (np.arange(n_samples) / fs).astype('float64')
-            np.save(output_dir / "lfp_timestamps.npy", ts_seconds)
+        # Timestamps: build a continuous, gapless time axis across the
+        # concatenated sessions. Per-session Trodes timestamps reset at each
+        # recording start, so a raw concatenation would be non-monotonic; we
+        # instead derive seconds from the sample index at the export rate.
+        ts_seconds = (np.arange(n_samples) / fs).astype('float64')
+        np.save(output_dir / "lfp_timestamps.npy", ts_seconds)
+
+        # Record where each session begins/ends within the concatenated data.
+        np.save(output_dir / "session_boundaries.npy", boundaries)
+        if len(boundaries) > 1:
+            for b in boundaries:
+                tqdm.write(f"    {b['name']}: samples {b['start']}.."
+                           f"{b['start'] + b['n']}  (t0={b['start'] / fs:.2f}s)")
 
         # Save channel mapping
         ch_info_list = []
@@ -381,6 +464,7 @@ def run_pipeline(input_folder, output_folder):
     tqdm.write(f"   channels_npy/                {num_channels} individual channel .npy files")
     tqdm.write(f"   lfp_data.npy                 ({n_samples}, {num_channels}) @ {fs} Hz")
     tqdm.write(f"   lfp_timestamps.npy           time axis (s)")
+    tqdm.write(f"   session_boundaries.npy       per-session sample ranges")
     tqdm.write(f"   channel_map.npy              ntrode/channel mapping")
     tqdm.write(f"   cleanest_channel_indices.npy top-3 EEG ch: {best_ch_idx}")
     tqdm.write(f"   channel_snr_scores.npy       SNR scores (all channels)")

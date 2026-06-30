@@ -57,20 +57,31 @@ def _parseFields(fieldstr):
 ACCEL_AXES = ('AccelX', 'AccelY', 'AccelZ')
 
 
-def find_analog_file(input_folder, suffix):
+def find_analog_roots(input_folder):
     """
-    Find the analogio-exported .dat file whose name ends in <suffix>.dat
-    (e.g. 'AccelX'). Searches the Trodes '*.analog' export folder, then the
-    input folder itself as a fallback.
+    Return the per-session analog export folders in chronological order.
+
+    Each .rec recording exports its analog channels into its own
+    '<recording>.analog' folder. When a folder holds several recordings
+    (separate sessions), each becomes its own root here. The Trodes name
+    embeds YYYYMMDD_HHMMSS, so sorting by name == sorting by time.
+
+    Returns (roots, names). Falls back to the input folder itself (flat
+    layout) when no '*.analog' folders exist.
     """
     base = Path(input_folder)
-    patterns = (f"*.analog/*{suffix}.dat", f"*{suffix}.dat")
-    for pat in patterns:
-        matches = [f for f in base.glob(pat)
-                   if 'timestamps' not in f.name.lower()]
-        if matches:
-            return sorted(matches)[0]
-    return None
+    dirs = sorted((d for d in base.glob("*.analog") if d.is_dir()),
+                  key=lambda d: d.name)
+    if dirs:
+        return [d for d in dirs], [d.stem for d in dirs]
+    return [base], [base.name]
+
+
+def find_axis_file(root, suffix):
+    """Find the .dat in <root> whose name ends in <suffix>.dat (e.g. 'AccelX')."""
+    matches = [f for f in Path(root).glob(f"*{suffix}.dat")
+               if 'timestamps' not in f.name.lower()]
+    return sorted(matches)[0] if matches else None
 
 
 def load_channel(dat_file):
@@ -115,39 +126,71 @@ def run(input_folder, output_folder):
     print(f"   Input:  {base_path}")
     print(f"   Output: {output_dir}")
 
-    columns = []
-    lengths = []
-    found_axes = []
+    # Each .rec is a separate recording session with its own analog export
+    # folder. Load + downsample every session, then concatenate them in
+    # chronological order so motion.npy spans all sessions, matching the
+    # concatenated LFP output.
+    roots, names = find_analog_roots(input_folder)
     src_fs = None
-    for axis in ACCEL_AXES:
-        dat_file = find_analog_file(input_folder, axis)
-        if dat_file is None:
-            print(f"  ⚠  {axis} .dat not found — skipping.")
+    sessions_data = []   # [{'name', 'nd', 'axes': {axis: down_array}}]
+    boundaries = []
+    for root, name in zip(roots, names):
+        axis_raw = {}
+        for axis in ACCEL_AXES:
+            dat_file = find_axis_file(root, axis)
+            if dat_file is None:
+                continue
+            values, header = load_channel(dat_file)
+            if src_fs is None:
+                src_fs = get_source_fs(header)
+            axis_raw[axis] = values
+        if not axis_raw:
+            if len(roots) > 1:
+                print(f"  ⚠  {name}: no Accel .dat found — skipping session.")
             continue
-        values, header = load_channel(dat_file)
-        if src_fs is None:
-            src_fs = get_source_fs(header)
-        print(f"  ✓ {axis}: {dat_file.name}  ({values.shape[0]} samples)")
-        columns.append(values)
-        lengths.append(values.shape[0])
-        found_axes.append(axis)
 
-    if not columns:
+        # Truncate ragged axes within this session, then downsample to 1000 Hz.
+        n = min(v.shape[0] for v in axis_raw.values())
+        if len({v.shape[0] for v in axis_raw.values()}) > 1:
+            print(f"  ⚠  {name}: axis lengths differ; truncating to {n}.")
+        down = {ax: downsample(v[:n], src_fs, TARGET_FS)
+                for ax, v in axis_raw.items()}
+        nd = min(len(v) for v in down.values())
+        down = {ax: v[:nd] for ax, v in down.items()}
+        for ax in ACCEL_AXES:
+            if ax in down:
+                print(f"  ✓ {name} {ax}  ({nd} samples @ {TARGET_FS} Hz)")
+        sessions_data.append({'name': name, 'nd': nd, 'axes': down})
+
+    if not sessions_data:
         print("❌  No Accel .dat files found. Did Step e / Step 1 export "
               "with -analogio?")
         print("    Expected: <recording>.analog/<recording>.analog_*AccelX.dat")
         return
 
-    # Guard against ragged channels (truncate to the shortest).
-    n = min(lengths)
-    if len(set(lengths)) > 1:
-        print(f"  ⚠  Axis lengths differ {lengths}; truncating to {n}.")
+    # Keep only axes present in every session so columns stay aligned.
+    common_axes = set(sessions_data[0]['axes'])
+    for sd in sessions_data[1:]:
+        common_axes &= set(sd['axes'])
+    found_axes = [ax for ax in ACCEL_AXES if ax in common_axes]
+    if not found_axes:
+        print("❌  No Accel axis is common to all sessions; cannot concatenate.")
+        return
 
-    # Downsample each axis from its native rate to TARGET_FS (1000 Hz).
-    print(f"  Downsampling {src_fs:g} Hz → {TARGET_FS} Hz")
-    down_cols = [downsample(c[:n], src_fs, TARGET_FS) for c in columns]
-    n_down = min(len(c) for c in down_cols)
-    motion = np.column_stack([c[:n_down] for c in down_cols]).astype('float32')
+    if len(sessions_data) > 1:
+        joined = ", ".join(f"{sd['name']} ({sd['nd']})" for sd in sessions_data)
+        print(f"  Concatenating {len(sessions_data)} session(s): {joined}")
+
+    cols = [np.concatenate([sd['axes'][ax] for sd in sessions_data])
+            for ax in found_axes]
+    motion = np.column_stack(cols).astype('float32')
+    n_down = motion.shape[0]
+
+    # Per-session sample ranges within the concatenated motion array.
+    start = 0
+    for sd in sessions_data:
+        boundaries.append({'name': sd['name'], 'start': start, 'n': sd['nd']})
+        start += sd['nd']
 
     out_file = output_dir / "motion.npy"
     np.save(out_file, motion)
@@ -157,6 +200,12 @@ def run(input_folder, output_folder):
     ts_seconds = (np.arange(n_down) / TARGET_FS).astype('float64')
     np.save(output_dir / "motion_timestamps.npy", ts_seconds)
     print(f"  ✓ motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
+
+    np.save(output_dir / "motion_session_boundaries.npy", boundaries)
+    if len(boundaries) > 1:
+        for b in boundaries:
+            print(f"    {b['name']}: samples {b['start']}.."
+                  f"{b['start'] + b['n']}  (t0={b['start'] / TARGET_FS:.2f}s)")
 
     print(f"{'=' * 60}")
     print(f"✅  Motion data → {out_file}")

@@ -311,18 +311,19 @@ if not defined STEPS_TO_RUN (
 :: --- STEP 1 (DIO/Raw only) ---
 echo %STEPS_TO_RUN% | findstr "1" >nul
 if %errorlevel% equ 0 (
-    echo [STEP 1] Running Trodes DIO/Raw Export...
+    echo [STEP 1] Running Trodes DIO/Raw/Analog Export ^(per .rec^)...
+    REM Each .rec is a separate recording session (independent timestamps),
+    REM so export each one on its own. Trodes names the output after each
+    REM .rec, giving per-session .DIO/.raw/.analog folders. Multiple sessions
+    REM are concatenated later by the Python extractors.
     if exist "%TRODES_EXPORT_CMD%" (
-        set "REC_ARGS="
+        set "FOUND_REC="
         for /f "delims=" %%F in ('dir /b /on "%IP%\*.rec" 2^>nul') do (
-            echo     Adding %%F
-            set "REC_ARGS=!REC_ARGS! -rec "%IP%\%%F""
+            set "FOUND_REC=1"
+            echo     Exporting %%F
+            "%TRODES_EXPORT_CMD%" -dio -raw -analogio -rec "%IP%\%%F"
         )
-        if not defined REC_ARGS (
-            echo [WARNING] No .rec files found in "%IP%"
-        ) else (
-            "%TRODES_EXPORT_CMD%" -dio -raw -analogio !REC_ARGS!
-        )
+        if not defined FOUND_REC echo [WARNING] No .rec files found in "%IP%"
     ) else (
         echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
     )
@@ -331,27 +332,28 @@ if %errorlevel% equ 0 (
 :: --- STEP e (LFP export) ---
 echo %STEPS_TO_RUN% | findstr "e" >nul
 if %errorlevel% equ 0 (
-    set "REC_ARGS="
+    echo [STEP e] Running Trodes LFP + Analog Export ^(per .rec^)...
+    REM Each .rec is a separate recording session with its own timestamps, so
+    REM Trodes cannot append them (-rec a -rec b aborts on the timestamp gap).
+    REM Export each session separately; the Python extractors concatenate them.
+    set "FOUND_REC="
     for /f "delims=" %%F in ('dir /b /on "%IP%\*.rec" 2^>nul') do (
-        echo     Adding %%F
-        set "REC_ARGS=!REC_ARGS! -rec "%IP%\%%F""
-    )
-    if not defined REC_ARGS (
-        echo [WARNING] No .rec files found in "%IP%"
-    ) else (
-        echo [STEP e] Running Trodes LFP Export ^(1000Hz, LP 500Hz^)...
+        set "FOUND_REC=1"
+        echo     --- %%F ---
         if exist "%TRODES_EXPORT_LFP%" (
-            "%TRODES_EXPORT_LFP%" !REC_ARGS! -outputrate 1000 -lfplowpass 500
+            echo     Exporting LFP ^(1000Hz, LP 500Hz^)...
+            "%TRODES_EXPORT_LFP%" -rec "%IP%\%%F" -outputrate 1000 -lfplowpass 500
         ) else (
             echo [WARNING] exportLFP not found at: %TRODES_EXPORT_LFP%
         )
-        echo [STEP e] Exporting Analog/AUX ^(headstage IMU^)...
         if exist "%TRODES_EXPORT_CMD%" (
-            "%TRODES_EXPORT_CMD%" -analogio !REC_ARGS!
+            echo     Exporting analog/AUX ^(headstage IMU^)...
+            "%TRODES_EXPORT_CMD%" -analogio -rec "%IP%\%%F"
         ) else (
             echo [WARNING] trodesexport not found at: %TRODES_EXPORT_CMD%
         )
     )
+    if not defined FOUND_REC echo [WARNING] No .rec files found in "%IP%"
 )
 
 :: --- STEP 2 ---
