@@ -33,6 +33,12 @@ for /f "usebackq tokens=1,* delims==" %%A in ("%CONFIG_FILE%") do (
 )
 set FREQ=30000
 
+:: Seconds to skip at the start of each eye video before locating/detecting the
+:: sync LED (the LED is repositioned early in the session). The per-frame
+:: timestamp output still covers every frame. Override by adding
+:: SYNC_START_SEC=<n> to hm_tracker_paths.txt; set 0 to disable.
+if not defined SYNC_START_SEC set "SYNC_START_SEC=45"
+
 :: ========================================================
 ::            MODE CHECK: MASTER OR WORKER?
 :: ========================================================
@@ -359,9 +365,9 @@ if %errorlevel% equ 0 (
 :: --- STEP 2 ---
 echo %STEPS_TO_RUN% | findstr "2" >nul
 if %errorlevel% equ 0 (
-    echo [STEP 2] Running Sync Script...
+    echo [STEP 2] Running Sync Script ^(LED detection starts after %SYNC_START_SEC%s^)...
     if exist ".\src\Video_LED_Sync_using_ICA.py" (
-        python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
+        python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ% --start-sec %SYNC_START_SEC%
     )
 )
 

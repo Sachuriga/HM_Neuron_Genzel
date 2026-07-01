@@ -7,6 +7,17 @@ FFMPEG_CMD=C:\Users\YOUR_NAME\Desktop\ffmpeg-...\bin\ffmpeg.exe
 ONNX_WEIGHTS_PATH=C:\Users\YOUR_NAME\Desktop\data\yolov\bests_1280_mosiac_close.pt
 TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport.exe
 
+# -------------------------------------------------------------------
+# Video/LED sync (menu [2]).
+# SYNC_START_SEC : seconds to skip at the START of each eye video before
+#                  locating and detecting the sync LED. Use this when the LED
+#                  is repositioned early in a session (e.g. moved at ~33s):
+#                  everything before the cutoff has the LED in the wrong place
+#                  and would corrupt detection. The per-frame timestamp OUTPUT
+#                  still covers every frame — only detection/fitting is windowed.
+#                  Defaults to 45 if omitted. Set 0 to disable.
+SYNC_START_SEC=45
+
 # NWB step (menu [w] nwblfp): rat number passed as --rat_nr to create_nwb.py.
 # Defaults to 1 if not set.
 NWB_RAT_NR=1
