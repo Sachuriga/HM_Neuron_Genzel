@@ -28,16 +28,14 @@ if not exist "%CONFIG_FILE%" (
     pause
     exit /b 1
 )
+REM Default seconds to skip at the start of each eye video before locating and
+REM detecting the sync LED. Set here BEFORE the config load so a SYNC_START_SEC
+REM line in hm_tracker_paths.txt overrides it; set 0 to disable.
+set "SYNC_START_SEC=45"
 for /f "usebackq tokens=1,* delims==" %%A in ("%CONFIG_FILE%") do (
     if not "%%A"=="" if not "!A:~0,1!"=="#" set "%%A=%%B"
 )
 set FREQ=30000
-
-:: Seconds to skip at the start of each eye video before locating/detecting the
-:: sync LED (the LED is repositioned early in the session). The per-frame
-:: timestamp output still covers every frame. Override by adding
-:: SYNC_START_SEC=<n> to hm_tracker_paths.txt; set 0 to disable.
-if not defined SYNC_START_SEC set "SYNC_START_SEC=45"
 
 :: ========================================================
 ::            MODE CHECK: MASTER OR WORKER?
