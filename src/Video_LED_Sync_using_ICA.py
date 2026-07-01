@@ -26,6 +26,55 @@ import sys
 import shutil
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LED-DETECTION DEBUG DUMP
+# ──────────────────────────────────────────────────────────────────────────────
+# When enabled (via --debug, or SYNC_DEBUG=1), the pipeline writes per-video
+# diagnostics to <output>/sync_debug/ so a "clearly blinking but not detected"
+# LED can be traced to the failing stage:
+#   • <stem>_localization.png   reference frame + detected crop box + blink map
+#   • <stem>_crop_trace.png     the 16x16 crop patch and its intensity over time
+#   • <stem>_ica.png            the ICA component traces with ON/OFF states
+#   • sync_debug_videos.csv     per-video fps / frame-count / crop location
+#   • sync_debug_components.csv per-component duty cycle, frequency, accept flags
+class _SyncDebug:
+    def __init__(self):
+        self.enabled = False
+        self.dir = None
+        self.videos = []
+        self.components = []
+
+    def setup(self, output_path):
+        base = Path(output_path) if output_path else Path.cwd()
+        self.dir = base / "sync_debug"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.enabled = True
+        print(f"[DEBUG] LED-detection debug dump → {self.dir}")
+
+    def path(self, name):
+        return str(self.dir / name)
+
+    def add_video(self, **kw):
+        self.videos.append(kw)
+
+    def add_component(self, **kw):
+        self.components.append(kw)
+
+    def write_summary(self):
+        if not self.enabled:
+            return
+        if self.videos:
+            pd.DataFrame(self.videos).to_csv(
+                self.dir / "sync_debug_videos.csv", index=False)
+        if self.components:
+            pd.DataFrame(self.components).to_csv(
+                self.dir / "sync_debug_components.csv", index=False)
+        print(f"[DEBUG] Wrote sync debug summary CSVs → {self.dir}")
+
+
+DEBUG = _SyncDebug()
+
+
 def get_led_coords_from_videoframes(file_path, process_frame_count):
     cap = cv2.VideoCapture(str(file_path))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -82,7 +131,24 @@ def get_led_coords_from_videoframes(file_path, process_frame_count):
     x, y, w, h = cv2.boundingRect(contours[largest_contour_index])
     cv2.rectangle(ref_frame, (x, y + 100), (x + w, y + 100 + h), (0, 255, 0), 2)
 
-    return int(x + (w / 2)), int(y + 100 + (h / 2))
+    cx, cy = int(x + (w / 2)), int(y + 100 + (h / 2))
+
+    if DEBUG.enabled:
+        stem = Path(file_path).stem
+        n_small = len(small_contours)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        ax[0].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
+        ax[0].set_title(f"Detected LED crop @ ({cx}, {cy})\n"
+                        f"{n_small} small contour(s) <100px; "
+                        f"picked area={areas[largest_contour_index]:.1f}")
+        ax[0].plot(cx, cy, 'r+', markersize=14)
+        ax[1].imshow(avg_th, cmap='gray')
+        ax[1].set_title("Blink map (max frame-diff, top 100px excluded)")
+        fig.tight_layout()
+        fig.savefig(DEBUG.path(f"{stem}_localization.png"), dpi=110)
+        plt.close(fig)
+
+    return cx, cy
 
 
 def get_dio_files(path: Path):
@@ -215,23 +281,24 @@ def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True,
     return videos_filepath_list, crop_xy_dict, meta_filepath_list, dio_file_path_dict
 
 
-def process_ica_signals(demixed, mix_weights, time_meta):
+def process_ica_signals(demixed, mix_weights, time_meta, debug_stem=None):
     fps = 30.0
     eD = 0.5       # expected Duty cycle of 0.5
     ef_red = 0.5   # expected frequency of 0.5 Hz
     ef_blue = 2.5  # expected frequency of 2.5 Hz
-    
+
     dD = np.zeros(demixed.shape[1])
     df_red = np.zeros(demixed.shape[1])
     df_blue = np.zeros(demixed.shape[1])
-    
+
     colors = {0: 'red', 1: 'blue', None: 'gray'}
     N = -1
     N_ICA = -1  # numbers of samples to use for ICA, -1 for all
-    
+
     df_red_out = None
     df_blue_out = None
-    
+    debug_states = []  # (component, y_km) for the trace plot
+
     for n in range(demixed.shape[1]):
         flip_ica = mix_weights[n] < 0
         if flip_ica:
@@ -258,7 +325,19 @@ def process_ica_signals(demixed, mix_weights, time_meta):
         signal_color = good_freq.argmax() if is_signal else None
         print(f"ICA signal number: {n}, DutyCycle:{duty_cycle}, Freq:{freq}")
         sig_col = colors[signal_color]
-        
+
+        if DEBUG.enabled:
+            debug_states.append((demixed[:, n].copy(), y_km.copy()))
+            DEBUG.add_component(
+                video=debug_stem, component=n,
+                duty_cycle=round(float(duty_cycle), 4),
+                freq_hz=round(float(freq), 4),
+                good_duty=bool(good_DC),
+                near_red_0p5hz=bool(good_freq[0]),
+                near_blue_2p5hz=bool(good_freq[1]),
+                accepted_as=sig_col if sig_col != 'gray' else 'none',
+            )
+
         if sig_col == 'red':
             df_red_out = pd.DataFrame({'key': [], "LED_Intensity": []})
             df_red_out['key'] = time_meta[0:(len(demixed[:N, n]-1))]
@@ -267,7 +346,27 @@ def process_ica_signals(demixed, mix_weights, time_meta):
             df_blue_out = pd.DataFrame({'key': [], "LED_Intensity": []})
             df_blue_out['key'] = time_meta[0:(len(demixed[:N, n]-1))]
             df_blue_out["LED_Intensity"] = demixed[:N, n]
-            
+
+    if DEBUG.enabled and debug_states:
+        nrows = len(debug_states)
+        fig, axes = plt.subplots(nrows, 1, figsize=(12, 2.2 * nrows), squeeze=False)
+        for n, (sig, y_km) in enumerate(debug_states):
+            comp = DEBUG.components[-nrows + n]
+            ax = axes[n][0]
+            # Normalise the source for overlay against the 0/1 ON-OFF state.
+            rng = np.ptp(sig) or 1.0
+            ax.plot((sig - sig.min()) / rng, lw=0.5, label='ICA source')
+            ax.plot(y_km, lw=0.8, alpha=0.7, label='ON/OFF (KMeans)')
+            ax.set_title(f"comp {n}: freq={comp['freq_hz']} Hz, "
+                         f"duty={comp['duty_cycle']}, accepted={comp['accepted_as']}")
+            ax.set_ylim(-0.1, 1.2)
+            if n == 0:
+                ax.legend(loc='upper right', fontsize=8)
+        axes[-1][0].set_xlabel("frame")
+        fig.tight_layout()
+        fig.savefig(DEBUG.path(f"{debug_stem}_ica.png"), dpi=110)
+        plt.close(fig)
+
     return df_red_out, df_blue_out
 
 
@@ -302,6 +401,7 @@ def vis_gpu_cpu_ts(path='/home/genzel/param/sync_inp_files'):
 def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_frame_count):
     cap = cv2.VideoCapture(str(file_path))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
     frames_to_process = process_frame_count if process_frame_count is not None else frame_count
     
     ts_data = np.genfromtxt(meta_filepath, delimiter=',', names=True)
@@ -315,10 +415,27 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
     print(df['extracted_seconds_timestamp'][0], df['extracted_seconds_timestamp'][0].tzinfo)
     print("----------------------------------------------------------")
     
-    if (frame_count != len(df['extracted_seconds_timestamp'])):
+    meta_frames = len(df['extracted_seconds_timestamp'])
+    frames_match = (frame_count == meta_frames)
+    if not frames_match:
         print("Frame counts do not match!!!")
         print(f"Frame count from video({frame_count})")
-        print(f"Frame count from metadata({len(df['extracted_seconds_timestamp'])})")
+        print(f"Frame count from metadata({meta_frames})")
+
+    # The detector assumes 30 fps when converting edges → Hz; flag any mismatch
+    # since it directly biases the measured blink frequency.
+    print(f"[fps] Video reports {video_fps:.4f} fps (detector assumes 30.0)")
+
+    if DEBUG.enabled:
+        DEBUG.add_video(
+            video=Path(file_path).name,
+            crop_x=xy_coord[0], crop_y=xy_coord[1],
+            video_fps=round(float(video_fps), 4),
+            video_frames=frame_count,
+            meta_frames=meta_frames,
+            frames_match=frames_match,
+        )
+
     if ((xy_coord[0]-8 < 0) or (xy_coord[1]-8 < 0) or (xy_coord[0]+8 > 600) or (xy_coord[1]+8 > 800)):
         print("INVALID XY COORDINATES FOUND FOR LED!!!", xy_coord[0], xy_coord[1])
         return None, None
@@ -339,14 +456,35 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
             print("Processed frames:", i, " at ", datetime.now(), end='\r')
 
     cap.release()
-    nc = 3 
+
+    if DEBUG.enabled:
+        stem = Path(file_path).stem
+        # Mean intensity of the crop patch over time — a real blink shows up as
+        # a clear square wave here regardless of ICA. Also preview the patch so
+        # you can confirm the LED is actually inside the 16x16 crop.
+        patch_mean = rgb_frames.reshape(rgb_frames.shape[0], -1).mean(axis=1)
+        mid = rgb_frames[rgb_frames.shape[0] // 2].astype('uint8')
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4),
+                               gridspec_kw={'width_ratios': [1, 4]})
+        ax[0].imshow(mid)
+        ax[0].set_title("16x16 crop\n(mid-frame)")
+        ax[1].plot(patch_mean, lw=0.6)
+        ax[1].set_title("Crop mean intensity vs frame")
+        ax[1].set_xlabel("frame")
+        fig.tight_layout()
+        fig.savefig(DEBUG.path(f"{stem}_crop_trace.png"), dpi=110)
+        plt.close(fig)
+
+    nc = 3
     ica = FastICA(n_components=nc, random_state=0)
-    X = rgb_frames.reshape(rgb_frames.shape[0], -1).astype(float) 
+    X = rgb_frames.reshape(rgb_frames.shape[0], -1).astype(float)
     demixed = ica.fit_transform(X)
     mix_weights = ica.mixing_.mean(axis=0)
-    
-    red_ica_df, blue_ica_df = process_ica_signals(demixed, mix_weights, df['extracted_seconds_timestamp'])
-    
+
+    debug_stem = Path(file_path).stem if DEBUG.enabled else None
+    red_ica_df, blue_ica_df = process_ica_signals(
+        demixed, mix_weights, df['extracted_seconds_timestamp'], debug_stem=debug_stem)
+
     return red_ica_df, blue_ica_df
 
 
@@ -664,12 +802,19 @@ if __name__ == "__main__":
     parser.add_argument('-i', "--input", dest='input_path', help=help_text)
     parser.add_argument('-o', "--output", dest='output_path', help='full path for generating framewise timestamps synchronised with DIO time')
     parser.add_argument('-f', "--samp_freq", dest='sampling_freq', help='Sampling freq for Spike Gadget DIO recordings')
+    parser.add_argument("--debug", action='store_true',
+                        help="Write LED-detection diagnostics to <output>/sync_debug/ "
+                             "(localization overlay, crop trace, ICA traces, and "
+                             "per-video/per-component CSV summaries).")
     args = parser.parse_args()
-    
-    if args.input_path is None:  
+
+    if args.input_path is None:
         sys.exit("Please provide path to input and output video files! See --help")
     print('Input path: ', args.input_path, 'Output log path: ', args.output_path)
     print('Sampling freq: ', int(args.sampling_freq))
+
+    if args.debug or os.environ.get('SYNC_DEBUG') == '1':
+        DEBUG.setup(args.output_path or args.input_path)
 
     vfl, xy_dict, meta_file_list, dio_file_path_dict = get_video_files_with_metadata(args.input_path, led_xy_manual=False)
 
@@ -696,6 +841,10 @@ if __name__ == "__main__":
         red_ica_list.append(red_ica_out)
         blue_ica_list.append(blue_ica_out)
         print("=================")
+
+    # Write debug CSVs now, before the sync stage (which may sys.exit on a
+    # folder with no usable LED), so diagnostics are always available.
+    DEBUG.write_summary()
 
     temp_dir = Path(args.input_path).resolve() / "temp_no_led"
     if temp_dir.exists():
