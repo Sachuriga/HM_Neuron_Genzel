@@ -47,7 +47,12 @@ def _parseFields(fieldstr):
         else:
             ftype = sep[i + 1]
         fieldtype = getattr(np, ftype)
-        typearr.append((str(fieldname), fieldtype, repeats))
+        # Scalar fields use (name, type); (name, type, 1) triggers a numpy
+        # FutureWarning and will later be reinterpreted as shape (1,).
+        if repeats == 1:
+            typearr.append((str(fieldname), fieldtype))
+        else:
+            typearr.append((str(fieldname), fieldtype, repeats))
     return np.dtype(typearr)
 
 
