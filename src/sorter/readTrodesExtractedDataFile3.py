@@ -39,7 +39,7 @@ def readTrodesExtractedDataFile(filename):
 # Returns: np.dtype
 def parseFields(fieldstr):
     # Returns np.dtype from field string
-    sep = re.split('\s', re.sub(r"\>\<|\>|\<", ' ', fieldstr).strip())
+    sep = re.split(r'\s', re.sub(r"\>\<|\>|\<", ' ', fieldstr).strip())
     # print(sep)
     typearr = []
     # Every two elmts is fieldname followed by datatype
@@ -49,7 +49,7 @@ def parseFields(fieldstr):
         ftype = 'uint32'
         # Finds if a <num>* is included in datatype
         if sep[i+1].__contains__('*'):
-            temptypes = re.split('\*', sep[i+1])
+            temptypes = re.split(r'\*', sep[i+1])
             # Results in the correct assignment, whether str is num*dtype or dtype*num
             ftype = temptypes[temptypes[0].isdigit()]
             repeats = int(temptypes[temptypes[1].isdigit()])
