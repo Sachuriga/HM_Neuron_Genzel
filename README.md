@@ -86,9 +86,8 @@ HM_Tracker_2025/
 
 ### 1. Environment
 
-**Option A — automated (recommended):** double-click `install.bat` or run it from an Anaconda Prompt.
 
-**Option B — manual:**
+** manual:**
 
 ```bat
 conda env create -f reproduce.yml

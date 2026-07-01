@@ -1,0 +1,27 @@
+# Minimal macOS (CPU) requirements — for sync, plotting, node analysis, and
+# code editing on a Mac. Install with:
+#   pip install -r requirements_mac.txt
+#
+# This deliberately EXCLUDES the GPU/CUDA-only packages from requirements_core.txt
+# that have no macOS wheels or require CUDA:
+#   - torch/torchvision/torchaudio (+cu128) and the cu128 --extra-index-url
+#   - kilosort (CUDA GPU sorter)
+#   - cuda-python / cuda-bindings (pulled by spikeinterface[full])
+#   - spikeinterface[full]  (the [full] extra drags in cuda-python)
+# Run the full GPU pipeline (Trodes export, spike sorting, YOLO tracking) on the
+# Windows machine with requirements_core.txt instead.
+#
+# External (non-pip) tool: join_views.py (stitching) shells out to ffmpeg —
+# install it separately, e.g.  brew install ffmpeg
+
+# --- Core scientific stack (used by the CPU scripts) ---
+numpy<2          # no numba here, so the <2.5 cap from requirements_core is unneeded
+scipy                # plot_trials (spatial/stats); also sklearn's backend
+pandas
+matplotlib
+scikit-learn         # LED sync: FastICA, KMeans, LinearRegression
+opencv-python        # LED sync: video frame reading / cropping
+networkx             # plot_trials + node analysis (hex maze graph)
+openpyxl             # node analysis + RecordingMeta.xlsx reading
+tqdm                 # progress bars (CPU LFP/motion export)
+spikeinterface      # CPU spike sorting (no CUDA)

@@ -269,6 +269,105 @@ except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BOMBCELL AUTOMATED UNIT LABELING (tetrode-tuned)
+# ──────────────────────────────────────────────────────────────────────────────
+# Tetrode-tuned thresholds for spikeinterface.curation.bombcell_label_units.
+# Started from the SpikeInterface bombcell defaults, then adapted for 4-channel
+# tetrodes:
+#   DROPPED (need dense-probe geometry — meaningless on a tetrode):
+#     - mua/drift_ptp    : spatial peak-to-trough DRIFT across the array.
+#     - noise/exp_decay  : spatial amplitude decay across channels.
+#   RELAXED for tetrodes (units are commonly smaller / lower-SNR than
+#   high-density-probe units near soma):
+#     - mua/snr              5   -> 4
+#     - mua/amplitude_median 30  -> 20 (µV)
+# Everything else is single-channel waveform shape or rate/refractory based,
+# which is valid for tetrodes, so those keep the bombcell defaults.
+# A unit is flagged into a category when it FAILS that category's thresholds;
+# precedence is noise -> mua -> non-somatic (see bombcell_curation.py).
+# NOTE: snr / amplitude_median are the most rig-dependent knobs — tune first.
+BOMBCELL_TETRODE_THRESHOLDS = {
+    "noise": {
+        "num_positive_peaks": {"greater": None, "less": 2},
+        "num_negative_peaks": {"greater": None, "less": 1},
+        "peak_to_trough_duration": {"greater": 0.0001, "less": 0.00115},
+        "waveform_baseline_flatness": {"greater": None, "less": 0.5},
+        "peak_after_to_trough_ratio": {"greater": None, "less": 0.8},
+    },
+    "mua": {
+        "amplitude_median": {"greater": 20, "less": None, "abs": True},
+        "snr": {"greater": 4, "less": None},
+        "amplitude_cutoff": {"greater": None, "less": 0.2},
+        "num_spikes": {"greater": 300, "less": None},
+        "rp_contamination": {"greater": None, "less": 0.1},
+        "presence_ratio": {"greater": 0.7, "less": None},
+    },
+    "non-somatic": {
+        "peak_before_to_trough_ratio": {"greater": None, "less": 3},
+        "peak_before_width": {"greater": 0.00015, "less": None},
+        "trough_width": {"greater": 0.0002, "less": None},
+        "peak_before_to_peak_after_ratio": {"greater": None, "less": 3},
+        "main_peak_to_trough_ratio": {"greater": None, "less": 0.8},
+    },
+}
+
+
+def label_units_bombcell(analyzer):
+    """Run bombcell_label_units with the tetrode-tuned thresholds.
+
+    Best-effort: returns a DataFrame (unit-id index, 'bombcell_label' column)
+    or None if bombcell is unavailable or anything fails. It NEVER raises into
+    the sorting pipeline, and it only thresholds metrics that were actually
+    computed (a missing metric column would otherwise KeyError inside bombcell).
+
+    Requires quality_metrics + template_metrics extensions to be computed first.
+    """
+    try:
+        from spikeinterface.curation import bombcell_label_units
+    except Exception as e:
+        print(f"[bombcell] Not available in this spikeinterface version ({e}); "
+              f"skipping automated labeling.")
+        return None
+
+    # Collect the metric columns that actually exist, so we can drop thresholds
+    # for anything that wasn't computed.
+    available = set()
+    for ext_name in ("quality_metrics", "template_metrics"):
+        try:
+            ext = analyzer.get_extension(ext_name)
+            if ext is not None:
+                available.update(ext.get_data().columns)
+        except Exception:
+            pass
+
+    thresholds = {}
+    dropped = []
+    for cat, rules in BOMBCELL_TETRODE_THRESHOLDS.items():
+        kept = {m: r for m, r in rules.items() if m in available}
+        dropped += [f"{cat}/{m}" for m in rules if m not in available]
+        if kept:
+            thresholds[cat] = kept
+    if dropped:
+        print(f"[bombcell] Metrics not computed, thresholds skipped: {dropped}")
+    if not thresholds:
+        print("[bombcell] No usable metrics available; skipping labeling.")
+        return None
+
+    try:
+        labels_df = bombcell_label_units(
+            sorting_analyzer=analyzer,
+            thresholds=thresholds,
+            label_non_somatic=True,
+        )
+        counts = labels_df["bombcell_label"].value_counts().to_dict()
+        print(f"[bombcell] Unit labels ({sum(counts.values())} units): {counts}")
+        return labels_df
+    except Exception as e:
+        print(f"[bombcell] Labeling failed ({e}); skipping.")
+        return None
+
+
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
                         sorter_name=DEFAULT_SORTER, sorting_params=None):
@@ -474,7 +573,29 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     analyzer.compute("templates", **job_kwargs)
     analyzer.compute("noise_levels", **job_kwargs)
     analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
-    analyzer.compute("quality_metrics", metric_names=['snr', 'isi_violation', 'firing_rate'], **job_kwargs)
+
+    # Quality metrics. The base three are always computed; the rest are what the
+    # tetrode BombCell thresholds need (amplitude / refractory / presence) and
+    # are best-effort so a failure here still leaves a usable phy export.
+    qm_names = ['snr', 'isi_violation', 'firing_rate']
+    try:
+        analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
+        qm_names = qm_names + ['num_spikes', 'presence_ratio', 'amplitude_cutoff',
+                               'amplitude_median', 'rp_contamination']
+    except Exception as e:
+        print(f"[bombcell] spike_amplitudes failed ({e}); using base quality metrics only.")
+    analyzer.compute("quality_metrics", metric_names=qm_names, **job_kwargs)
+
+    # Template (waveform-shape) metrics feed BombCell's noise / non-somatic rules.
+    # Single-channel only: the tetrode thresholds drop the multi-channel spatial
+    # metrics (exp_decay), which are unreliable on 4-channel geometry.
+    try:
+        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
+    except Exception as e:
+        print(f"[bombcell] template_metrics failed ({e}); noise/non-somatic labels limited.")
+
+    # 8b. BOMBCELL AUTOMATED LABELING (tetrode-tuned; best-effort)
+    bombcell_labels = label_units_bombcell(analyzer)
 
     # 9. PHY EXPORT
     phy_output_folder = output_dir / "phy_export"
@@ -489,9 +610,29 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         compute_amplitudes=True,
         remove_if_exists=True,
         copy_binary=True, # CHANGED TO TRUE: Necessary so we can delete the intermediate binary folder
-        **job_kwargs  
+        **job_kwargs
     )
-    
+
+    # 9b. Persist BombCell labels INTO the phy export so they survive the
+    #     cleanup below and show up as a column in Phy.
+    if bombcell_labels is not None:
+        try:
+            import pandas as pd
+            bombcell_labels.to_csv(phy_output_folder / "bombcell_labels.csv")
+            # Phy reads cluster_<name>.tsv keyed by 0-based cluster_id, in the
+            # same unit order export_to_phy used (analyzer.sorting.unit_ids).
+            unit_ids = list(analyzer.sorting.unit_ids)
+            labels_by_unit = bombcell_labels["bombcell_label"].to_dict()
+            tsv = pd.DataFrame({
+                "cluster_id": range(len(unit_ids)),
+                "bombcell": [labels_by_unit.get(u, "unlabeled") for u in unit_ids],
+            })
+            tsv.to_csv(phy_output_folder / "cluster_bombcell.tsv", sep="\t", index=False)
+            print(f"[bombcell] Wrote bombcell_labels.csv and cluster_bombcell.tsv "
+                  f"to {phy_output_folder} (the label column appears in Phy).")
+        except Exception as e:
+            print(f"[bombcell] Could not write label files ({e}).")
+
     # 10. CLEANUP INTERMEDIATE FILES
     print("\nCleaning up intermediate files...")
     for item in output_dir.iterdir():
