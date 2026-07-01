@@ -525,54 +525,76 @@ def extract_dio_com(dio_file_path_dict, sampling_freq, fallback_start_time=None)
     return com_dio_red, com_dio_blue, sys_time, timestamp_at_creation, first_timestamp
 
 
-def visualise_ica_dio_coms(dio_com_red, ica_com_red, dio_com_blue, ica_com_blue):    
-    dio_com_red["Amp"] = 0.6
-    ica_com_red["Amp"] = 0.6
-    dio_com_blue["Amp"] = 0.5
-    ica_com_blue["Amp"] = 0.5
+def visualise_ica_dio_coms(dio_com_red, ica_com_red, dio_com_blue, ica_com_blue):
+    # Skip any channel with no center-of-mass points (e.g. blue is empty in the
+    # red-only fallback); matplotlib's stem() errors on empty input.
+    series = [
+        (dio_com_red,  0.6, 'red',    'ro', 'Red_DIO'),
+        (ica_com_red,  0.6, 'orange', 'yo', 'Red_ICA'),
+        (dio_com_blue, 0.5, 'blue',   'bo', 'Blue_DIO'),
+        (ica_com_blue, 0.5, 'cyan',   'co', 'Blue_ICA'),
+    ]
 
     fig, ax = plt.subplots()
-    h1 = ax.stem(dio_com_red["Center_of_mass"], dio_com_red["Amp"], linefmt='red', markerfmt='ro') 
-    h2 = ax.stem(ica_com_red["Center_of_mass"], ica_com_red["Amp"], linefmt='orange', markerfmt='yo')
-    h3 = ax.stem(dio_com_blue["Center_of_mass"], dio_com_blue["Amp"], linefmt='blue', markerfmt='bo')
-    h4 = ax.stem(ica_com_blue["Center_of_mass"], ica_com_blue["Amp"], linefmt='cyan', markerfmt='co')
-    
-    proxies = [h1, h2, h3, h4]
-    legend_names = ['Red_DIO', 'Red_ICA', 'Blue_DIO', 'Blue_ICA']
-    plt.legend(proxies, legend_names, loc='best', numpoints=1)
+    proxies, legend_names = [], []
+    for df, amp, linefmt, markerfmt, name in series:
+        df["Amp"] = amp
+        if len(df["Center_of_mass"]) == 0:
+            continue
+        h = ax.stem(df["Center_of_mass"], df["Amp"], linefmt=linefmt, markerfmt=markerfmt)
+        proxies.append(h)
+        legend_names.append(name)
+
+    if proxies:
+        plt.legend(proxies, legend_names, loc='best', numpoints=1)
 
 
-def pred_dio_ts_from_ica_ts_and_verify(ica_train, dio_train, test_cpu_blue, test_cpu_red, frame_wise_ts, vis_on=False):
+def pred_dio_ts_from_ica_ts_and_verify(ica_train, dio_train, test_cpu_primary, test_cpu_other, frame_wise_ts, vis_on=False):
+    # The regression is fit on the driving (primary) LED's edge train; the
+    # "other" LED is only used for cross-check and may be empty (e.g. the red
+    # fallback runs with no blue signal).
     reg = LinearRegression().fit(ica_train.reshape(-1, 1), dio_train)
-    pred_dio_blue = reg.predict(test_cpu_blue.reshape(-1, 1))
-    pred_dio_red = reg.predict(test_cpu_red.reshape(-1, 1))
     pred_frame_wise_ts = reg.predict(frame_wise_ts.reshape(-1, 1))
-    offset_red = pred_dio_red[0] - test_cpu_red[0]
-    offset_blue = pred_dio_blue[0] - test_cpu_blue[0]
-    assert offset_red == offset_blue, f"Offset in red({offset_red}) and blue ({offset_blue})signal is not same"
-    print("Offset for final correction(s) is: ", offset_red)
-    pred_dio_blue = pred_dio_blue - offset_blue
-    pred_dio_red = pred_dio_red - offset_red
-    pred_frame_wise_ts = pred_frame_wise_ts - offset_red
-    
+
+    def _pred(series):
+        if series is None or len(series) == 0:
+            return np.array([]), None
+        p = reg.predict(series.reshape(-1, 1))
+        return p, p[0] - series[0]
+
+    pred_primary, off_primary = _pred(test_cpu_primary)
+    pred_other,   off_other   = _pred(test_cpu_other)
+
+    offset = off_primary if off_primary is not None else off_other
+    if off_primary is not None and off_other is not None and not np.isclose(off_primary, off_other):
+        print(f"[WARN] Offset mismatch: primary({off_primary}) vs other({off_other})")
+    print("Offset for final correction(s) is: ", offset)
+
+    if len(pred_primary):
+        pred_primary = pred_primary - offset
+    if len(pred_other):
+        pred_other = pred_other - offset
+    pred_frame_wise_ts = pred_frame_wise_ts - offset
+
     if vis_on:
         plt.figure()
-        plt.plot(pred_dio_blue)
+        plt.plot(pred_primary)
         plt.title("Predicted ts vs Frame number")
-        
-        plt.figure()
-        plt.plot(pred_dio_blue - test_cpu_blue)
-        plt.title("Predicted ts-cpu vs Frame number")
-        
+
+        if len(pred_primary):
+            plt.figure()
+            plt.plot(pred_primary - test_cpu_primary)
+            plt.title("Predicted ts-cpu vs Frame number")
+
         val_dio = reg.predict(ica_train.reshape(-1, 1))
         plt.figure()
         plt.plot(val_dio - dio_train)
         plt.title("pred dio on train - dio ground truth vs Frame number")
-        
+
         plt.figure()
         plt.plot(pred_frame_wise_ts - frame_wise_ts)
         plt.title("pred framewise ts - cpu avg framewise ts vs Frame number")
-    return pred_dio_blue, pred_dio_red, pred_frame_wise_ts
+    return pred_primary, pred_other, pred_frame_wise_ts
 
 
 def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blue):
@@ -600,23 +622,29 @@ def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blu
     plt.plot(diff)
     plt.title("diff between RED : trimmed dio and trimmed ica vs Frame number")
     
-    trimmed_dio_blue = dio_ts_blue[(dio_ts_blue > dio_ts_red.values[0]) & 
-                                   (dio_ts_blue < dio_ts_red.values[-1])].to_numpy()
-    print(f"trimmed blue dio len: {trimmed_dio_blue.shape}, before trim: {dio_ts_blue.shape} ")
-    trimmed_ica_blue_front = ica_ts_blue[(ica_ts_blue > dio_ts_red.values[0])].to_numpy()
-    print(f"trimmed blue ica front len: {trimmed_ica_blue_front.shape}, before trim: {ica_ts_blue.shape} ")
-    trimmed_ica_blue = trimmed_ica_blue_front[5*start_point_ica:len(trimmed_dio_blue)+5*start_point_ica]
-    print(f"trimmed blue ica len: {trimmed_ica_blue.shape}, before trim: {ica_ts_blue.shape} ")
-    
-    if is_dio_longer:
-        trimmed_dio_blue = trimmed_dio_blue[:len(trimmed_ica_blue)]
+    # Blue channel may be absent (red-only fallback): skip its alignment.
+    if len(ica_ts_blue) == 0 or len(dio_ts_blue) == 0:
+        print("Blue channel empty — skipping blue trim (red-only fallback).")
+        trimmed_ica_blue = np.array([])
+        trimmed_dio_blue = np.array([])
+    else:
+        trimmed_dio_blue = dio_ts_blue[(dio_ts_blue > dio_ts_red.values[0]) &
+                                       (dio_ts_blue < dio_ts_red.values[-1])].to_numpy()
+        print(f"trimmed blue dio len: {trimmed_dio_blue.shape}, before trim: {dio_ts_blue.shape} ")
+        trimmed_ica_blue_front = ica_ts_blue[(ica_ts_blue > dio_ts_red.values[0])].to_numpy()
+        print(f"trimmed blue ica front len: {trimmed_ica_blue_front.shape}, before trim: {ica_ts_blue.shape} ")
+        trimmed_ica_blue = trimmed_ica_blue_front[5*start_point_ica:len(trimmed_dio_blue)+5*start_point_ica]
+        print(f"trimmed blue ica len: {trimmed_ica_blue.shape}, before trim: {ica_ts_blue.shape} ")
 
-    diff = trimmed_dio_blue - trimmed_ica_blue
-    print("Blue: Trimmed dio - Trimmed ICA difference is: ", diff)
-    plt.figure()
-    plt.plot(diff)
-    plt.title("diff between trimmed dio and trimmed ica vs Frame number")
-    
+        if is_dio_longer:
+            trimmed_dio_blue = trimmed_dio_blue[:len(trimmed_ica_blue)]
+
+        diff = trimmed_dio_blue - trimmed_ica_blue
+        print("Blue: Trimmed dio - Trimmed ICA difference is: ", diff)
+        plt.figure()
+        plt.plot(diff)
+        plt.title("diff between trimmed dio and trimmed ica vs Frame number")
+
     return trimmed_ica_red, trimmed_dio_red, trimmed_ica_blue, trimmed_dio_blue
 
 
@@ -682,16 +710,30 @@ if __name__ == "__main__":
         except OSError as e:
             print(f"Could not remove 'temp_no_led' folder (it might not be empty): {e}")
 
-    final_size = min([eye_ts.shape[0] for eye_ts in blue_ica_list if eye_ts.shape[0] > 0])
-    print("Final size:", final_size)
+    # Prefer the blue LED for sync; fall back to red when blue was not detected
+    # in any video (e.g. the blue LED was absent or ICA could not isolate a
+    # ~2.5 Hz component). The per-frame timestamps ('key') are identical for
+    # either LED, so only the edge-train alignment differs.
+    have_blue = any(df.shape[0] > 0 for df in blue_ica_list)
+    have_red  = any(df.shape[0] > 0 for df in red_ica_list)
+    if have_blue:
+        sync_color, primary_ica_list = 'blue', blue_ica_list
+    elif have_red:
+        print("[WARN] No blue LED detected in any video — falling back to RED LED for sync.")
+        sync_color, primary_ica_list = 'red', red_ica_list
+    else:
+        sys.exit("[ERROR] Neither blue nor red LED detected in any video; cannot sync this folder.")
+
+    final_size = min([eye_ts.shape[0] for eye_ts in primary_ica_list if eye_ts.shape[0] > 0])
+    print(f"Sync LED: {sync_color} | Final size:", final_size)
 
     sum_ts = np.zeros((final_size,))
-    for eye_df in blue_ica_list:
+    for eye_df in primary_ica_list:
         if not eye_df.empty:
             ts_df = pd.to_datetime(eye_df['key']).astype('int64') / 10**9
             sum_ts = sum_ts + ts_df.to_numpy()[:final_size]
 
-    avg_ts_per_frame = sum_ts / len([eye_df for eye_df in blue_ica_list if not eye_df.empty])
+    avg_ts_per_frame = sum_ts / len([eye_df for eye_df in primary_ica_list if not eye_df.empty])
 
     ica_com_red, ica_com_blue, red_ica_total, blue_ica_total = merge_ica_and_extract_com(red_ica_list, blue_ica_list)
 
@@ -710,17 +752,30 @@ if __name__ == "__main__":
 
     ica_train_red, dio_train_red, ica_train_blue, dio_train_blue = trim_ts_before_first_overlap(
         ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue)
-        
+
     red_ica_corrected_s  = pd.to_datetime(red_ica_total['key']).astype('int64') // 10**9
     blue_ica_corrected_s = pd.to_datetime(blue_ica_total['key']).astype('int64') // 10**9
 
-    pred_dio_blue, pred_dio_red, pred_framewise_ts = pred_dio_ts_from_ica_ts_and_verify(
-        ica_train_blue, dio_train_blue, blue_ica_corrected_s.to_numpy(),
-        red_ica_corrected_s.to_numpy(), avg_ts_per_frame, vis_on=False)
+    # Fit the sync regression on whichever LED drives it; the other channel is
+    # only cross-checked and may be empty.
+    if sync_color == 'blue':
+        ica_train, dio_train = ica_train_blue, dio_train_blue
+        primary_corrected = blue_ica_corrected_s.to_numpy()
+        other_corrected   = red_ica_corrected_s.to_numpy()
+    else:
+        ica_train, dio_train = ica_train_red, dio_train_red
+        primary_corrected = red_ica_corrected_s.to_numpy()
+        other_corrected   = blue_ica_corrected_s.to_numpy()
 
-    diff = pred_dio_blue - blue_ica_corrected_s.to_numpy()
-    print("Min diff in seconds between final corrected vs cpu corrected:", np.min(diff))
-    print("Max diff in seconds between final corrected vs cpu corrected::", np.max(diff))
+    if len(ica_train) == 0 or len(dio_train) == 0:
+        sys.exit(f"[ERROR] No overlapping {sync_color} ICA/DIO edges to fit the sync regression.")
+
+    pred_dio_primary, pred_dio_other, pred_framewise_ts = pred_dio_ts_from_ica_ts_and_verify(
+        ica_train, dio_train, primary_corrected, other_corrected, avg_ts_per_frame, vis_on=False)
+
+    diff = pred_dio_primary - primary_corrected
+    print(f"[{sync_color} sync] Min diff in seconds (final corrected vs cpu corrected):", np.min(diff))
+    print(f"[{sync_color} sync] Max diff in seconds (final corrected vs cpu corrected):", np.max(diff))
 
     pred_ts_df = pd.DataFrame(pred_framewise_ts, columns=['Corrected Time Stamp'])
     pred_ts_df.to_csv(args.output_path + "/stitched_framewise_ts.csv", index_label='Frame Number')
