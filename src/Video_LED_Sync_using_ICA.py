@@ -80,9 +80,12 @@ def get_led_coords_from_videoframes(file_path, process_frame_count):
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_to_process = process_frame_count if process_frame_count is not None else frame_count
 
-    rgb_frames = np.empty((frames_to_process, 16, 16, 3))
     ret, ref_frame = cap.read()
-    acc_frames = []
+    # Accumulate the per-pixel MAX frame-difference incrementally instead of
+    # storing every thresholded frame — this keeps memory flat when scanning
+    # many frames (e.g. 1000) for the blink.
+    max_diff = None
+    frames_seen = 0
 
     for i in range(frames_to_process):
         ret, frame = cap.read()
@@ -95,14 +98,18 @@ def get_led_coords_from_videoframes(file_path, process_frame_count):
 
         # Ignoring the top 100 pixels in image due to noise from the timestamp prints
         th = cv2.threshold(subtracted[100:, :], 50, 255, cv2.THRESH_BINARY)[1]
-        acc_frames.append(th)
+        if max_diff is None:
+            max_diff = th
+        else:
+            np.maximum(max_diff, th, out=max_diff)
+        frames_seen += 1
 
     cap.release()
 
-    if len(acc_frames) == 0:
+    if frames_seen == 0:
         raise RuntimeError(f"No frames processed for {file_path}; cannot detect LED.")
 
-    avg_frame = np.max(acc_frames, axis=0).astype("uint8")
+    avg_frame = max_diff.astype("uint8")
     avg_frame = cv2.cvtColor(avg_frame, cv2.COLOR_RGB2GRAY)
     avg_th = cv2.threshold(avg_frame, 0, 255, cv2.THRESH_BINARY)[1]
 
@@ -230,7 +237,7 @@ def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True,
         else:
             raise Exception("File containing led crop coordinates not found.")
     else:
-        n_frame = 100
+        n_frame = 1000
         for video_file_path in all_videos:
             try:
                 xy = get_led_coords_from_videoframes(video_file_path, n_frame)
