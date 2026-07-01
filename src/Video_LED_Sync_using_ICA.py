@@ -75,10 +75,33 @@ class _SyncDebug:
 DEBUG = _SyncDebug()
 
 
+# Skip the first SYNC_START_SEC seconds of every eye video when LOCATING the LED
+# and when EXTRACTING its blink for the sync regression. Use this when the LED is
+# repositioned early in a session (e.g. moved at ~33s): everything before the
+# cutoff has the LED in the wrong place and would corrupt the crop and the
+# measured blink frequency. The per-frame timestamp OUTPUT still covers every
+# frame — only detection/fitting is windowed. Configurable via --start-sec.
+SYNC_START_SEC = 45.0
+
+
+def _start_frame_for(fps):
+    """Frame index corresponding to SYNC_START_SEC, using fps (fallback 30)."""
+    if not fps or fps <= 0 or fps != fps:  # 0 / None / NaN
+        fps = 30.0
+    return int(round(SYNC_START_SEC * fps))
+
+
 def get_led_coords_from_videoframes(file_path, process_frame_count):
     cap = cv2.VideoCapture(str(file_path))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_to_process = process_frame_count if process_frame_count is not None else frame_count
+
+    # Start localization after SYNC_START_SEC so the LED is scanned in its final
+    # (post-move) position. Seeking is fine here — localization only needs a
+    # position, not frame-accurate alignment with the metadata.
+    start_frame = _start_frame_for(cap.get(cv2.CAP_PROP_FPS))
+    if start_frame > 0 and start_frame < frame_count:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     ret, ref_frame = cap.read()
     # Accumulate the per-pixel MAX frame-difference incrementally instead of
@@ -445,7 +468,7 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
 
     if ((xy_coord[0]-8 < 0) or (xy_coord[1]-8 < 0) or (xy_coord[0]+8 > 600) or (xy_coord[1]+8 > 800)):
         print("INVALID XY COORDINATES FOUND FOR LED!!!", xy_coord[0], xy_coord[1])
-        return None, None
+        return None, None, None
     
     rgb_frames = np.empty((frames_to_process, 16, 16, 3))
     for i in range(frames_to_process):
@@ -482,17 +505,35 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
         fig.savefig(DEBUG.path(f"{stem}_crop_trace.png"), dpi=110)
         plt.close(fig)
 
+    # Window the blink extraction to AFTER SYNC_START_SEC: before the cutoff the
+    # LED may sit elsewhere (repositioned), which corrupts the crop and dilutes
+    # the measured frequency. The FULL per-frame timestamps are still returned so
+    # the final output covers every frame.
+    skip_frames = _start_frame_for(video_fps)
+    n_read = rgb_frames.shape[0]
+    if skip_frames >= n_read - 10:  # too few frames left after the cutoff
+        if skip_frames > 0:
+            print(f"[WARN] {Path(file_path).name}: only {n_read} frames read; "
+                  f"start cutoff ({skip_frames}) leaves too few — using full video.")
+        skip_frames = 0
+    elif skip_frames > 0:
+        print(f"[start] Using frames after {SYNC_START_SEC:g}s "
+              f"(skipping first {skip_frames}) for LED detection.")
+
+    full_frame_ts = df['extracted_seconds_timestamp']            # all frames (output)
+    win_ts = full_frame_ts.iloc[skip_frames:].reset_index(drop=True)  # detection window
+
     nc = 3
     ica = FastICA(n_components=nc, random_state=0)
-    X = rgb_frames.reshape(rgb_frames.shape[0], -1).astype(float)
+    X = rgb_frames[skip_frames:].reshape(n_read - skip_frames, -1).astype(float)
     demixed = ica.fit_transform(X)
     mix_weights = ica.mixing_.mean(axis=0)
 
     debug_stem = Path(file_path).stem if DEBUG.enabled else None
     red_ica_df, blue_ica_df = process_ica_signals(
-        demixed, mix_weights, df['extracted_seconds_timestamp'], debug_stem=debug_stem)
+        demixed, mix_weights, win_ts, debug_stem=debug_stem)
 
-    return red_ica_df, blue_ica_df
+    return red_ica_df, blue_ica_df, full_frame_ts
 
 
 # PERFORMANCE FIX 2: Fully Vectorized COM Extraction
@@ -813,12 +854,20 @@ if __name__ == "__main__":
                         help="Write LED-detection diagnostics to <output>/sync_debug/ "
                              "(localization overlay, crop trace, ICA traces, and "
                              "per-video/per-component CSV summaries).")
+    parser.add_argument("--start-sec", dest='start_sec', type=float, default=SYNC_START_SEC,
+                        help="Skip the first N seconds of each eye video when "
+                             "locating/detecting the LED (default 45; the LED was "
+                             "repositioned early in the session). The per-frame "
+                             "timestamp output still covers every frame. Set 0 to disable.")
     args = parser.parse_args()
 
     if args.input_path is None:
         sys.exit("Please provide path to input and output video files! See --help")
     print('Input path: ', args.input_path, 'Output log path: ', args.output_path)
     print('Sampling freq: ', int(args.sampling_freq))
+
+    SYNC_START_SEC = args.start_sec
+    print(f"LED detection start cutoff: {SYNC_START_SEC:g}s")
 
     if args.debug or os.environ.get('SYNC_DEBUG') == '1':
         DEBUG.setup(args.output_path or args.input_path)
@@ -827,16 +876,18 @@ if __name__ == "__main__":
 
     red_ica_list = []
     blue_ica_list = []
+    full_ts_list = []          # full per-frame timestamps per video (for output)
     process_frame_count = None
     for itr, video_file_path in enumerate(vfl):
         print("\n")
         print("Processing for eye:", itr)
         print("Filepath:", video_file_path)
         print("XY coordinates for crop:", xy_dict[str(video_file_path)])
-        
-        red_ica_out, blue_ica_out = process_video_with_metadata(video_file_path, xy_dict[str(video_file_path)],
-                                                              meta_file_list[itr], process_frame_count)
-        
+
+        red_ica_out, blue_ica_out, full_frame_ts = process_video_with_metadata(
+            video_file_path, xy_dict[str(video_file_path)],
+            meta_file_list[itr], process_frame_count)
+
         if red_ica_out is None:
             print("Red ICA signal manquant pour :", str(video_file_path))
             red_ica_out = pd.DataFrame({"key": [], "LED_Intensity": []})
@@ -847,6 +898,8 @@ if __name__ == "__main__":
 
         red_ica_list.append(red_ica_out)
         blue_ica_list.append(blue_ica_out)
+        if full_frame_ts is not None and len(full_frame_ts) > 0:
+            full_ts_list.append(full_frame_ts)
         print("=================")
 
     # Write debug CSVs now, before the sync stage (which may sys.exit on a
@@ -873,23 +926,28 @@ if __name__ == "__main__":
     have_blue = any(df.shape[0] > 0 for df in blue_ica_list)
     have_red  = any(df.shape[0] > 0 for df in red_ica_list)
     if have_blue:
-        sync_color, primary_ica_list = 'blue', blue_ica_list
+        sync_color = 'blue'
     elif have_red:
         print("[WARN] No blue LED detected in any video — falling back to RED LED for sync.")
-        sync_color, primary_ica_list = 'red', red_ica_list
+        sync_color = 'red'
     else:
         sys.exit("[ERROR] Neither blue nor red LED detected in any video; cannot sync this folder.")
 
-    final_size = min([eye_ts.shape[0] for eye_ts in primary_ica_list if eye_ts.shape[0] > 0])
-    print(f"Sync LED: {sync_color} | Final size:", final_size)
+    # avg_ts_per_frame drives the FINAL per-frame output, so it must span every
+    # frame — build it from the full per-frame timestamps (not the windowed ICA
+    # signal, which starts after SYNC_START_SEC).
+    if not full_ts_list:
+        sys.exit("[ERROR] No per-frame timestamps collected; cannot build output.")
+
+    final_size = min(len(ts) for ts in full_ts_list)
+    print(f"Sync LED: {sync_color} | Final size (all frames):", final_size)
 
     sum_ts = np.zeros((final_size,))
-    for eye_df in primary_ica_list:
-        if not eye_df.empty:
-            ts_df = pd.to_datetime(eye_df['key']).astype('int64') / 10**9
-            sum_ts = sum_ts + ts_df.to_numpy()[:final_size]
+    for eye_ts in full_ts_list:
+        ts_df = pd.to_datetime(eye_ts).astype('int64') / 10**9
+        sum_ts = sum_ts + ts_df.to_numpy()[:final_size]
 
-    avg_ts_per_frame = sum_ts / len([eye_df for eye_df in primary_ica_list if not eye_df.empty])
+    avg_ts_per_frame = sum_ts / len(full_ts_list)
 
     ica_com_red, ica_com_blue, red_ica_total, blue_ica_total = merge_ica_and_extract_com(red_ica_list, blue_ica_list)
 
