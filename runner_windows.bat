@@ -70,6 +70,7 @@ echo [5] Plotting
 echo [6] Compression
 echo [7] Sorting
 echo [c] Continue After Sorting (metrics + BombCell + Phy, no re-sort)
+echo [r] Recompute Metrics (after manual Phy curation)
 echo [8] LFP + Motion (IMU Accel)
 echo [d] deeplabcut
 echo [9] Cleaning
@@ -78,11 +79,12 @@ echo [w] nwblfp (NWB / LFP package)
 echo.
 set /p "MY_SELECTION=Enter steps: "
 
-:: --- Steps 7, c, 9 and w run after all parallel steps, sequentially ---
-:: Strip "7", "c", "9", and "w" from the selection passed to parallel workers
+:: --- Steps 7, c, r, 9 and w run after all parallel steps, sequentially ---
+:: Strip "7", "c", "r", "9", and "w" from the selection passed to parallel workers
 set "PARALLEL_STEPS=%MY_SELECTION%"
 set "HAS_SORT=0"
 set "HAS_CONTINUE=0"
+set "HAS_RECOMPUTE=0"
 set "HAS_CLEAN=0"
 set "HAS_NWB=0"
 echo %MY_SELECTION% | findstr "7" >nul
@@ -94,6 +96,11 @@ echo %MY_SELECTION% | findstr "c" >nul
 if %errorlevel% equ 0 (
     set "HAS_CONTINUE=1"
     call set "PARALLEL_STEPS=%%PARALLEL_STEPS:c=%%"
+)
+echo %MY_SELECTION% | findstr "r" >nul
+if %errorlevel% equ 0 (
+    set "HAS_RECOMPUTE=1"
+    call set "PARALLEL_STEPS=%%PARALLEL_STEPS:r=%%"
 )
 echo %MY_SELECTION% | findstr "9" >nul
 if %errorlevel% equ 0 (
@@ -210,6 +217,30 @@ if !HAS_CONTINUE!==1 (
     echo [MASTER] Continue-after-sorting complete for all !sort_count! folder^(s^).
 )
 
+:: Run RECOMPUTE-METRICS sequentially — recompute quality/waveform metrics on the
+:: manually-curated phy folders (run this AFTER curating in Phy).
+if !HAS_RECOMPUTE!==1 (
+    echo.
+    echo ========================================================
+    echo [MASTER] Running RECOMPUTE-METRICS sequentially ^(curated Phy^)...
+    echo ========================================================
+    for /l %%i in (1,1,!sort_count!) do (
+        set "CUR_OP=!SORT_OP_%%i!"
+        echo.
+        echo [RECOMP %%i/!sort_count!] Recomputing: !CUR_OP!
+        if exist ".\src\sorter\recompute_metrics.py" (
+            python -u ./src/sorter/recompute_metrics.py --output_folder "!CUR_OP!" --config "%CONFIG_FILE%"
+            if errorlevel 1 (
+                echo [RECOMP %%i/!sort_count!] Python exited with error ^(errorlevel=!errorlevel!^). Continuing to next folder...
+            ) else (
+                echo [RECOMP %%i/!sort_count!] Done.
+            )
+        )
+    )
+    echo.
+    echo [MASTER] Recompute-metrics complete for all !sort_count! folder^(s^).
+)
+
 :: Run cleaning sequentially after sorting — one folder at a time
 if !HAS_CLEAN!==1 (
     echo.
@@ -257,7 +288,7 @@ if !HAS_NWB!==1 (
 
 echo.
 echo ========================================================
-echo [MASTER] Done. Parallel jobs: !count! ^| Sorting: !HAS_SORT! ^| Continue: !HAS_CONTINUE! ^| NWB: !HAS_NWB!
+echo [MASTER] Done. Parallel jobs: !count! ^| Sorting: !HAS_SORT! ^| Continue: !HAS_CONTINUE! ^| Recompute: !HAS_RECOMPUTE! ^| NWB: !HAS_NWB!
 echo ========================================================
 pause
 exit /b

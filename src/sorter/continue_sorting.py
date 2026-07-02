@@ -3,7 +3,7 @@ Continue the pipeline AFTER spike sorting, without re-sorting.
 
 For each already-sorted recording it rebuilds the SortingAnalyzer from the saved
 sorting + preprocessed recording, computes quality/template metrics, runs the
-tetrode-tuned BombCell labeling, and exports to Phy — i.e. the exact same
+tetrode quality-check labeling, and exports to Phy — i.e. the exact same
 post-sorting steps as sorting.py (they share analyze_and_export()).
 
 It looks inside the OUTPUT (op) folder for the per-recording subfolders that
@@ -29,9 +29,9 @@ from pathlib import Path
 
 import spikeinterface.full as si
 
-# Reuse the exact post-sorting logic from sorting.py.
+# Reuse the exact post-sorting logic (shared with sorting.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sorting import analyze_and_export  # noqa: E402
+from sorter_common import analyze_and_export  # noqa: E402
 
 
 def _load_extractor(folder):
@@ -124,7 +124,7 @@ def run(output_folder, n_jobs=4, cleanup=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Continue post-sorting steps (analyzer, metrics, BombCell "
+        description="Continue post-sorting steps (analyzer, metrics, quality-check "
                     "labels, Phy export) without re-sorting.")
     parser.add_argument("--output_folder", required=True,
                         help="op* folder containing the *_sorting_output subfolders.")

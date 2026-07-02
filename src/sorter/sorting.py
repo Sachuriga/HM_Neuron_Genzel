@@ -269,224 +269,15 @@ except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# BOMBCELL AUTOMATED UNIT LABELING (tetrode-tuned)
-# ──────────────────────────────────────────────────────────────────────────────
-# Tetrode-tuned thresholds for spikeinterface.curation.bombcell_label_units.
-# Started from the SpikeInterface bombcell defaults, then adapted for 4-channel
-# tetrodes:
-#   DROPPED (need dense-probe geometry — meaningless on a tetrode):
-#     - mua/drift_ptp    : spatial peak-to-trough DRIFT across the array.
-#     - noise/exp_decay  : spatial amplitude decay across channels.
-#   RELAXED for tetrodes (units are commonly smaller / lower-SNR than
-#   high-density-probe units near soma):
-#     - mua/snr              5   -> 4
-#     - mua/amplitude_median 30  -> 20 (µV)
-# Everything else is single-channel waveform shape or rate/refractory based,
-# which is valid for tetrodes, so those keep the bombcell defaults.
-# A unit is flagged into a category when it FAILS that category's thresholds;
-# precedence is noise -> mua -> non-somatic (see bombcell_curation.py).
-# NOTE: snr / amplitude_median are the most rig-dependent knobs — tune first.
-BOMBCELL_TETRODE_THRESHOLDS = {
-    "noise": {
-        "num_positive_peaks": {"greater": None, "less": 2},
-        "num_negative_peaks": {"greater": None, "less": 1},
-        "peak_to_trough_duration": {"greater": 0.0001, "less": 0.00115},
-        "waveform_baseline_flatness": {"greater": None, "less": 0.5},
-        "peak_after_to_trough_ratio": {"greater": None, "less": 0.8},
-    },
-    "mua": {
-        "amplitude_median": {"greater": 20, "less": None, "abs": True},
-        "snr": {"greater": 4, "less": None},
-        "amplitude_cutoff": {"greater": None, "less": 0.2},
-        "num_spikes": {"greater": 300, "less": None},
-        "rp_contamination": {"greater": None, "less": 0.1},
-        "presence_ratio": {"greater": 0.7, "less": None},
-    },
-    "non-somatic": {
-        "peak_before_to_trough_ratio": {"greater": None, "less": 3},
-        "peak_before_width": {"greater": 0.00015, "less": None},
-        "trough_width": {"greater": 0.0002, "less": None},
-        "peak_before_to_peak_after_ratio": {"greater": None, "less": 3},
-        "main_peak_to_trough_ratio": {"greater": None, "less": 0.8},
-    },
-}
-
-
-def label_units_bombcell(analyzer):
-    """Run bombcell_label_units with the tetrode-tuned thresholds.
-
-    Best-effort: returns a DataFrame (unit-id index, 'bombcell_label' column)
-    or None if bombcell is unavailable or anything fails. It NEVER raises into
-    the sorting pipeline, and it only thresholds metrics that were actually
-    computed (a missing metric column would otherwise KeyError inside bombcell).
-
-    Requires quality_metrics + template_metrics extensions to be computed first.
-    """
-    try:
-        from spikeinterface.curation import bombcell_label_units
-    except Exception as e:
-        print(f"[bombcell] Not available in this spikeinterface version ({e}); "
-              f"skipping automated labeling.")
-        return None
-
-    # Collect the metric columns that actually exist, so we can drop thresholds
-    # for anything that wasn't computed.
-    available = set()
-    for ext_name in ("quality_metrics", "template_metrics"):
-        try:
-            ext = analyzer.get_extension(ext_name)
-            if ext is not None:
-                available.update(ext.get_data().columns)
-        except Exception:
-            pass
-
-    thresholds = {}
-    dropped = []
-    for cat, rules in BOMBCELL_TETRODE_THRESHOLDS.items():
-        kept = {m: r for m, r in rules.items() if m in available}
-        dropped += [f"{cat}/{m}" for m in rules if m not in available]
-        if kept:
-            thresholds[cat] = kept
-    if dropped:
-        print(f"[bombcell] Metrics not computed, thresholds skipped: {dropped}")
-    if not thresholds:
-        print("[bombcell] No usable metrics available; skipping labeling.")
-        return None
-
-    try:
-        labels_df = bombcell_label_units(
-            sorting_analyzer=analyzer,
-            thresholds=thresholds,
-            label_non_somatic=True,
-        )
-        counts = labels_df["bombcell_label"].value_counts().to_dict()
-        print(f"[bombcell] Unit labels ({sum(counts.values())} units): {counts}")
-        return labels_df
-    except Exception as e:
-        print(f"[bombcell] Labeling failed ({e}); skipping.")
-        return None
-
-
-def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", cleanup=True):
-    """Everything AFTER spike sorting: build the SortingAnalyzer, compute
-    metrics + BombCell labels, export to Phy, and (optionally) clean up
-    intermediates. Shared by the main pipeline (process_single_file) and the
-    standalone continue-after-sorting script so both stay in sync.
-
-    Set cleanup=False to keep the intermediate folders (e.g. when re-running
-    only the post-sorting steps and you want the inputs preserved).
-    """
-    output_dir = Path(output_dir)
-
-    # 7. SORTING ANALYZER
-    print("Initializing SortingAnalyzer (New API)...")
-    analyzer_folder = output_dir / "sorting_analyzer"
-    if analyzer_folder.exists():
-        shutil.rmtree(analyzer_folder)
-
-    analyzer = si.create_sorting_analyzer(
-        sorting=sorting,
-        recording=recording,
-        format="binary_folder",
-        folder=analyzer_folder,
-        overwrite=True,
-        sparse=True
-    )
-
-    # 8. COMPUTE METRICS
-    print("Computing analyzer features...")
-    job_kwargs = {'n_jobs': n_jobs, 'chunk_duration': '1s', 'progress_bar': True}
-
-    analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, **job_kwargs)
-    analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, **job_kwargs)
-    analyzer.compute("templates", **job_kwargs)
-    analyzer.compute("noise_levels", **job_kwargs)
-    analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
-
-    # Quality metrics. The base three are always computed; the rest are what the
-    # tetrode BombCell thresholds need (amplitude / refractory / presence).
-    # NOTE: the metric NAME 'rp_violation' is what you request to compute — it
-    # OUTPUTS the 'rp_contamination' column that BombCell reads (they differ).
-    qm_base = ['snr', 'isi_violation', 'firing_rate']
-    qm_extra = ['num_spikes', 'presence_ratio', 'amplitude_cutoff',
-                'amplitude_median', 'rp_violation']
-    try:
-        analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
-    except Exception as e:
-        print(f"[bombcell] spike_amplitudes failed ({e}); dropping amplitude metrics.")
-        qm_extra = [m for m in qm_extra if not m.startswith('amplitude')]
-    # Best-effort: if any extra metric name is unknown to this spikeinterface
-    # version, fall back to the base set so the sort/phy export still completes.
-    try:
-        analyzer.compute("quality_metrics", metric_names=qm_base + qm_extra, **job_kwargs)
-    except Exception as e:
-        print(f"[bombcell] extended quality_metrics failed ({e}); computing base metrics only.")
-        analyzer.compute("quality_metrics", metric_names=qm_base, **job_kwargs)
-
-    # Template (waveform-shape) metrics feed BombCell's noise / non-somatic rules.
-    # Single-channel only: the tetrode thresholds drop the multi-channel spatial
-    # metrics (exp_decay), which are unreliable on 4-channel geometry.
-    try:
-        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
-    except Exception as e:
-        print(f"[bombcell] template_metrics failed ({e}); noise/non-somatic labels limited.")
-
-    # 8b. BOMBCELL AUTOMATED LABELING (tetrode-tuned; best-effort)
-    bombcell_labels = label_units_bombcell(analyzer)
-
-    # 9. PHY EXPORT
-    phy_output_folder = output_dir / "phy_export"
-    if phy_output_folder.exists():
-        shutil.rmtree(phy_output_folder)
-
-    print(f"Exporting results to Phy: {phy_output_folder}")
-    si.export_to_phy(
-        sorting_analyzer=analyzer,
-        output_folder=phy_output_folder,
-        compute_pc_features=True,
-        compute_amplitudes=True,
-        remove_if_exists=True,
-        copy_binary=True, # CHANGED TO TRUE: Necessary so we can delete the intermediate binary folder
-        **job_kwargs
-    )
-
-    # 9b. Persist BombCell labels INTO the phy export so they survive the
-    #     cleanup below and show up as a column in Phy.
-    if bombcell_labels is not None:
-        try:
-            import pandas as pd
-            bombcell_labels.to_csv(phy_output_folder / "bombcell_labels.csv")
-            # Phy reads cluster_<name>.tsv keyed by 0-based cluster_id, in the
-            # same unit order export_to_phy used (analyzer.sorting.unit_ids).
-            unit_ids = list(analyzer.sorting.unit_ids)
-            labels_by_unit = bombcell_labels["bombcell_label"].to_dict()
-            tsv = pd.DataFrame({
-                "cluster_id": range(len(unit_ids)),
-                "bombcell": [labels_by_unit.get(u, "unlabeled") for u in unit_ids],
-            })
-            tsv.to_csv(phy_output_folder / "cluster_bombcell.tsv", sep="\t", index=False)
-            print(f"[bombcell] Wrote bombcell_labels.csv and cluster_bombcell.tsv "
-                  f"to {phy_output_folder} (the label column appears in Phy).")
-        except Exception as e:
-            print(f"[bombcell] Could not write label files ({e}).")
-
-    # 10. CLEANUP INTERMEDIATE FILES
-    if cleanup:
-        print("\nCleaning up intermediate files...")
-        for item in output_dir.iterdir():
-            if item.name != "phy_export":
-                try:
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                except Exception as e:
-                    print(f"Could not delete {item.name}: {e}")
-        print(f"Cleanup complete! Only phy_export remains.")
-
-    print(f"Done processing {file_stem}!")
-    print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
+# Post-sorting analysis (analyzer, metrics, quality-check labels, Phy export)
+# lives in sorter_common.py so it stays identical between the full pipeline and
+# continue_sorting.py. QUALITY_CHECK_THRESHOLDS / label_units_quality_check are
+# re-exported here for convenience/backwards-compatibility.
+from sorter_common import (  # noqa: E402
+    QUALITY_CHECK_THRESHOLDS,
+    label_units_quality_check,
+    analyze_and_export,
+)
 
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
@@ -670,8 +461,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     sorting.save(folder=final_output_folder)
     print(f"Sorting complete! Object saved to: {final_output_folder}")
 
-    # 7-10. Analyzer, metrics, BombCell labels, Phy export, cleanup — shared with
-    #       continue_sorting.py so both paths stay identical.
+    # 7-10. Analyzer, metrics, quality-check labels, Phy export, cleanup — shared
+    #       with continue_sorting.py so both paths stay identical.
     analyze_and_export(
         sorting, rec_saved, output_dir,
         n_jobs=n_jobs, file_stem=file_stem, cleanup=True,
