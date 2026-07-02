@@ -1059,27 +1059,32 @@ class Tracker:
                         self.end_trial(reason="NGL 10min timeout")
 
         trial_elapsed_ms = self.frame_time - self.last_trial_start_time_ms
-        researcher_trigger_allowed = trial_elapsed_ms >= 5_000
+        # Researcher-proximity end is allowed after 5s for normal trials, but for
+        # the long "special" types (3/4/5/6) only after 10 min — before that a
+        # researcher near the rat (often from placing it) must not end the trial.
+        if _curr_type in (3, 4, 5, 6):
+            researcher_trigger_allowed = trial_elapsed_ms >= self.lockout_duration_ms  # 10 min
+        else:
+            researcher_trigger_allowed = trial_elapsed_ms >= 5_000
 
-        # For all trial types except 3, 4, 5, 6: end trial when researcher is within 150px of the rat
+        # End the trial when a researcher is within 150px of the rat.
         if researcher_trigger_allowed and not is_schedule_only_type:
-            if _curr_type not in (3, 4, 5, 6):
-                _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
-                if _closest_to_rat is not None:
-                    _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
-                    # Arm only after the rat has moved clear of every researcher
-                    # this trial; until then a researcher lingering from placing
-                    # the rat (common on schedule-forced trials) must not end it.
-                    if _res_rat_dist > 150:
-                        self.researcher_rat_end_armed = True
-                    if _res_rat_dist <= 150 and self.researcher_rat_end_armed:
-                        print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 150px of rat ({_res_rat_dist:.0f}px), ending trial')
-                        self.normal_trial = False
-                        self.NGL = False
-                        self.probe = False
-                        self.probe_researcher_signalled = False
-                        self.end_trial(reason="researcher near rat 150px")
-                        return
+            _closest_to_rat = self.closest_researcher_to(self.pos_centroid)
+            if _closest_to_rat is not None:
+                _res_rat_dist = points_dist(_closest_to_rat, self.pos_centroid)
+                # Arm only after the rat has moved clear of every researcher
+                # this trial; until then a researcher lingering from placing
+                # the rat (common on schedule-forced trials) must not end it.
+                if _res_rat_dist > 150:
+                    self.researcher_rat_end_armed = True
+                if _res_rat_dist <= 150 and self.researcher_rat_end_armed:
+                    print(f'\n\n >>> Trial {self.trial_num} (type {_curr_type}): researcher within 150px of rat ({_res_rat_dist:.0f}px), ending trial')
+                    self.normal_trial = False
+                    self.NGL = False
+                    self.probe = False
+                    self.probe_researcher_signalled = False
+                    self.end_trial(reason="researcher near rat 150px")
+                    return
 
         if self.probe:
             minutes = self.timer(start=self.start_time)
