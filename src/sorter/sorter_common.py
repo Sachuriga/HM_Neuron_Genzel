@@ -25,19 +25,15 @@ import spikeinterface.full as si
 # first, then the "mua" gate, so the outcome is:
 #   fails NOISE gate -> "noise"; else fails MUA gate -> "mua"; else "good".
 #
-# NOISE (no real signal above the noise floor):
-#   snr > 2.5 : SNR = spike amplitude / background noise; low SNR -> noise.
-#               (The classic trio only splits good/mua, so SNR provides noise.)
+# NOISE (not a real, well-sampled unit):
+#   snr        > 2.5 : SNR = spike amplitude / background noise; low SNR -> noise.
+#   num_spikes > 100 : too few spikes to be a trustworthy unit -> noise.
 #
-# MUA (real spikes but multi-unit / contaminated) — the classic tetrode trio,
-# using the LENIENT cutoffs:
+# MUA (real spikes but multi-unit / contaminated):
 #   isolation_distance > 10    : Isolation Distance (Harris et al., 2001) —
 #                                Mahalanobis separation of the cluster; higher is
 #                                better (lenient 10; typical 15-20). NaN when the
 #                                cluster holds >half the region's spikes -> mua.
-#   l_ratio            < 0.5   : L-ratio (Schmitzer-Torbert et al., 2005) — spike
-#                                intrusion near the cluster; lower is better
-#                                (very lenient 0.5; typical 0.05-0.1).
 #   isi_violations_ratio < 0.2 : ISI refractory violations (Hill et al., 2011) —
 #                                violation firing rate normalised by the unit's
 #                                overall rate; 0 = clean gap, higher = contaminated.
@@ -46,18 +42,18 @@ import spikeinterface.full as si
 #                                Implemented via SI's 'isi_violation' metric, which
 #                                OUTPUTS the 'isi_violations_ratio' column.
 #
-# isolation_distance + l_ratio are OUTPUT columns of the 'mahalanobis' metric on
-# spikeinterface 0.104 (requestable directly on 0.103); they need the
+# isolation_distance is an OUTPUT column of the 'mahalanobis' metric on
+# spikeinterface 0.104 (requestable directly on 0.103); it needs the
 # principal_components extension.
 # NOTE: these cutoffs are the per-rig knobs to tune. A gate is "greater"/"less"
 # = the value it must satisfy to PASS; failing it flags the unit into that category.
 QUALITY_CHECK_THRESHOLDS = {
     "noise": {
         "snr": {"greater": 2.5, "less": None},
+        "num_spikes": {"greater": 100, "less": None},
     },
     "mua": {
         "isolation_distance": {"greater": 10, "less": None},
-        "l_ratio": {"greater": None, "less": 0.5},
         "isi_violations_ratio": {"greater": None, "less": 0.2},
     },
 }
@@ -73,7 +69,7 @@ def label_units_quality_check(analyzer):
     pipeline, and it only thresholds metrics that were actually computed (a
     missing metric column would otherwise KeyError inside the engine).
 
-    Requires the quality_metrics extension (snr, isolation_distance, l_ratio,
+    Requires the quality_metrics extension (snr, num_spikes, isolation_distance,
     isi_violations_ratio) to be computed first.
     """
     try:
