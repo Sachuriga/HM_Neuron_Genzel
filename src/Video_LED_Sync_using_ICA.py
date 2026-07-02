@@ -234,6 +234,35 @@ def get_dio_files(path: Path):
     return dio
 
 
+def _load_crop_overrides(path):
+    """Optional per-file LED crop overrides for the AUTO-detect path.
+
+    Reads 'led_crop_override.txt' (or .csv) in the input folder — lines of
+    'filename, x, y' ('#' comments allowed) — and returns {basename: (x, y)}.
+    Only the listed videos use the manual crop; everything else auto-detects.
+    Example line:
+        eye08_2026-06-29_12-36-32.mp4, 396, 626
+    """
+    overrides = {}
+    for name in ("led_crop_override.txt", "led_crop_override.csv"):
+        f = path / name
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                fname, x, y = [p.strip() for p in line.split(",")]
+                overrides[Path(fname).name] = (int(float(x)), int(float(y)))
+            except ValueError:
+                print(f"[crop-override] Skipping malformed line: {line!r}")
+        break
+    if overrides:
+        print(f"[crop-override] Loaded {len(overrides)} manual crop(s): {list(overrides)}")
+    return overrides
+
+
 def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True, info=True):
     path = Path(basepath).resolve()
     all_videos = list(sorted(path.glob('*eye*.mp4')))
@@ -261,7 +290,15 @@ def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True,
             raise Exception("File containing led crop coordinates not found.")
     else:
         n_frame = 1000
+        overrides = _load_crop_overrides(path)
         for video_file_path in all_videos:
+            # Manual per-file override wins over auto-detection.
+            if video_file_path.name in overrides:
+                xy = overrides[video_file_path.name]
+                print(f"[crop-override] {video_file_path.name}: using manual crop {xy}")
+                crop_xy_dict[str(video_file_path)] = xy
+                videos_filepath_list.append(video_file_path)
+                continue
             try:
                 xy = get_led_coords_from_videoframes(video_file_path, n_frame)
             except RuntimeError as e:
