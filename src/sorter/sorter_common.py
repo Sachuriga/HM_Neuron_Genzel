@@ -154,28 +154,31 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", c
     analyzer.compute("noise_levels", **job_kwargs)
     analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
 
-    # Quality metrics. The base set is useful in Phy + gates the NOISE category
-    # (snr, num_spikes), so keep it always computed. qm_label is derived from the
-    # quality-check thresholds and resolves to the version's request names (e.g.
-    # 'rp_violation' -> rp_contamination; 'nn_advanced' -> nn_isolation/nn_noise_overlap).
-    qm_base = ['snr', 'num_spikes', 'isi_violation', 'firing_rate']
-    qm_label = [n for n in _quality_check_request_names() if n not in qm_base]
-    qm_amp = ['presence_ratio', 'amplitude_cutoff', 'amplitude_median']
-    try:
-        analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
-    except Exception as e:
-        print(f"[QC] spike_amplitudes failed ({e}); dropping amplitude metrics.")
-        qm_amp = [m for m in qm_amp if not m.startswith('amplitude')]
-    # Best-effort, degrading gracefully: full set -> base+labeling -> base only,
-    # so an unknown/failing metric name never loses the labeling-critical ones.
-    for attempt in (qm_base + qm_label + qm_amp, qm_base + qm_label, qm_base):
+    # Compute ONLY the metrics the quality check uses (resolved to this version's
+    # request names) — no extras — so the Phy export shows just those columns.
+    qm_names = _quality_check_request_names()
+    # PCA-dependent (isolation) metrics vs the rest, so we can still compute the
+    # non-PCA ones if the PCA-based isolation metric fails.
+    pca_reqs = {'mahalanobis', 'isolation_distance', 'l_ratio', 'd_prime',
+                'nn_advanced', 'nn_isolation', 'nn_noise_overlap',
+                'nearest_neighbor', 'silhouette'}
+    non_pca = [n for n in qm_names if n not in pca_reqs]
+    for attempt in (qm_names, non_pca):
+        if not attempt:
+            continue
         try:
             analyzer.compute("quality_metrics", metric_names=attempt, **job_kwargs)
             break
         except Exception as e:
-            print(f"[QC] quality_metrics {attempt} failed ({e}); trying a smaller set.")
+            print(f"[QC] quality_metrics {attempt} failed ({e}); trying without PCA metrics.")
 
-    # 8b. AUTOMATED QUALITY CHECK — classic tetrode isolation trio (best-effort)
+    # Waveform (template) metrics — single-channel (tetrode-appropriate).
+    try:
+        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
+    except Exception as e:
+        print(f"[QC] template_metrics failed ({e}).")
+
+    # 8b. AUTOMATED QUALITY CHECK — good/mua/noise labels (best-effort)
     qc_labels = label_units_quality_check(analyzer)
 
     # 9. PHY EXPORT
