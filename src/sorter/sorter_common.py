@@ -19,42 +19,46 @@ import spikeinterface.full as si
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AUTOMATED QUALITY CHECK — MountainSort-native isolation
+# AUTOMATED QUALITY CHECK — classic tetrode trio (LENIENT thresholds)
 # ──────────────────────────────────────────────────────────────────────────────
-# Two geometry-free stages label each unit good / mua / noise (no waveform-shape
-# criteria, which were designed for high-density probes). The "noise" gate is
-# applied first, then the "mua" gate, so the outcome is:
+# Two stages label each unit good / mua / noise. The "noise" gate is applied
+# first, then the "mua" gate, so the outcome is:
 #   fails NOISE gate -> "noise"; else fails MUA gate -> "mua"; else "good".
 #
-# Metric assignment follows Chung et al. (2017): nn_noise_overlap measures
-# overlap with the NOISE cloud (a noise detector), while nn_isolation measures
-# separation from the nearest OTHER unit (the multi-unit detector).
+# NOISE (no real signal above the noise floor):
+#   snr > 2.5 : SNR = spike amplitude / background noise; low SNR -> noise.
+#               (The classic trio only splits good/mua, so SNR provides noise.)
 #
-# NOISE (looks like noise, not a real unit):
-#   snr              > 2.5  : below this there is no real spike amplitude above noise.
-#   nn_noise_overlap < 0.05 : how much the cluster overlaps the noise cloud;
-#                             lower is better (0.03 strict, 0.1 lenient).
+# MUA (real spikes but multi-unit / contaminated) — the classic tetrode trio,
+# using the LENIENT cutoffs:
+#   isolation_distance > 10    : Isolation Distance (Harris et al., 2001) —
+#                                Mahalanobis separation of the cluster; higher is
+#                                better (lenient 10; typical 15-20). NaN when the
+#                                cluster holds >half the region's spikes -> mua.
+#   l_ratio            < 0.2   : L-ratio (Schmitzer-Torbert et al., 2005) — spike
+#                                intrusion near the cluster; lower is better
+#                                (lenient 0.2; typical 0.05-0.1).
+#   isi_violations_ratio < 0.2 : ISI refractory violations (Hill et al., 2011) —
+#                                violation firing rate normalised by the unit's
+#                                overall rate; 0 = clean gap, higher = contaminated.
+#                                It is a RATIO, not a %: common cutoffs ~0.5
+#                                (lenient) / 0.2 (moderate) / 0.1 (strict).
+#                                Implemented via SI's 'isi_violation' metric, which
+#                                OUTPUTS the 'isi_violations_ratio' column.
 #
-# MUA (real spikes but merged / contaminated):
-#   nn_isolation     > 0.9  : fraction of the cluster separable from its nearest
-#                             neighbour; higher is better (0.9 common, 0.95 strict).
-#   rp_contamination < 0.01 : clear refractory gap — <1% estimated refractory
-#                             contamination (the 'rp_violation' metric OUTPUTS
-#                             the 'rp_contamination' column).
-#
-# nn_isolation + nn_noise_overlap are OUTPUT columns of the 'nn_advanced' metric
-# on spikeinterface 0.104 (requestable directly as 'nn_isolation'/'nn_noise_overlap'
-# on 0.103); both need the principal_components extension.
-# NOTE: the four cutoffs are the per-rig knobs to tune. A gate is "greater"/"less"
+# isolation_distance + l_ratio are OUTPUT columns of the 'mahalanobis' metric on
+# spikeinterface 0.104 (requestable directly on 0.103); they need the
+# principal_components extension.
+# NOTE: these cutoffs are the per-rig knobs to tune. A gate is "greater"/"less"
 # = the value it must satisfy to PASS; failing it flags the unit into that category.
 QUALITY_CHECK_THRESHOLDS = {
     "noise": {
         "snr": {"greater": 2.5, "less": None},
-        "nn_noise_overlap": {"greater": None, "less": 0.05},
     },
     "mua": {
-        "nn_isolation": {"greater": 0.9, "less": None},
-        "rp_contamination": {"greater": None, "less": 0.01},
+        "isolation_distance": {"greater": 10, "less": None},
+        "l_ratio": {"greater": None, "less": 0.2},
+        "isi_violations_ratio": {"greater": None, "less": 0.2},
     },
 }
 
@@ -69,8 +73,8 @@ def label_units_quality_check(analyzer):
     pipeline, and it only thresholds metrics that were actually computed (a
     missing metric column would otherwise KeyError inside the engine).
 
-    Requires the quality_metrics extension (snr, num_spikes, rp_contamination,
-    l_ratio, isolation_distance) to be computed first.
+    Requires the quality_metrics extension (snr, isolation_distance, l_ratio,
+    isi_violations_ratio) to be computed first.
     """
     try:
         from spikeinterface.curation import bombcell_label_units
@@ -307,6 +311,7 @@ def _quality_metric_names():
 # request name is valid for the installed version are used.
 _COLUMN_TO_REQUEST = {
     "rp_contamination": ("rp_contamination", "rp_violation"),
+    "isi_violations_ratio": ("isi_violations_ratio", "isi_violation"),
     "isolation_distance": ("isolation_distance", "mahalanobis"),
     "l_ratio": ("l_ratio", "mahalanobis"),
     "nn_isolation": ("nn_isolation", "nn_advanced"),
