@@ -199,22 +199,23 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", c
     )
 
     # 9b. Persist quality-check labels INTO the phy export so they survive the
-    #     cleanup below and show up as a column in Phy.
+    #     cleanup below. We OVERWRITE Phy's native 'group' (cluster_group.tsv)
+    #     with good/mua/noise so units pre-sort into groups when Phy opens.
     if qc_labels is not None:
         try:
             import pandas as pd
             qc_labels.to_csv(phy_output_folder / "quality_check_labels.csv")
-            # Phy reads cluster_<name>.tsv keyed by 0-based cluster_id, in the
+            # Phy reads cluster_group.tsv keyed by 0-based cluster_id, in the
             # same unit order export_to_phy used (analyzer.sorting.unit_ids).
             unit_ids = list(analyzer.sorting.unit_ids)
             labels_by_unit = qc_labels["quality_label"].to_dict()
             tsv = pd.DataFrame({
                 "cluster_id": range(len(unit_ids)),
-                "quality": [labels_by_unit.get(u, "unlabeled") for u in unit_ids],
+                "group": [labels_by_unit.get(u, "unsorted") for u in unit_ids],
             })
-            tsv.to_csv(phy_output_folder / "cluster_quality.tsv", sep="\t", index=False)
-            print(f"[QC] Wrote quality_check_labels.csv and cluster_quality.tsv "
-                  f"to {phy_output_folder} (the 'quality' column appears in Phy).")
+            tsv.to_csv(phy_output_folder / "cluster_group.tsv", sep="\t", index=False)
+            print(f"[QC] Wrote quality_check_labels.csv and set Phy's group "
+                  f"(cluster_group.tsv) to good/mua/noise in {phy_output_folder}.")
         except Exception as e:
             print(f"[QC] Could not write label files ({e}).")
 
@@ -319,7 +320,8 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     sorting and write them back into the phy folder. Best-effort; never raises.
 
     Writes: curated_quality_metrics.csv, curated_template_metrics.csv, one
-    cluster_<metric>.tsv per metric, and a refreshed cluster_quality.tsv label.
+    cluster_<metric>.tsv per metric, and OVERWRITES Phy's cluster_group.tsv with
+    the refreshed good/mua/noise quality-check label.
     """
     phy = Path(phy_folder)
     if not (phy / "params.py").exists():
@@ -339,46 +341,39 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, **job_kwargs)
     analyzer.compute("templates", **job_kwargs)
     analyzer.compute("noise_levels", **job_kwargs)
-    # Extra extensions some metrics depend on (best-effort).
-    for ext, kw in (("spike_amplitudes", {}),
-                    ("principal_components", {"n_components": 3, "mode": "by_channel_local"}),
-                    ("spike_locations", {})):
-        try:
-            analyzer.compute(ext, **kw, **job_kwargs)
-        except Exception as e:
-            print(f"[recompute] optional extension '{ext}' failed ({e}); "
-                  f"metrics needing it are skipped.")
+    # PCA is only needed for the isolation metrics (l_ratio / isolation_distance).
+    try:
+        analyzer.compute("principal_components", n_components=3,
+                         mode="by_channel_local", **job_kwargs)
+    except Exception as e:
+        print(f"[recompute] principal_components failed ({e}); isolation metrics skipped.")
 
-    # ALL quality metrics, degrading in tiers so a single flaky metric can't
-    # cost us the isolation metrics:
-    #   all   = every valid misc + PCA metric
-    #   mid   = robust misc (spikes/rate/refractory) + PCA isolation metrics
-    #   safe  = robust misc only (no PCA / amplitude / drift extensions)
+    # ONLY the metrics the quality check uses: snr + num_spikes (noise gate),
+    # rp_violation -> rp_contamination, and the isolation metrics l_ratio /
+    # isolation_distance. The PCA request name is version-dependent:
+    # 'mahalanobis' on 0.104, 'isolation_distance'/'l_ratio' on 0.103.
     misc, pca = _quality_metric_names()
-    all_qm = list(misc) + list(pca)
-    safe_misc = [m for m in ('num_spikes', 'firing_rate', 'presence_ratio', 'snr',
-                             'isi_violation', 'rp_violation', 'sliding_rp_violation',
-                             'firing_range') if m in set(misc)]
-    mid_qm = safe_misc + list(pca)
-    for names in (all_qm, mid_qm, safe_misc):
+    qc_names = [m for m in ('snr', 'num_spikes', 'rp_violation') if m in set(misc)]
+    if 'mahalanobis' in pca:
+        pca_names = ['mahalanobis']
+    else:
+        pca_names = [m for m in ('isolation_distance', 'l_ratio') if m in pca]
+    for names in (qc_names + pca_names, qc_names):
         if not names:
             continue
         try:
             analyzer.compute("quality_metrics", metric_names=names, **job_kwargs)
-            print(f"[recompute] quality_metrics computed ({len(names)}): {names}")
+            print(f"[recompute] quality_metrics computed: {names}")
             break
         except Exception as e:
-            print(f"[recompute] quality_metrics ({len(names)} names) failed ({e}); "
-                  f"trying a smaller set.")
+            print(f"[recompute] quality_metrics {names} failed ({e}); trying without PCA.")
 
-    # ALL waveform (template) metrics — try multi-channel, fall back to single.
-    for mc in (True, False):
-        try:
-            analyzer.compute("template_metrics", include_multi_channel_metrics=mc, **job_kwargs)
-            print(f"[recompute] template_metrics computed (multi_channel={mc}).")
-            break
-        except Exception as e:
-            print(f"[recompute] template_metrics (multi_channel={mc}) failed ({e}).")
+    # Waveform (template) metrics — single-channel (tetrode-appropriate).
+    try:
+        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
+        print("[recompute] template_metrics computed.")
+    except Exception as e:
+        print(f"[recompute] template_metrics failed ({e}).")
 
     # Persist results into the phy folder (no re-export -> curation preserved).
     wrote = []
@@ -395,15 +390,16 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         except Exception as e:
             print(f"[recompute] Could not save {ext_name} ({e}).")
 
-    # Refresh the good/mua/noise quality-check label on the curated units.
+    # Refresh the good/mua/noise quality-check label on the curated units and
+    # OVERWRITE Phy's native 'group' (cluster_group.tsv) with it.
     try:
         qc = label_units_quality_check(analyzer)
         if qc is not None:
             qc.to_csv(phy / "quality_check_labels.csv")
-            tsv = qc.rename(columns={"quality_label": "quality"})[["quality"]].copy()
+            tsv = qc.rename(columns={"quality_label": "group"})[["group"]].copy()
             tsv.index.name = "cluster_id"
-            tsv.reset_index().to_csv(phy / "cluster_quality.tsv", sep="\t", index=False)
-            wrote.append("cluster_quality.tsv")
+            tsv.reset_index().to_csv(phy / "cluster_group.tsv", sep="\t", index=False)
+            wrote.append("cluster_group.tsv")
     except Exception as e:
         print(f"[recompute] Quality-check relabel failed ({e}).")
 
