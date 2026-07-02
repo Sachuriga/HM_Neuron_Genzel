@@ -368,6 +368,127 @@ def label_units_bombcell(analyzer):
         return None
 
 
+def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", cleanup=True):
+    """Everything AFTER spike sorting: build the SortingAnalyzer, compute
+    metrics + BombCell labels, export to Phy, and (optionally) clean up
+    intermediates. Shared by the main pipeline (process_single_file) and the
+    standalone continue-after-sorting script so both stay in sync.
+
+    Set cleanup=False to keep the intermediate folders (e.g. when re-running
+    only the post-sorting steps and you want the inputs preserved).
+    """
+    output_dir = Path(output_dir)
+
+    # 7. SORTING ANALYZER
+    print("Initializing SortingAnalyzer (New API)...")
+    analyzer_folder = output_dir / "sorting_analyzer"
+    if analyzer_folder.exists():
+        shutil.rmtree(analyzer_folder)
+
+    analyzer = si.create_sorting_analyzer(
+        sorting=sorting,
+        recording=recording,
+        format="binary_folder",
+        folder=analyzer_folder,
+        overwrite=True,
+        sparse=True
+    )
+
+    # 8. COMPUTE METRICS
+    print("Computing analyzer features...")
+    job_kwargs = {'n_jobs': n_jobs, 'chunk_duration': '1s', 'progress_bar': True}
+
+    analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, **job_kwargs)
+    analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, **job_kwargs)
+    analyzer.compute("templates", **job_kwargs)
+    analyzer.compute("noise_levels", **job_kwargs)
+    analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
+
+    # Quality metrics. The base three are always computed; the rest are what the
+    # tetrode BombCell thresholds need (amplitude / refractory / presence).
+    # NOTE: the metric NAME 'rp_violation' is what you request to compute — it
+    # OUTPUTS the 'rp_contamination' column that BombCell reads (they differ).
+    qm_base = ['snr', 'isi_violation', 'firing_rate']
+    qm_extra = ['num_spikes', 'presence_ratio', 'amplitude_cutoff',
+                'amplitude_median', 'rp_violation']
+    try:
+        analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
+    except Exception as e:
+        print(f"[bombcell] spike_amplitudes failed ({e}); dropping amplitude metrics.")
+        qm_extra = [m for m in qm_extra if not m.startswith('amplitude')]
+    # Best-effort: if any extra metric name is unknown to this spikeinterface
+    # version, fall back to the base set so the sort/phy export still completes.
+    try:
+        analyzer.compute("quality_metrics", metric_names=qm_base + qm_extra, **job_kwargs)
+    except Exception as e:
+        print(f"[bombcell] extended quality_metrics failed ({e}); computing base metrics only.")
+        analyzer.compute("quality_metrics", metric_names=qm_base, **job_kwargs)
+
+    # Template (waveform-shape) metrics feed BombCell's noise / non-somatic rules.
+    # Single-channel only: the tetrode thresholds drop the multi-channel spatial
+    # metrics (exp_decay), which are unreliable on 4-channel geometry.
+    try:
+        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
+    except Exception as e:
+        print(f"[bombcell] template_metrics failed ({e}); noise/non-somatic labels limited.")
+
+    # 8b. BOMBCELL AUTOMATED LABELING (tetrode-tuned; best-effort)
+    bombcell_labels = label_units_bombcell(analyzer)
+
+    # 9. PHY EXPORT
+    phy_output_folder = output_dir / "phy_export"
+    if phy_output_folder.exists():
+        shutil.rmtree(phy_output_folder)
+
+    print(f"Exporting results to Phy: {phy_output_folder}")
+    si.export_to_phy(
+        sorting_analyzer=analyzer,
+        output_folder=phy_output_folder,
+        compute_pc_features=True,
+        compute_amplitudes=True,
+        remove_if_exists=True,
+        copy_binary=True, # CHANGED TO TRUE: Necessary so we can delete the intermediate binary folder
+        **job_kwargs
+    )
+
+    # 9b. Persist BombCell labels INTO the phy export so they survive the
+    #     cleanup below and show up as a column in Phy.
+    if bombcell_labels is not None:
+        try:
+            import pandas as pd
+            bombcell_labels.to_csv(phy_output_folder / "bombcell_labels.csv")
+            # Phy reads cluster_<name>.tsv keyed by 0-based cluster_id, in the
+            # same unit order export_to_phy used (analyzer.sorting.unit_ids).
+            unit_ids = list(analyzer.sorting.unit_ids)
+            labels_by_unit = bombcell_labels["bombcell_label"].to_dict()
+            tsv = pd.DataFrame({
+                "cluster_id": range(len(unit_ids)),
+                "bombcell": [labels_by_unit.get(u, "unlabeled") for u in unit_ids],
+            })
+            tsv.to_csv(phy_output_folder / "cluster_bombcell.tsv", sep="\t", index=False)
+            print(f"[bombcell] Wrote bombcell_labels.csv and cluster_bombcell.tsv "
+                  f"to {phy_output_folder} (the label column appears in Phy).")
+        except Exception as e:
+            print(f"[bombcell] Could not write label files ({e}).")
+
+    # 10. CLEANUP INTERMEDIATE FILES
+    if cleanup:
+        print("\nCleaning up intermediate files...")
+        for item in output_dir.iterdir():
+            if item.name != "phy_export":
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except Exception as e:
+                    print(f"Could not delete {item.name}: {e}")
+        print(f"Cleanup complete! Only phy_export remains.")
+
+    print(f"Done processing {file_stem}!")
+    print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
+
+
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
                         sorter_name=DEFAULT_SORTER, sorting_params=None):
@@ -549,105 +670,12 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     sorting.save(folder=final_output_folder)
     print(f"Sorting complete! Object saved to: {final_output_folder}")
 
-    # 7. SORTING ANALYZER
-    print("Initializing SortingAnalyzer (New API)...")
-    analyzer_folder = output_dir / "sorting_analyzer"
-    if analyzer_folder.exists():
-        shutil.rmtree(analyzer_folder)
-
-    analyzer = si.create_sorting_analyzer(
-        sorting=sorting,
-        recording=rec_saved,
-        format="binary_folder",
-        folder=analyzer_folder, 
-        overwrite=True,
-        sparse=True 
+    # 7-10. Analyzer, metrics, BombCell labels, Phy export, cleanup — shared with
+    #       continue_sorting.py so both paths stay identical.
+    analyze_and_export(
+        sorting, rec_saved, output_dir,
+        n_jobs=n_jobs, file_stem=file_stem, cleanup=True,
     )
-
-    # 8. COMPUTE METRICS
-    print("Computing analyzer features...")
-    job_kwargs = {'n_jobs': n_jobs, 'chunk_duration': '1s', 'progress_bar': True}
-    
-    analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, **job_kwargs)
-    analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, **job_kwargs)
-    analyzer.compute("templates", **job_kwargs)
-    analyzer.compute("noise_levels", **job_kwargs)
-    analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
-
-    # Quality metrics. The base three are always computed; the rest are what the
-    # tetrode BombCell thresholds need (amplitude / refractory / presence) and
-    # are best-effort so a failure here still leaves a usable phy export.
-    qm_names = ['snr', 'isi_violation', 'firing_rate']
-    try:
-        analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
-        qm_names = qm_names + ['num_spikes', 'presence_ratio', 'amplitude_cutoff',
-                               'amplitude_median', 'rp_contamination']
-    except Exception as e:
-        print(f"[bombcell] spike_amplitudes failed ({e}); using base quality metrics only.")
-    analyzer.compute("quality_metrics", metric_names=qm_names, **job_kwargs)
-
-    # Template (waveform-shape) metrics feed BombCell's noise / non-somatic rules.
-    # Single-channel only: the tetrode thresholds drop the multi-channel spatial
-    # metrics (exp_decay), which are unreliable on 4-channel geometry.
-    try:
-        analyzer.compute("template_metrics", include_multi_channel_metrics=False, **job_kwargs)
-    except Exception as e:
-        print(f"[bombcell] template_metrics failed ({e}); noise/non-somatic labels limited.")
-
-    # 8b. BOMBCELL AUTOMATED LABELING (tetrode-tuned; best-effort)
-    bombcell_labels = label_units_bombcell(analyzer)
-
-    # 9. PHY EXPORT
-    phy_output_folder = output_dir / "phy_export"
-    if phy_output_folder.exists():
-        shutil.rmtree(phy_output_folder)
-
-    print(f"Exporting results to Phy: {phy_output_folder}")
-    si.export_to_phy(
-        sorting_analyzer=analyzer,
-        output_folder=phy_output_folder,
-        compute_pc_features=True, 
-        compute_amplitudes=True,
-        remove_if_exists=True,
-        copy_binary=True, # CHANGED TO TRUE: Necessary so we can delete the intermediate binary folder
-        **job_kwargs
-    )
-
-    # 9b. Persist BombCell labels INTO the phy export so they survive the
-    #     cleanup below and show up as a column in Phy.
-    if bombcell_labels is not None:
-        try:
-            import pandas as pd
-            bombcell_labels.to_csv(phy_output_folder / "bombcell_labels.csv")
-            # Phy reads cluster_<name>.tsv keyed by 0-based cluster_id, in the
-            # same unit order export_to_phy used (analyzer.sorting.unit_ids).
-            unit_ids = list(analyzer.sorting.unit_ids)
-            labels_by_unit = bombcell_labels["bombcell_label"].to_dict()
-            tsv = pd.DataFrame({
-                "cluster_id": range(len(unit_ids)),
-                "bombcell": [labels_by_unit.get(u, "unlabeled") for u in unit_ids],
-            })
-            tsv.to_csv(phy_output_folder / "cluster_bombcell.tsv", sep="\t", index=False)
-            print(f"[bombcell] Wrote bombcell_labels.csv and cluster_bombcell.tsv "
-                  f"to {phy_output_folder} (the label column appears in Phy).")
-        except Exception as e:
-            print(f"[bombcell] Could not write label files ({e}).")
-
-    # 10. CLEANUP INTERMEDIATE FILES
-    print("\nCleaning up intermediate files...")
-    for item in output_dir.iterdir():
-        if item.name != "phy_export":
-            try:
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-            except Exception as e:
-                print(f"Could not delete {item.name}: {e}")
-    
-    print(f"Cleanup complete! Only phy_export remains.")
-    print(f"Done processing {file_stem}!")
-    print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
 
 
 def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None):
