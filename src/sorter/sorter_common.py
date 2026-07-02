@@ -19,44 +19,42 @@ import spikeinterface.full as si
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AUTOMATED QUALITY CHECK — classic tetrode isolation trio
+# AUTOMATED QUALITY CHECK — MountainSort-native isolation
 # ──────────────────────────────────────────────────────────────────────────────
 # Two geometry-free stages label each unit good / mua / noise (no waveform-shape
 # criteria, which were designed for high-density probes). The "noise" gate is
-# applied first, then the "mua" isolation gate, so the outcome is:
-#   fails NOISE gate -> "noise"; else fails the isolation trio -> "mua"; else "good".
+# applied first, then the "mua" gate, so the outcome is:
+#   fails NOISE gate -> "noise"; else fails MUA gate -> "mua"; else "good".
 #
-# NOISE (not a real unit):
-#   snr        > 2.5 : below this there is no real spike amplitude above noise.
-#   num_spikes > 100 : too few spikes to be a unit.
+# Metric assignment follows Chung et al. (2017): nn_noise_overlap measures
+# overlap with the NOISE cloud (a noise detector), while nn_isolation measures
+# separation from the nearest OTHER unit (the multi-unit detector).
 #
-# MUA (real spikes but poorly isolated) — the classic tetrode isolation trio:
-#   rp_contamination   < 0.01 : clear refractory gap — <1% estimated refractory
-#                               contamination (the 'rp_violation' metric OUTPUTS
-#                               the 'rp_contamination' column).
-#   l_ratio            < 0.1  : L-ratio (Schmitzer-Torbert et al., 2005) — how
-#                               much other spikes intrude near the cluster; lower
-#                               is better. Common cutoffs ~0.05 (strict)–0.2.
-#   isolation_distance > 15   : Isolation Distance (Harris et al., 2001) —
-#                               Mahalanobis distance out to which the cluster
-#                               stays purer than its surroundings; higher is
-#                               better, >~15–20 a common floor. (NaN when a
-#                               cluster holds >half the region's spikes -> mua.)
+# NOISE (looks like noise, not a real unit):
+#   snr              > 2.5  : below this there is no real spike amplitude above noise.
+#   nn_noise_overlap < 0.05 : how much the cluster overlaps the noise cloud;
+#                             lower is better (0.03 strict, 0.1 lenient).
 #
-# l_ratio + isolation_distance are the OUTPUT columns of the 'mahalanobis'
-# quality metric (needs the principal_components extension).
-# NOTE: snr / num_spikes (noise) and the three isolation cutoffs (mua) are the
-# per-rig knobs to tune. A gate is "greater"/"less" = the value it must satisfy
-# to PASS; failing it flags the unit into that category.
+# MUA (real spikes but merged / contaminated):
+#   nn_isolation     > 0.9  : fraction of the cluster separable from its nearest
+#                             neighbour; higher is better (0.9 common, 0.95 strict).
+#   rp_contamination < 0.01 : clear refractory gap — <1% estimated refractory
+#                             contamination (the 'rp_violation' metric OUTPUTS
+#                             the 'rp_contamination' column).
+#
+# nn_isolation + nn_noise_overlap are OUTPUT columns of the 'nn_advanced' metric
+# on spikeinterface 0.104 (requestable directly as 'nn_isolation'/'nn_noise_overlap'
+# on 0.103); both need the principal_components extension.
+# NOTE: the four cutoffs are the per-rig knobs to tune. A gate is "greater"/"less"
+# = the value it must satisfy to PASS; failing it flags the unit into that category.
 QUALITY_CHECK_THRESHOLDS = {
     "noise": {
         "snr": {"greater": 2.5, "less": None},
-        "num_spikes": {"greater": 100, "less": None},
+        "nn_noise_overlap": {"greater": None, "less": 0.05},
     },
     "mua": {
+        "nn_isolation": {"greater": 0.9, "less": None},
         "rp_contamination": {"greater": None, "less": 0.01},
-        "l_ratio": {"greater": None, "less": 0.1},
-        "isolation_distance": {"greater": 15, "less": None},
     },
 }
 
@@ -156,14 +154,12 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", c
     analyzer.compute("noise_levels", **job_kwargs)
     analyzer.compute("principal_components", n_components=3, mode='by_channel_local', **job_kwargs)
 
-    # Quality metrics. The base three are useful in Phy; the labeling-critical
-    # ones feed the isolation-trio curation. Metric NAME -> OUTPUT columns:
-    #   'rp_violation' -> 'rp_contamination'
-    #   'mahalanobis'  -> 'l_ratio', 'isolation_distance'  (needs PCA extension)
-    # snr + num_spikes gate the NOISE category, so keep them in the always-computed
-    # base set (they have no heavy dependencies).
+    # Quality metrics. The base set is useful in Phy + gates the NOISE category
+    # (snr, num_spikes), so keep it always computed. qm_label is derived from the
+    # quality-check thresholds and resolves to the version's request names (e.g.
+    # 'rp_violation' -> rp_contamination; 'nn_advanced' -> nn_isolation/nn_noise_overlap).
     qm_base = ['snr', 'num_spikes', 'isi_violation', 'firing_rate']
-    qm_label = ['rp_violation', 'mahalanobis']  # the three isolation-trio columns
+    qm_label = [n for n in _quality_check_request_names() if n not in qm_base]
     qm_amp = ['presence_ratio', 'amplitude_cutoff', 'amplitude_median']
     try:
         analyzer.compute("spike_amplitudes", **job_kwargs)  # needed for amplitude_* metrics
@@ -305,6 +301,40 @@ def _quality_metric_names():
     return misc, pca
 
 
+# Map a desired quality-metric OUTPUT column -> the metric you must REQUEST to
+# produce it. Request names differ across spikeinterface versions; the OUTPUT
+# column names (the keys) are what the thresholds reference. Only entries whose
+# request name is valid for the installed version are used.
+_COLUMN_TO_REQUEST = {
+    "rp_contamination": ("rp_contamination", "rp_violation"),
+    "isolation_distance": ("isolation_distance", "mahalanobis"),
+    "l_ratio": ("l_ratio", "mahalanobis"),
+    "nn_isolation": ("nn_isolation", "nn_advanced"),
+    "nn_noise_overlap": ("nn_noise_overlap", "nn_advanced"),
+}
+
+
+def _request_names_for_columns(columns):
+    """Version-adaptive metric REQUEST names needed to produce `columns`."""
+    misc, pca = _quality_metric_names()
+    valid = set(misc) | set(pca)
+    out = []
+    for col in columns:
+        for candidate in _COLUMN_TO_REQUEST.get(col, (col,)):
+            if candidate in valid and candidate not in out:
+                out.append(candidate)
+                break
+    return out
+
+
+def _quality_check_request_names():
+    """The metric REQUEST names needed for every column in QUALITY_CHECK_THRESHOLDS."""
+    cols = []
+    for rules in QUALITY_CHECK_THRESHOLDS.values():
+        cols += list(rules.keys())
+    return _request_names_for_columns(cols)
+
+
 def _write_df_as_phy_tsv(df, phy_folder):
     """Write each metric column as a phy cluster_<metric>.tsv (cluster_id keyed by
     the curated unit ids), so the recomputed metrics show up as columns in Phy."""
@@ -348,17 +378,15 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     except Exception as e:
         print(f"[recompute] principal_components failed ({e}); isolation metrics skipped.")
 
-    # ONLY the metrics the quality check uses: snr + num_spikes (noise gate),
-    # rp_violation -> rp_contamination, and the isolation metrics l_ratio /
-    # isolation_distance. The PCA request name is version-dependent:
-    # 'mahalanobis' on 0.104, 'isolation_distance'/'l_ratio' on 0.103.
-    misc, pca = _quality_metric_names()
-    qc_names = [m for m in ('snr', 'num_spikes', 'rp_violation') if m in set(misc)]
-    if 'mahalanobis' in pca:
-        pca_names = ['mahalanobis']
-    else:
-        pca_names = [m for m in ('isolation_distance', 'l_ratio') if m in pca]
-    for names in (qc_names + pca_names, qc_names):
+    # ONLY the metrics the quality check uses (resolved to this version's request
+    # names): snr + num_spikes (noise), rp_violation -> rp_contamination, and the
+    # isolation metrics nn_isolation / nn_noise_overlap (via 'nn_advanced' on 0.104).
+    qc_names = _quality_check_request_names()
+    # PCA-dependent isolation metrics vs the rest, so we can drop them if PCA failed.
+    pca_reqs = {'mahalanobis', 'nn_advanced', 'nn_isolation', 'nn_noise_overlap',
+                'isolation_distance', 'l_ratio', 'd_prime', 'nearest_neighbor', 'silhouette'}
+    non_pca = [n for n in qc_names if n not in pca_reqs]
+    for names in (qc_names, non_pca):
         if not names:
             continue
         try:
