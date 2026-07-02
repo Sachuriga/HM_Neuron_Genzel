@@ -35,9 +35,9 @@ import spikeinterface.full as si
 #                                Mahalanobis separation of the cluster; higher is
 #                                better (lenient 10; typical 15-20). NaN when the
 #                                cluster holds >half the region's spikes -> mua.
-#   l_ratio            < 0.2   : L-ratio (Schmitzer-Torbert et al., 2005) — spike
+#   l_ratio            < 0.5   : L-ratio (Schmitzer-Torbert et al., 2005) — spike
 #                                intrusion near the cluster; lower is better
-#                                (lenient 0.2; typical 0.05-0.1).
+#                                (very lenient 0.5; typical 0.05-0.1).
 #   isi_violations_ratio < 0.2 : ISI refractory violations (Hill et al., 2011) —
 #                                violation firing rate normalised by the unit's
 #                                overall rate; 0 = clean gap, higher = contaminated.
@@ -57,7 +57,7 @@ QUALITY_CHECK_THRESHOLDS = {
     },
     "mua": {
         "isolation_distance": {"greater": 10, "less": None},
-        "l_ratio": {"greater": None, "less": 0.2},
+        "l_ratio": {"greater": None, "less": 0.5},
         "isi_violations_ratio": {"greater": None, "less": 0.2},
     },
 }
