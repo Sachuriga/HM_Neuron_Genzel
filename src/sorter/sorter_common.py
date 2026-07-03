@@ -424,6 +424,14 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     recording = _load_recording_from_phy(phy)
     print(f"[recompute] {sorting.get_num_units()} curated unit(s), "
           f"{recording.get_num_channels()} channel(s).")
+    # DEBUG: exactly which cluster ids read_phy returned + their spike counts,
+    # so you can compare against what Phy shows (esp. manually-split units).
+    try:
+        _counts = dict(sorting.count_num_spikes_per_unit())
+        print("[recompute][debug] read_phy unit ids -> n_spikes: "
+              + ", ".join(f"{u}={_counts.get(u, '?')}" for u in sorting.unit_ids))
+    except Exception as e:
+        print(f"[recompute][debug] could not list read_phy units ({e}).")
 
     analyzer = si.create_sorting_analyzer(sorting, recording, format="memory", sparse=True)
 
@@ -463,6 +471,34 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         print("[recompute] template_metrics computed.")
     except Exception as e:
         print(f"[recompute] template_metrics failed ({e}).")
+
+    # --- DEBUG: which curated units got metrics vs not (helps spot split units
+    #     that read_phy or the metric computation dropped) ----------------------
+    try:
+        all_ids = list(analyzer.sorting.unit_ids)
+        try:
+            counts = dict(analyzer.sorting.count_num_spikes_per_unit())
+        except Exception:
+            counts = {}
+        qm_ext = analyzer.get_extension("quality_metrics")
+        qdf = qm_ext.get_data() if qm_ext is not None else None
+        qm_ids = list(qdf.index) if qdf is not None else []
+        missing = [u for u in all_ids if u not in set(qm_ids)]
+        print(f"[recompute][debug] curated units ({len(all_ids)}): {all_ids}")
+        print(f"[recompute][debug] units WITH quality_metrics ({len(qm_ids)})")
+        if missing:
+            print(f"[recompute][debug] MISSING quality_metrics for {len(missing)} unit(s): "
+                  + ", ".join(f"{u}(n_spikes={counts.get(u, '?')})" for u in missing))
+        else:
+            print("[recompute][debug] every curated unit has quality_metrics.")
+        if qdf is not None and "isi_violations_ratio" in qdf.columns:
+            nan_isi = qdf.index[qdf["isi_violations_ratio"].isna()].tolist()
+            if nan_isi:
+                print(f"[recompute][debug] NaN isi_violations_ratio for {len(nan_isi)} unit(s): "
+                      + ", ".join(f"{u}(n_spikes={counts.get(u, '?')})" for u in nan_isi))
+    except Exception as e:
+        print(f"[recompute][debug] unit/metric diagnostic failed ({e}).")
+    # -------------------------------------------------------------------------
 
     # Persist results into the phy folder (no re-export -> curation preserved).
     wrote = []
