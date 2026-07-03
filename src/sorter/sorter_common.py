@@ -464,10 +464,10 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     # so you can compare against what Phy shows (esp. manually-split units).
     try:
         _counts = dict(sorting.count_num_spikes_per_unit())
-        print("[recompute][debug] read_phy unit ids -> n_spikes: "
+        print("[recompute][debug] loaded unit ids -> n_spikes: "
               + ", ".join(f"{u}={_counts.get(u, '?')}" for u in sorting.unit_ids))
     except Exception as e:
-        print(f"[recompute][debug] could not list read_phy units ({e}).")
+        print(f"[recompute][debug] could not list loaded units ({e}).")
     # DEBUG: compare against the raw spike_clusters.npy so we can see any Phy
     # cluster ids that read_phy did NOT load (those are the "not recomputed" ones).
     try:
