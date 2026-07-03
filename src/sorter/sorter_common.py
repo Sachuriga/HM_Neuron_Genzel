@@ -324,6 +324,12 @@ def _load_recording_from_phy(phy_folder):
         dtype=p["dtype"],
         num_channels=int(p["n_channels_dat"]),
         file_offset=int(p.get("offset", 0)),
+        # Nominal uV scaling so the analyzer runs in return_in_uV=True mode
+        # (template_metrics requires it). All our labeling metrics (snr ratio,
+        # Mahalanobis, ISI rate, counts) and waveform SHAPE metrics are
+        # scale-invariant, so a unit gain is fine.
+        gain_to_uV=1.0,
+        offset_to_uV=0.0,
     )
 
     pos_file = phy / "channel_positions.npy"
@@ -432,6 +438,20 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
               + ", ".join(f"{u}={_counts.get(u, '?')}" for u in sorting.unit_ids))
     except Exception as e:
         print(f"[recompute][debug] could not list read_phy units ({e}).")
+    # DEBUG: compare against the raw spike_clusters.npy so we can see any Phy
+    # cluster ids that read_phy did NOT load (those are the "not recomputed" ones).
+    try:
+        sc = np.load(phy / "spike_clusters.npy")
+        phy_ids = sorted(int(x) for x in np.unique(sc))
+        loaded = set(int(x) for x in sorting.unit_ids)
+        not_loaded = [i for i in phy_ids if i not in loaded]
+        print(f"[recompute][debug] spike_clusters.npy has {len(phy_ids)} cluster id(s); "
+              f"read_phy loaded {len(loaded)}.")
+        if not_loaded:
+            print(f"[recompute][debug] Phy cluster ids NOT loaded by read_phy "
+                  f"({len(not_loaded)}): {not_loaded}")
+    except Exception as e:
+        print(f"[recompute][debug] spike_clusters.npy check failed ({e}).")
 
     analyzer = si.create_sorting_analyzer(sorting, recording, format="memory", sparse=True)
 
