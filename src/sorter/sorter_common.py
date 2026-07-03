@@ -118,16 +118,73 @@ def label_units_quality_check(analyzer):
         return None
 
 
-def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="", cleanup=True):
-    """Everything AFTER spike sorting: build the SortingAnalyzer, compute
-    metrics + quality-check labels, export to Phy, and (optionally) clean up
-    intermediates. Shared by the main pipeline (process_single_file) and the
-    standalone continue-after-sorting script so both stay in sync.
+def run_auto_curation(sorting, recording, n_jobs=4):
+    """Automatic cluster refinement via SpikeInterface curation, best-effort:
+      1. remove_duplicated_spikes — drop double-counted spikes within a unit
+      2. auto_merge_units         — merge over-split units (MountainSort over-splits)
+      3. remove_redundant_units   — drop duplicate units (same spikes twice)
+    Returns a curated Sorting. NEVER raises into the pipeline — on any failure it
+    returns the best sorting obtained so far.
+
+    (unitrefine is NOT applied here: unitrefine_label_units is a model-based
+    LABELING method needing a pretrained classifier — the available ones are
+    Neuropixels-trained, so it isn't suitable for tetrodes out of the box.)
+    """
+    try:
+        from spikeinterface.curation import (
+            remove_duplicated_spikes, auto_merge_units, remove_redundant_units)
+    except Exception as e:
+        print(f"[curate] SpikeInterface curation unavailable ({e}); skipping auto-curation.")
+        return sorting
+
+    job_kwargs = {"n_jobs": n_jobs, "progress_bar": True}
+    n_start = sorting.get_num_units()
+
+    # 1. Remove duplicated spikes (operates on the Sorting; cheap, no analyzer).
+    try:
+        sorting = remove_duplicated_spikes(sorting, censored_period_ms=0.3, method="keep_first")
+    except Exception as e:
+        print(f"[curate] remove_duplicated_spikes failed ({e}); continuing.")
+
+    # 2 & 3 need a (temporary, in-memory) analyzer with templates/noise; auto_merge
+    # computes the correlogram/similarity extensions its preset needs.
+    try:
+        a = si.create_sorting_analyzer(sorting, recording, format="memory", sparse=True)
+        a.compute("random_spikes", method="uniform", max_spikes_per_unit=500, **job_kwargs)
+        a.compute("templates", **job_kwargs)
+        a.compute("noise_levels", **job_kwargs)
+
+        n_before = a.sorting.get_num_units()
+        a = auto_merge_units(a, presets=["similarity_correlograms"], **job_kwargs)
+        print(f"[curate] auto_merge: {n_before} -> {a.sorting.get_num_units()} units.")
+
+        # Template-based redundant-unit removal on the merged analyzer.
+        sorting = remove_redundant_units(a, remove_strategy="minimum_shift")
+    except Exception as e:
+        print(f"[curate] auto_merge / remove_redundant failed ({e}); "
+              f"using the de-duplicated sorting.")
+
+    print(f"[curate] Auto-curation: {n_start} -> {sorting.get_num_units()} units.")
+    return sorting
+
+
+def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
+                       cleanup=True, auto_curate=True):
+    """Everything AFTER spike sorting: (optionally) auto-curate the clusters,
+    build the SortingAnalyzer, compute metrics + quality-check labels, export to
+    Phy, and (optionally) clean up intermediates. Shared by the main pipeline
+    (process_single_file) and the continue-after-sorting script.
 
     Set cleanup=False to keep the intermediate folders (e.g. when re-running
-    only the post-sorting steps and you want the inputs preserved).
+    only the post-sorting steps). Set auto_curate=False to skip the automatic
+    merge/dedup/redundant-removal step.
     """
     output_dir = Path(output_dir)
+
+    # 6b. AUTOMATIC CLUSTER REFINEMENT — merge over-split / remove duplicates,
+    #     so all downstream metrics + labels use the curated units.
+    if auto_curate:
+        sorting = run_auto_curation(sorting, recording, n_jobs=n_jobs)
 
     # 7. SORTING ANALYZER
     print("Initializing SortingAnalyzer (New API)...")
