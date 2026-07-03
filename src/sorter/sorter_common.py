@@ -319,9 +319,17 @@ def _load_curated_sorting_from_phy(phy_folder):
     phy = Path(phy_folder)
     p = _read_phy_params(phy)
     fs = float(p["sample_rate"])
-    spike_times = np.load(phy / "spike_times.npy").astype("int64").flatten()
+    # phy 'spike_times.npy' stores spike SAMPLE indices (not seconds).
+    spike_samples = np.load(phy / "spike_times.npy").astype("int64").flatten()
     spike_clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
-    return si.NumpySorting.from_times_labels(spike_times, spike_clusters, sampling_frequency=fs)
+    # Factory name changed across spikeinterface versions:
+    #   0.104: NumpySorting.from_samples_and_labels(samples, labels, fs)
+    #   older: NumpySorting.from_times_labels(frames, labels, fs)  (also samples)
+    for meth in ("from_samples_and_labels", "from_times_labels"):
+        factory = getattr(si.NumpySorting, meth, None)
+        if factory is not None:
+            return factory(spike_samples, spike_clusters, sampling_frequency=fs)
+    raise RuntimeError("NumpySorting has no from_samples_and_labels/from_times_labels factory.")
 
 
 def _load_recording_from_phy(phy_folder):
