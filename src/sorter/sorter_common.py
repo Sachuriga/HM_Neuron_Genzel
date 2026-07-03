@@ -308,6 +308,22 @@ def _read_phy_params(phy_folder):
     return {k: v for k, v in ns.items() if not k.startswith("__")}
 
 
+def _load_curated_sorting_from_phy(phy_folder):
+    """Build the curated Sorting DIRECTLY from phy's spike_times + spike_clusters,
+    so EVERY phy cluster id (including manually-split ones) becomes a unit with
+    the exact ids / spike counts Phy shows.
+
+    si.read_phy can return a stale/remapped assignment that drops split clusters
+    (observed: split ids 266+ missing, spike counts mismatched), so we read the
+    raw arrays instead."""
+    phy = Path(phy_folder)
+    p = _read_phy_params(phy)
+    fs = float(p["sample_rate"])
+    spike_times = np.load(phy / "spike_times.npy").astype("int64").flatten()
+    spike_clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
+    return si.NumpySorting.from_times_labels(spike_times, spike_clusters, sampling_frequency=fs)
+
+
 def _load_recording_from_phy(phy_folder):
     """Rebuild the (preprocessed) recording from phy's recording.dat + params.py,
     attaching the probe geometry from channel_positions.npy."""
@@ -426,7 +442,13 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         return
 
     print(f"[recompute] Loading curated sorting from {phy} ...")
-    sorting = si.read_phy(phy, load_all_cluster_properties=True)
+    try:
+        sorting = _load_curated_sorting_from_phy(phy)
+        print("[recompute] Built sorting directly from spike_times/spike_clusters "
+              "(all phy cluster ids, incl. splits).")
+    except Exception as e:
+        print(f"[recompute] Direct load failed ({e}); falling back to si.read_phy.")
+        sorting = si.read_phy(phy, load_all_cluster_properties=True)
     recording = _load_recording_from_phy(phy)
     print(f"[recompute] {sorting.get_num_units()} curated unit(s), "
           f"{recording.get_num_channels()} channel(s).")
