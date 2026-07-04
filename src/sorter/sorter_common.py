@@ -560,6 +560,24 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         except Exception as e:
             print(f"[recompute] Could not save {ext_name} ({e}).")
 
+    # Save the curated per-unit waveform templates so the NWB units step (runner
+    # step 'u') can attach them without rebuilding the analyzer from the (huge)
+    # recording.dat. Phy's own templates.npy is stale after merges/splits (its
+    # rows are keyed by the ORIGINAL cluster ids), so we persist the freshly
+    # computed ones here, keyed by the curated unit ids.
+    try:
+        tpl_ext = analyzer.get_extension("templates")
+        if tpl_ext is not None:
+            templates = np.asarray(tpl_ext.get_data())  # (n_units, n_samples, n_channels)
+            np.save(phy / "curated_templates.npy", templates)
+            np.save(phy / "curated_template_unit_ids.npy",
+                    np.asarray(analyzer.unit_ids))
+            np.save(phy / "curated_template_channel_ids.npy",
+                    np.asarray(analyzer.channel_ids))
+            wrote.append("curated_templates.npy")
+    except Exception as e:
+        print(f"[recompute] Could not save curated templates ({e}).")
+
     # Refresh the good/mua/noise quality-check label on the curated units and
     # OVERWRITE Phy's native 'group' (cluster_group.tsv) with it.
     try:

@@ -367,17 +367,20 @@ echo "[d] deeplabcut"
 echo "[9] Cleaning"
 echo "[n] Node Analysis"
 echo "[w] nwblfp (NWB / LFP package)"
+echo "[u] Add curated Units (metrics + waveforms) to NWB (runs after w)"
 echo
 read -r -p "Enter steps: " MY_SELECTION
 
-# Steps 7, c, r, 9 and w run sequentially after the parallel workers.
-HAS_SORT=0; HAS_CONTINUE=0; HAS_RECOMPUTE=0; HAS_CLEAN=0; HAS_NWB=0
+# Steps 7, c, r, 9, w and u run sequentially after the parallel workers
+# (u always runs after w, so a fresh NWB exists to attach the units to).
+HAS_SORT=0; HAS_CONTINUE=0; HAS_RECOMPUTE=0; HAS_CLEAN=0; HAS_NWB=0; HAS_UNITS=0
 PARALLEL_STEPS="$MY_SELECTION"
 if [[ "$MY_SELECTION" == *"7"* ]]; then HAS_SORT=1;      PARALLEL_STEPS="${PARALLEL_STEPS//7/}"; fi
 if [[ "$MY_SELECTION" == *"c"* ]]; then HAS_CONTINUE=1;  PARALLEL_STEPS="${PARALLEL_STEPS//c/}"; fi
 if [[ "$MY_SELECTION" == *"r"* ]]; then HAS_RECOMPUTE=1; PARALLEL_STEPS="${PARALLEL_STEPS//r/}"; fi
 if [[ "$MY_SELECTION" == *"9"* ]]; then HAS_CLEAN=1;     PARALLEL_STEPS="${PARALLEL_STEPS//9/}"; fi
 if [[ "$MY_SELECTION" == *"w"* ]]; then HAS_NWB=1;       PARALLEL_STEPS="${PARALLEL_STEPS//w/}"; fi
+if [[ "$MY_SELECTION" == *"u"* ]]; then HAS_UNITS=1;     PARALLEL_STEPS="${PARALLEL_STEPS//u/}"; fi
 PARALLEL_STEPS_TRIM="${PARALLEL_STEPS//[[:space:]]/}"
 
 # Scan ip* folders.
@@ -543,7 +546,37 @@ if (( HAS_NWB == 1 )); then
     fi
 fi
 
+# --- Units -> NWB (sequential, after NWB packaging) ---
+# Attaches the curated spike-sorting Units table (spike times, quality +
+# waveform/template metrics, and mean waveform templates) to each op's NWB.
+# Runs AFTER step w so the NWB it appends to already exists.
+if (( HAS_UNITS == 1 )); then
+    echo
+    echo "========================================================"
+    echo "[MASTER] Running ADD-UNITS sequentially (curated Phy -> NWB)..."
+    echo "========================================================"
+    total=${#sort_ops[@]}
+    for i in "${!sort_ops[@]}"; do
+        idx=$((i + 1))
+        cur_op="${sort_ops[$i]}"
+        echo
+        echo "[UNITS $idx/$total] Adding units to NWB in: $cur_op"
+        if [[ -f ./src/nwb/add_units.py ]]; then
+            if "$PYTHON" -u ./src/nwb/add_units.py \
+                    --output_folder "$cur_op" --config "$CONFIG_FILE"; then
+                echo "[UNITS $idx/$total] Done."
+            else
+                echo "[UNITS $idx/$total] Python exited with error. Continuing..."
+            fi
+        else
+            echo "[UNITS] add_units.py NOT found at: $SCRIPT_DIR/src/nwb/add_units.py"
+        fi
+    done
+    echo
+    echo "[MASTER] Add-units complete for all $total folder(s)."
+fi
+
 echo
 echo "========================================================"
-echo "[MASTER] Done. Parallel jobs: $count | Sorting: $HAS_SORT | Continue: $HAS_CONTINUE | Recompute: $HAS_RECOMPUTE | NWB: $HAS_NWB"
+echo "[MASTER] Done. Parallel jobs: $count | Sorting: $HAS_SORT | Continue: $HAS_CONTINUE | Recompute: $HAS_RECOMPUTE | NWB: $HAS_NWB | Units: $HAS_UNITS"
 echo "========================================================"

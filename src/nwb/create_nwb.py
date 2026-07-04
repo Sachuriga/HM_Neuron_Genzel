@@ -280,8 +280,13 @@ def create_position_obj(pos_name, df, rate=float(30)):
 # creates position object to hold DLC bodypart data in the form of SpatialSeries
 # reads lowercase _x/_y columns; coordinates are head-centered on mid_brain
 def create_dlc_position_obj(pos_name, df, rate=float(30)):
-    position_obj = Position(name=pos_name)
     labels = split_dlc_labels(df)
+    # A Position must hold at least one SpatialSeries. If this session has no
+    # DLC bodypart (_x/_y) columns, return None so the caller can skip adding
+    # an invalid empty Position (which pynwb warns about and writes anyway).
+    if not labels:
+        return None
+    position_obj = Position(name=pos_name)
     for label in labels:
         if 'Time (seconds)' in df.columns:
             spatial_series_obj = SpatialSeries(
@@ -336,32 +341,54 @@ def create_metrics_object(timeseries_list, metrics_name):
         metrics_obj.add_timeseries(ts)
     return metrics_obj
 
+# reads the per-session scalar metadata (row 0) from RecordingMeta.xlsx in the
+# session folder. Returns a dict with whatever of Rat_ID/Date/Repeat/Day/Session/
+# Goal_Node is present (coerced to int where possible), or {} if no file/rows.
+# This is the authoritative source for rat id, session date and repeat/day/session.
+def read_recording_meta(session_dir):
+    meta_paths = list(Path(session_dir).glob("RecordingMeta.xlsx"))
+    if not meta_paths:
+        return {}
+    try:
+        df = pd.read_excel(meta_paths[0], sheet_name=0)
+    except Exception as e:
+        print(f"Could not read RecordingMeta.xlsx ({e}).")
+        return {}
+    if len(df) == 0:
+        return {}
+    row = df.iloc[0]
+    out = {}
+    for key in ("Rat_ID", "Date", "Repeat", "Day", "Session", "Goal_Node"):
+        if key in df.columns and pd.notna(row[key]):
+            try:
+                out[key] = int(row[key])
+            except (TypeError, ValueError):
+                out[key] = row[key]
+    return out
+
 # reads the per-session Goal_Node scalar from RecordingMeta.xlsx inside the session folder
 # returns the goal node as an int, or None if no meta file / column is found
 def read_goal_node(session_dir):
-    meta_paths = list(Path(session_dir).glob("RecordingMeta.xlsx"))
-    if not meta_paths:
-        return None
-    df = pd.read_excel(meta_paths[0], sheet_name=0)
-    if "Goal_Node" not in df.columns:
-        return None
-    return int(df.iloc[0]["Goal_Node"])
+    return read_recording_meta(session_dir).get("Goal_Node")
 
 # creates a DynamicTable from a pandas DataFrame
-def create_trials_table(df, table_name, description, goal_node=None):
+def create_trials_table(df, table_name, description, goal_node=None, session_scalars=None):
     """
     Converts a pandas DataFrame to a DynamicTable for NWB storage.
-    
+
     Args:
         df: pandas DataFrame with trial data
         table_name: name for the table
         description: description of the table
-    
+        goal_node: session Goal_Node scalar, added as a repeated column
+        session_scalars: dict of session-level scalars (e.g. Repeat/Day/Session
+            from RecordingMeta.xlsx), each added as a repeated per-trial column
+
     Returns:
         DynamicTable with columns from the DataFrame
     """
     columns = []
-    
+
     for col in df.columns:
         vector = VectorData(
             name=col,
@@ -369,7 +396,7 @@ def create_trials_table(df, table_name, description, goal_node=None):
             data=df[col].values,
         )
         columns.append(vector)
-    
+
     # add per-trial Goal_node column (single session value repeated across rows, stored as bytes)
     if goal_node is not None:
         columns.append(VectorData(
@@ -377,7 +404,18 @@ def create_trials_table(df, table_name, description, goal_node=None):
             description="Column: Goal_node",
             data=np.array([str(goal_node).encode()] * len(df), dtype=object),
         ))
-    
+
+    # add per-trial session scalars (Repeat / Day / Session) the same way: one
+    # constant session value repeated across every trial row, stored as bytes.
+    for name, val in (session_scalars or {}).items():
+        if val is None:
+            continue
+        columns.append(VectorData(
+            name=name,
+            description=f"Session-level {name} from RecordingMeta.xlsx",
+            data=np.array([str(val).encode()] * len(df), dtype=object),
+        ))
+
     table = DynamicTable(
         name=table_name,
         description=description,
@@ -586,6 +624,10 @@ if __name__ == "__main__":
         # timezone
         timezone = tz.gettz('Europe/Amsterdam')
 
+        # Per-session scalar metadata from RecordingMeta.xlsx — authoritative
+        # source for rat id / date / repeat / day / session / goal node.
+        rec_meta = read_recording_meta(session_folders[session_i])
+
         if 'Time (seconds)' in df.columns:
             index_time_zero = find_index_time_zero(df)
             ts = df_coordinates_with_frames['Timestamp'][index_time_zero]
@@ -604,15 +646,35 @@ if __name__ == "__main__":
                 except:
                     pass
 
+            # Next, fall back to the Date (YYYYMMDD) in RecordingMeta.xlsx.
+            if session_date is None and rec_meta.get("Date"):
+                try:
+                    session_date = datetime.strptime(str(int(rec_meta["Date"])), "%Y%m%d")
+                    session_date = session_date.replace(tzinfo=timezone)
+                except Exception:
+                    pass
+
             # Fallback to current date if txt failed
             if session_date is None:
                 session_date = datetime.now()
             
             nwb_session_start_time = session_date.replace(hour=9, minute=0, second=0, tzinfo=timezone)
         
-        # nwb metadata
-        nwb_session_id = session_folders[session_i].name
-        nwb_session_description = f"Rat1 Hexmaze Session {nwb_session_id}"
+        # nwb metadata — derive rat / date / session identifiers from the real
+        # session metadata (RecordingMeta.xlsx) instead of the op-folder name and
+        # a hard-coded 'Rat1'. session_id is the session date; the description
+        # spells out rat, date and repeat/day/session so the session is unambiguous.
+        rat_id = rec_meta.get("Rat_ID", args.rat_nr)
+        date_str = (str(int(rec_meta["Date"])) if rec_meta.get("Date")
+                    else nwb_session_start_time.strftime("%Y%m%d"))
+        nwb_session_id = date_str
+        _desc = [f"Rat{rat_id} HexMaze session {date_str}"]
+        for _lbl in ("Repeat", "Day", "Session"):
+            if rec_meta.get(_lbl) is not None:
+                _desc.append(f"{_lbl} {rec_meta[_lbl]}")
+        if rec_meta.get("Goal_Node") is not None:
+            _desc.append(f"Goal_Node {rec_meta['Goal_Node']}")
+        nwb_session_description = ", ".join(_desc)
         nwb_experimenter = "Person"
         nwb_lab = "Genzel Lab"
         nwb_institution = "Donders Institute, Radboud University"
@@ -620,8 +682,8 @@ if __name__ == "__main__":
         nwb_keywords=["behavior", "ephys", "maze"]
         nwb_related_publications="N/A"
 
-        # rat/subject metadata
-        rat_nr = str(args.rat_nr)
+        # rat/subject metadata (rat number from RecordingMeta.xlsx, else --rat_nr)
+        rat_nr = str(rec_meta.get("Rat_ID", args.rat_nr))
         subject_id = rat_nr.zfill(3)
         rat_birthday = datetime(2019, 1, 1, 0, 0, 0, tzinfo = timezone)
         rat_age = parse_ISO_8601(rat_birthday, nwb_session_start_time)
@@ -651,8 +713,10 @@ if __name__ == "__main__":
         table_name ="Trials_Data"
         table_description = "Trial transition and speed data from txt file"
 
-        # goal node metadata (read from RecordingMeta.xlsx in the session folder)
-        goal_node = read_goal_node(session_folders[session_i])
+        # goal node + repeat/day/session scalars (from RecordingMeta.xlsx) to
+        # attach to the trials table as repeated per-trial columns.
+        goal_node = rec_meta.get("Goal_Node")
+        session_scalars = {k: rec_meta.get(k) for k in ("Repeat", "Day", "Session")}
         # --- END METADATA --- #
 
 
@@ -684,8 +748,12 @@ if __name__ == "__main__":
         # create dlc position object (head-centered bodypart coordinates)
         dlc_position_obj = create_dlc_position_obj(dlc_position_name, df)
 
-        # add dlc position object to behavior module
-        behavior_module.add(dlc_position_obj)
+        # add dlc position object to behavior module (skip when this session
+        # has no DLC bodypart data, i.e. create_dlc_position_obj returned None)
+        if dlc_position_obj is not None:
+            behavior_module.add(dlc_position_obj)
+        else:
+            print("No DLC bodypart (_x/_y) columns found — skipping DLC_Position.")
 
         # create metrics object
         df_filtered = df[[c for c in metrics_cols if c in df.columns]]
@@ -701,7 +769,8 @@ if __name__ == "__main__":
                 df_txt,
                 table_name,
                 table_description,
-                goal_node
+                goal_node,
+                session_scalars=session_scalars,
             )
 
         # add trials table to behavior module
@@ -734,7 +803,9 @@ if __name__ == "__main__":
         # replace. This way a failed/interrupted write (common on network
         # mounts) never truncates or corrupts a previously-good .nwb file,
         # since NWBHDF5IO("w") zeroes the target the instant it opens.
-        tmp_path = str(op_dir / (output_name + ".tmp"))
+        # Keep the '.nwb' suffix on the temp file too (insert '.tmp' before it)
+        # so pynwb/HDF5 don't warn about a non-.nwb extension.
+        tmp_path = str(op_dir / (Path(output_name).stem + ".tmp.nwb"))
         try:
             with NWBHDF5IO(tmp_path, "w") as io:
                 io.write(nwbfile)
