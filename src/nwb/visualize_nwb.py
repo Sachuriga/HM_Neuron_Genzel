@@ -585,12 +585,47 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
         pdf.savefig(fig); plt.close(fig)
 
 
+def autocorrelogram(spike_times, window_s, bin_s, max_spikes=50000):
+    """Spike-train autocorrelogram: counts of inter-spike lags in [-window,+window]
+    (zero lag excluded). Bin choices follow common multi-scale ACG practice
+    (e.g. CellExplorer, Petersen & Buzsáki): a wide ±500 ms / 5 ms and a narrow
+    ±20 ms / 0.5 ms view. Returns (counts, bin-centres in ms)."""
+    st = np.sort(np.asarray(spike_times, dtype=float))
+    if st.size > max_spikes:                     # cap for runtime on fast cells
+        st = np.sort(np.random.choice(st, max_spikes, replace=False))
+    n = st.size
+    if n < 2:
+        return None, None
+    lo = np.searchsorted(st, st - window_s, side="left")
+    hi = np.searchsorted(st, st + window_s, side="right")
+    diffs = [st[lo[i]:hi[i]] - st[i] for i in range(n)]
+    d = np.concatenate(diffs)
+    d = d[d != 0]
+    edges = np.arange(-window_s, window_s + bin_s, bin_s)
+    counts, edges = np.histogram(d, bins=edges)
+    centres = (edges[:-1] + edges[1:]) / 2 * 1000.0   # ms
+    return counts, centres
+
+
+def _plot_acg(ax, spike_times, window_s, bin_s, label):
+    counts, centres = autocorrelogram(spike_times, window_s, bin_s)
+    if counts is not None:
+        ax.bar(centres, counts, width=bin_s * 1000.0, color="#555555", align="center")
+    else:
+        ax.text(0.5, 0.5, "too few spikes", ha="center", va="center", transform=ax.transAxes)
+    ax.set_xlim(-window_s * 1000.0, window_s * 1000.0)
+    ax.set_title(f"autocorrelogram ({label})", fontsize=8)
+    ax.set_xlabel("lag (ms)", fontsize=7); ax.set_ylabel("count", fontsize=7)
+    ax.tick_params(labelsize=6)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+
+
 def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
                     pos, extent, bins, dt, sigma, speed, trials, nodes):
     with PdfPages(str(path)) as pdf:
         # ---- Page 1: summary info ----
-        fig = plt.figure(figsize=(8.27, 6.5))
-        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1])
+        fig = plt.figure(figsize=(8.27, 9.0))
+        gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1])
         ax_amp = fig.add_subplot(gs[0, :])
         if amp_t is not None and len(amp_t):
             ax_amp.scatter(amp_t, amp_v, s=2, alpha=0.3, c="#333333", edgecolors="none")
@@ -634,6 +669,11 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
         ]
         ax_txt.text(0.02, 0.98, "\n".join(lines), va="top", ha="left",
                     family="monospace", fontsize=9, transform=ax_txt.transAxes)
+
+        # autocorrelograms: wide (±500 ms, 5 ms bins) and narrow (±20 ms, 0.5 ms bins)
+        _plot_acg(fig.add_subplot(gs[2, 0]), spike_times, 0.5, 0.005, "±500 ms, 5 ms bins")
+        _plot_acg(fig.add_subplot(gs[2, 1]), spike_times, 0.02, 0.0005, "±20 ms, 0.5 ms bins")
+
         fig.tight_layout()
         pdf.savefig(fig); plt.close(fig)
 
