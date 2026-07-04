@@ -667,11 +667,16 @@ if __name__ == "__main__":
         if df_txt is not None:
             behavior_module.add(trials_table)
 
-        # save nwbfile
-        output_name = str(session_folders[session_i].stem) + ".nwb"
+        # save nwbfile to the op folder, named after the session's .rec file
+        # (maze_merged_rec); fall back to the session folder name if no .rec found
+        if paths.maze_merged_rec is not None:
+            output_name = paths.maze_merged_rec.stem + ".nwb"
+        else:
+            output_name = str(session_folders[session_i].stem) + ".nwb"
+        output_path = root + output_folder + output_name
         try:
-            with NWBHDF5IO(root + output_folder + output_name, "w") as io:
+            with NWBHDF5IO(output_path, "w") as io:
                 io.write(nwbfile)
-            print(f"Saved to {root + output_folder + output_name}!")
+            print(f"Saved to {output_path}!")
         except:
-            print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {root + output_folder + output_name} failed! Path might not exist or is inaccessible.{Style.RESET_ALL}")
+            print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {output_path} failed! Path might not exist or is inaccessible.{Style.RESET_ALL}")
