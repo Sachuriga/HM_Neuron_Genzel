@@ -23,6 +23,15 @@ from itertools import groupby
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+
+# This script lives in src/tracker/ but imports shared helpers from src/tools
+# (e.g. `from tools import mask`). Add the parent src/ dir to sys.path so those
+# imports resolve regardless of the directory this script is launched from.
+import os as _os, sys as _sys
+_SRC_DIR = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _SRC_DIR not in _sys.path:
+    _sys.path.insert(0, _SRC_DIR)
+
 from tools import mask
 import cv2
 from ultralytics import YOLO 
@@ -161,7 +170,15 @@ class Tracker:
         if not os.path.exists(out):
             os.makedirs(out, exist_ok=True)
 
-        fh = logging.FileHandler(str(logfile_name))
+        # Overwrite the log each run (mode='w'). The default FileHandler mode is
+        # 'a' (append), so re-running the tracker on a session — e.g. after an
+        # aborted first pass — piled the new run's trials on top of the old
+        # ones. Trial numbers restart at 1 every run, so downstream tools that
+        # group by "Recording Trial N" merged the colliding blocks (plus the
+        # idle seam between runs) into one giant trial, making the rat appear to
+        # visit nodes it never reached in that trial. The .txt/.csv summaries are
+        # already rewritten per run via save_to_file; this makes the log match.
+        fh = logging.FileHandler(str(logfile_name), mode='w')
         formatter = logging.Formatter('%(levelname)s : %(message)s')
         fh.setFormatter(formatter)
         self.logger.addHandler(fh)

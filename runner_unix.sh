@@ -6,7 +6,8 @@
 #
 #   Mirrors the Windows orchestrator:
 #     - parallel steps run one background worker per ip*/op* pair
-#     - steps 7 (sort), 9 (clean) and w (nwb) run sequentially afterwards
+#     - steps 7 (sort), c (continue), r (recompute), 9 (clean) and w (nwb)
+#       run sequentially afterwards
 #     - a CPU/GPU/MEM resource gate throttles new worker launches
 #
 #   Differences from the .bat (platform adaptations):
@@ -79,6 +80,11 @@ done < "$CONFIG_FILE"
 
 # Video codec for step 6 (Windows uses NVENC; Mac users: h264_videotoolbox).
 FFMPEG_VCODEC="${FFMPEG_VCODEC:-h264_nvenc}"
+
+# Seconds to skip at the start of each eye video before locating/detecting the
+# sync LED (step 2). A SYNC_START_SEC line in the config overrides this default
+# (it is exported by the config parser above); set 0 to disable.
+SYNC_START_SEC="${SYNC_START_SEC:-45}"
 
 # Provide harmless defaults for vars the steps reference, so `set -u`
 # doesn't abort when the config omits an optional tool path.
@@ -177,51 +183,73 @@ run_worker() {
     echo "[INFO] Running steps [$STEPS] for $IP"
     [[ -z "$STEPS" ]] && { echo "[WORKER] No steps to run, exiting."; return; }
 
-    # --- STEP 1 (DIO/Raw export) ---
+    # --- STEP 1 (DIO/Raw/Analog export) ---
+    # Each .rec is a separate recording session (independent timestamps), so
+    # export each one on its own. Trodes names the output after each .rec,
+    # giving per-session .DIO/.raw/.analog folders. Multiple sessions are
+    # concatenated later by the Python extractors.
     if [[ "$STEPS" == *"1"* ]]; then
-        echo "[STEP 1] Running Trodes DIO/Raw Export..."
+        echo "[STEP 1] Running Trodes DIO/Raw/Analog Export (per .rec)..."
         if [[ -n "$TRODES_EXPORT_CMD" && -x "$TRODES_EXPORT_CMD" ]]; then
+            local found_rec=0
             for f in "$IP"/*.rec; do
                 [[ -e "$f" ]] || continue
-                "$TRODES_EXPORT_CMD" -dio -raw -rec "$f"
+                found_rec=1
+                echo "    Exporting $(basename "$f")"
+                "$TRODES_EXPORT_CMD" -dio -raw -analogio -rec "$f"
             done
+            (( found_rec == 0 )) && echo "[WARNING] No .rec files found in '$IP'"
         else
             echo "[WARNING] trodesexport not found at: $TRODES_EXPORT_CMD"
         fi
     fi
 
-    # --- STEP e (LFP export) ---
+    # --- STEP e (LFP + Analog export) ---
+    # Each .rec is a separate recording session with its own timestamps, so
+    # Trodes cannot append them; export each session separately (the Python
+    # extractors concatenate them). Also export analog/AUX (headstage IMU).
     if [[ "$STEPS" == *"e"* ]]; then
-        echo "[STEP e] Running Trodes LFP Export (1000Hz, LP 500Hz)..."
-        if [[ -n "$TRODES_EXPORT_LFP" && -x "$TRODES_EXPORT_LFP" ]]; then
-            for f in "$IP"/*.rec; do
-                [[ -e "$f" ]] || continue
-                echo "    Exporting LFP from $(basename "$f")"
+        echo "[STEP e] Running Trodes LFP + Analog Export (per .rec)..."
+        local found_rec=0
+        for f in "$IP"/*.rec; do
+            [[ -e "$f" ]] || continue
+            found_rec=1
+            echo "    --- $(basename "$f") ---"
+            if [[ -n "$TRODES_EXPORT_LFP" && -x "$TRODES_EXPORT_LFP" ]]; then
+                echo "    Exporting LFP (1000Hz, LP 500Hz)..."
                 "$TRODES_EXPORT_LFP" -rec "$f" -outputrate 1000 -lfplowpass 500
-            done
-        else
-            echo "[WARNING] exportLFP not found at: $TRODES_EXPORT_LFP"
-        fi
+            else
+                echo "[WARNING] exportLFP not found at: $TRODES_EXPORT_LFP"
+            fi
+            if [[ -n "$TRODES_EXPORT_CMD" && -x "$TRODES_EXPORT_CMD" ]]; then
+                echo "    Exporting analog/AUX (headstage IMU)..."
+                "$TRODES_EXPORT_CMD" -analogio -rec "$f"
+            else
+                echo "[WARNING] trodesexport not found at: $TRODES_EXPORT_CMD"
+            fi
+        done
+        (( found_rec == 0 )) && echo "[WARNING] No .rec files found in '$IP'"
     fi
 
     # --- STEP 2 (LED sync) ---
     if [[ "$STEPS" == *"2"* ]]; then
-        echo "[STEP 2] Running Sync Script..."
-        [[ -f ./src/Video_LED_Sync_using_ICA.py ]] && \
-            "$PYTHON" -u ./src/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" -f "$FREQ"
+        echo "[STEP 2] Running Sync Script (LED detection starts after ${SYNC_START_SEC}s)..."
+        [[ -f ./src/tracker/Video_LED_Sync_using_ICA.py ]] && \
+            "$PYTHON" -u ./src/tracker/Video_LED_Sync_using_ICA.py -i "$IP" -o "$OP" \
+                -f "$FREQ" --start-sec "$SYNC_START_SEC"
     fi
 
     # --- STEP 3 (stitching) ---
     if [[ "$STEPS" == *"3"* ]]; then
         echo "[STEP 3] Running Stitching..."
-        [[ -f ./src/join_views.py ]] && "$PYTHON" -u ./src/join_views.py "$IP"
+        [[ -f ./src/tracker/join_views.py ]] && "$PYTHON" -u ./src/tracker/join_views.py "$IP"
     fi
 
     # --- STEP 4 (tracker) ---
     if [[ "$STEPS" == *"4"* ]]; then
         echo "[STEP 4] Running Tracker..."
         if [[ -f "$IP/stitched.mp4" ]]; then
-            "$PYTHON" -u ./src/TrackerYolov11.py --input_folder "$IP" \
+            "$PYTHON" -u ./src/tracker/TrackerYolov11.py --input_folder "$IP" \
                 --output_folder "$OP" --onnx_weight "$ONNX_WEIGHTS_PATH"
         fi
     fi
@@ -229,8 +257,8 @@ run_worker() {
     # --- STEP 5 (plotting) ---
     if [[ "$STEPS" == *"5"* ]]; then
         echo "[STEP 5] Running Plotting..."
-        [[ -f ./src/plot_trials.py ]] && \
-            "$PYTHON" -u ./src/plot_trials.py --input_folder "$IP" --output_folder "$OP"
+        [[ -f ./src/tracker/plot_trials.py ]] && \
+            "$PYTHON" -u ./src/tracker/plot_trials.py --input_folder "$IP" --output_folder "$OP"
     fi
 
     # --- STEP 6 (GPU compression) ---
@@ -260,11 +288,14 @@ run_worker() {
         fi
     fi
 
-    # --- STEP 8 (LFP extraction) ---
+    # --- STEP 8 (LFP + Motion/IMU extraction) ---
     if [[ "$STEPS" == *"8"* ]]; then
         echo "[STEP 8] Running LFP Extraction..."
         [[ -f ./src/sorter/export_lfp.py ]] && \
             "$PYTHON" -u ./src/sorter/export_lfp.py --input_folder "$IP" --output_folder "$OP"
+        echo "[STEP 8] Running Motion (IMU Accel) Extraction..."
+        [[ -f ./src/sorter/export_motion.py ]] && \
+            "$PYTHON" -u ./src/sorter/export_motion.py --input_folder "$IP" --output_folder "$OP"
     fi
 
     # --- STEP d (DeepLabCut export) ---
@@ -321,15 +352,17 @@ echo "[DEBUG] Target Root Directory: [$ROOT_DIR]"
 echo
 
 echo "Select steps to run (e.g., 123 for steps 1, 2, and 3):"
-echo "[1] Trodes Export (DIO/Raw)"
-echo "[e] Trodes Export LFP (per channel)"
+echo "[1] Trodes Export (DIO/Raw/Analog)"
+echo "[e] Trodes Export LFP + Analog (per channel)"
 echo "[2] Sync Script"
 echo "[3] Stitching"
 echo "[4] Tracker"
 echo "[5] Plotting"
 echo "[6] Compression"
 echo "[7] Sorting"
-echo "[8] LFP"
+echo "[c] Continue After Sorting (metrics + BombCell + Phy, no re-sort)"
+echo "[r] Recompute Metrics (after manual Phy curation)"
+echo "[8] LFP + Motion (IMU Accel)"
 echo "[d] deeplabcut"
 echo "[9] Cleaning"
 echo "[n] Node Analysis"
@@ -337,12 +370,14 @@ echo "[w] nwblfp (NWB / LFP package)"
 echo
 read -r -p "Enter steps: " MY_SELECTION
 
-# Steps 7, 9 and w run sequentially after the parallel workers.
-HAS_SORT=0; HAS_CLEAN=0; HAS_NWB=0
+# Steps 7, c, r, 9 and w run sequentially after the parallel workers.
+HAS_SORT=0; HAS_CONTINUE=0; HAS_RECOMPUTE=0; HAS_CLEAN=0; HAS_NWB=0
 PARALLEL_STEPS="$MY_SELECTION"
-if [[ "$MY_SELECTION" == *"7"* ]]; then HAS_SORT=1;  PARALLEL_STEPS="${PARALLEL_STEPS//7/}"; fi
-if [[ "$MY_SELECTION" == *"9"* ]]; then HAS_CLEAN=1; PARALLEL_STEPS="${PARALLEL_STEPS//9/}"; fi
-if [[ "$MY_SELECTION" == *"w"* ]]; then HAS_NWB=1;   PARALLEL_STEPS="${PARALLEL_STEPS//w/}"; fi
+if [[ "$MY_SELECTION" == *"7"* ]]; then HAS_SORT=1;      PARALLEL_STEPS="${PARALLEL_STEPS//7/}"; fi
+if [[ "$MY_SELECTION" == *"c"* ]]; then HAS_CONTINUE=1;  PARALLEL_STEPS="${PARALLEL_STEPS//c/}"; fi
+if [[ "$MY_SELECTION" == *"r"* ]]; then HAS_RECOMPUTE=1; PARALLEL_STEPS="${PARALLEL_STEPS//r/}"; fi
+if [[ "$MY_SELECTION" == *"9"* ]]; then HAS_CLEAN=1;     PARALLEL_STEPS="${PARALLEL_STEPS//9/}"; fi
+if [[ "$MY_SELECTION" == *"w"* ]]; then HAS_NWB=1;       PARALLEL_STEPS="${PARALLEL_STEPS//w/}"; fi
 PARALLEL_STEPS_TRIM="${PARALLEL_STEPS//[[:space:]]/}"
 
 # Scan ip* folders.
@@ -423,6 +458,58 @@ if (( HAS_SORT == 1 )); then
     echo "[MASTER] Sorting complete for all $total folder(s)."
 fi
 
+# --- Continue-after-sorting (sequential) — post-sort steps without re-sorting
+#     (rebuilds analyzer, computes metrics + BombCell labels, exports to Phy). ---
+if (( HAS_CONTINUE == 1 )); then
+    echo
+    echo "========================================================"
+    echo "[MASTER] Running CONTINUE-AFTER-SORTING sequentially..."
+    echo "========================================================"
+    total=${#sort_ops[@]}
+    for i in "${!sort_ops[@]}"; do
+        idx=$((i + 1))
+        cur_op="${sort_ops[$i]}"
+        echo
+        echo "[CONT $idx/$total] Continuing: $cur_op"
+        if [[ -f ./src/sorter/continue_sorting.py ]]; then
+            if "$PYTHON" -u ./src/sorter/continue_sorting.py \
+                    --output_folder "$cur_op" --config "$CONFIG_FILE"; then
+                echo "[CONT $idx/$total] Done."
+            else
+                echo "[CONT $idx/$total] Python exited with error. Continuing..."
+            fi
+        fi
+    done
+    echo
+    echo "[MASTER] Continue-after-sorting complete for all $total folder(s)."
+fi
+
+# --- Recompute-metrics (sequential) — recompute quality/waveform metrics on the
+#     manually-curated Phy folders (run this AFTER curating in Phy). ---
+if (( HAS_RECOMPUTE == 1 )); then
+    echo
+    echo "========================================================"
+    echo "[MASTER] Running RECOMPUTE-METRICS sequentially (curated Phy)..."
+    echo "========================================================"
+    total=${#sort_ops[@]}
+    for i in "${!sort_ops[@]}"; do
+        idx=$((i + 1))
+        cur_op="${sort_ops[$i]}"
+        echo
+        echo "[RECOMP $idx/$total] Recomputing: $cur_op"
+        if [[ -f ./src/sorter/recompute_metrics.py ]]; then
+            if "$PYTHON" -u ./src/sorter/recompute_metrics.py \
+                    --output_folder "$cur_op" --config "$CONFIG_FILE"; then
+                echo "[RECOMP $idx/$total] Done."
+            else
+                echo "[RECOMP $idx/$total] Python exited with error. Continuing..."
+            fi
+        fi
+    done
+    echo
+    echo "[MASTER] Recompute-metrics complete for all $total folder(s)."
+fi
+
 # --- Cleaning (sequential, after sorting) ---
 if (( HAS_CLEAN == 1 )); then
     echo
@@ -458,5 +545,5 @@ fi
 
 echo
 echo "========================================================"
-echo "[MASTER] Done. Parallel jobs: $count | Sorting: $HAS_SORT | NWB: $HAS_NWB"
+echo "[MASTER] Done. Parallel jobs: $count | Sorting: $HAS_SORT | Continue: $HAS_CONTINUE | Recompute: $HAS_RECOMPUTE | NWB: $HAS_NWB"
 echo "========================================================"

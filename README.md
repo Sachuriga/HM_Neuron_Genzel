@@ -9,7 +9,7 @@
 
 A batch-processing pipeline for neuroscience experiments — integrates video-based animal tracking (YOLOv11), behavioral node analysis, neural spike sorting (Mountainsort4), LFP extraction, and LED-based synchronization into a single orchestrated workflow.
 
-> **Attribution** — `src/Video_LED_Sync_using_ICA.py` (Step 2), `src/join_views.py` (Step 3), and `src/TrackerYolov11.py` (Step 4) are based on and modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a summary of changes to the tracker.
+> **Attribution** — `src/tracker/Video_LED_Sync_using_ICA.py` (Step 2), `src/tracker/join_views.py` (Step 3), and `src/tracker/TrackerYolov11.py` (Step 4) are based on and modified from [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT). See [Tracker — Modifications from Original](#tracker--modifications-from-original) for a summary of changes to the tracker.
 
 ---
 
@@ -61,10 +61,11 @@ The pipeline takes raw Trodes recordings (`.rec`) and multi-camera video, then r
 ```
 HM_Tracker_2025/
 ├── src/
-│   ├── TrackerYolov11.py            # Main YOLOv11 tracker
-│   ├── Video_LED_Sync_using_ICA.py  # LED sync via ICA
-│   ├── join_views.py                # Multi-camera stitching
-│   ├── plot_trials.py               # Trial-level plotting
+│   ├── tracker/                     # Video pipeline (Steps 2–5)
+│   │   ├── Video_LED_Sync_using_ICA.py  # Step 2: LED sync via ICA
+│   │   ├── join_views.py                # Step 3: Multi-camera stitching
+│   │   ├── TrackerYolov11.py            # Step 4: Main YOLOv11 tracker
+│   │   └── plot_trials.py               # Step 5: Trial-level plotting
 │   ├── sorter/
 │   │   ├── sorting.py               # Mountainsort4 spike sorting
 │   │   └── export_lfp.py            # LFP extraction & export
@@ -236,10 +237,10 @@ These files are read by Step 8 (LFP extraction).
 ### Step 2 — LED Sync (ICA)
 
 **Key:** `2`  
-**Script:** `src/Video_LED_Sync_using_ICA.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
+**Script:** `src/tracker/Video_LED_Sync_using_ICA.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
 ```
-python Video_LED_Sync_using_ICA.py -i <ip> -o <op> -f 30000
+python src/tracker/Video_LED_Sync_using_ICA.py -i <ip> -o <op> -f 30000
 ```
 
 Aligns the video timeline to the neural recording timeline using an LED synchronization light visible in the camera frame:
@@ -256,10 +257,10 @@ Aligns the video timeline to the neural recording timeline using an LED synchron
 ### Step 3 — Multi-Camera Stitching
 
 **Key:** `3`  
-**Script:** `src/join_views.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
+**Script:** `src/tracker/join_views.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
 ```
-python join_views.py <ip>
+python src/tracker/join_views.py <ip>
 ```
 
 Stitches multiple individual camera video files (named `eye??_*.mp4`) into a single combined output file:
@@ -275,11 +276,11 @@ Stitches multiple individual camera video files (named `eye??_*.mp4`) into a sin
 ### Step 4 — YOLOv11 Tracker
 
 **Key:** `4`  
-**Script:** `src/TrackerYolov11.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
+**Script:** `src/tracker/TrackerYolov11.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Requires:** `stitched.mp4` in the input folder  
 **Command:**
 ```
-python TrackerYolov11.py --input_folder <ip> --output_folder <op> --onnx_weight <weights.pt>
+python src/tracker/TrackerYolov11.py --input_folder <ip> --output_folder <op> --onnx_weight <weights.pt>
 ```
 
 Runs the full tracking pipeline on the stitched video. See [Tracker — How It Works](#tracker--how-it-works) for a complete description.
@@ -298,10 +299,10 @@ Runs the full tracking pipeline on the stitched video. See [Tracker — How It W
 ### Step 5 — Trial Plotting
 
 **Key:** `5`  
-**Script:** `src/plot_trials.py`  
+**Script:** `src/tracker/plot_trials.py`  
 **Command:**
 ```
-python plot_trials.py --input_folder <ip> --output_folder <op>
+python src/tracker/plot_trials.py --input_folder <ip> --output_folder <op>
 ```
 
 Generates a PDF report with trial-level visualizations from the tracker output:
@@ -517,7 +518,7 @@ This step is not parallelized: it runs once at the master level after sorting an
 
 ## Tracker — How It Works
 
-`src/TrackerYolov11.py` is based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT) and is built around a per-frame detect → classify → update-state loop.
+`src/tracker/TrackerYolov11.py` is based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT) and is built around a per-frame detect → classify → update-state loop.
 
 ### Model
 

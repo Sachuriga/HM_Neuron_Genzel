@@ -426,8 +426,8 @@ if %errorlevel% equ 0 (
 echo %STEPS_TO_RUN% | findstr "2" >nul
 if %errorlevel% equ 0 (
     echo [STEP 2] Running Sync Script ^(LED detection starts after %SYNC_START_SEC%s^)...
-    if exist ".\src\Video_LED_Sync_using_ICA.py" (
-        python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ% --start-sec %SYNC_START_SEC%
+    if exist ".\src\tracker\Video_LED_Sync_using_ICA.py" (
+        python -u ./src/tracker/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ% --start-sec %SYNC_START_SEC%
     )
 )
 
@@ -435,8 +435,8 @@ if %errorlevel% equ 0 (
 echo %STEPS_TO_RUN% | findstr "3" >nul
 if %errorlevel% equ 0 (
     echo [STEP 3] Running Stitching...
-    if exist ".\src\join_views.py" (
-        python -u ./src/join_views.py "%IP%"
+    if exist ".\src\tracker\join_views.py" (
+        python -u ./src/tracker/join_views.py "%IP%"
     )
 )
 
@@ -445,7 +445,7 @@ echo %STEPS_TO_RUN% | findstr "4" >nul
 if %errorlevel% equ 0 (
     echo [STEP 4] Running Tracker...
     if exist "%IP%\stitched.mp4" (
-        python -u ./src/TrackerYolov11.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+        python -u ./src/tracker/TrackerYolov11.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
     )
 )
 
@@ -453,8 +453,8 @@ if %errorlevel% equ 0 (
 echo %STEPS_TO_RUN% | findstr "5" >nul
 if %errorlevel% equ 0 (
     echo [STEP 5] Running Plotting...
-    if exist ".\src\plot_trials.py" (
-        python -u ./src/plot_trials.py --input_folder "%IP%" --output_folder "%OP%"
+    if exist ".\src\tracker\plot_trials.py" (
+        python -u ./src/tracker/plot_trials.py --input_folder "%IP%" --output_folder "%OP%"
     )
 )
 

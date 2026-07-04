@@ -82,6 +82,12 @@ class SessionPaths:
             f" --------------------------------- "
         ])
 
+# skips dot-files: hidden files and macOS AppleDouble sidecars (._*), which
+# appear alongside real data on network/exFAT shares. Real data files never
+# start with a dot, so these are always junk and must not be globbed in.
+def _is_hidden(p: Path) -> bool:
+    return p.name.startswith(".")
+
 # finds the paths to files in the working directory for each .ext type
 # sorts the loaded files alphabetically
 # then adds them per .ext type making sure it is recognized as unique
@@ -91,25 +97,30 @@ def find_paths(work_dir: Path) -> SessionPaths:
 
     log_paths: dict[str, Path] = {}
     for p in sorted(work_dir.glob("*.log")):
+        if _is_hidden(p): continue
         add_unique(log_paths, p)
 
     txt_paths: dict[str, Path] = {}
     for p in sorted(work_dir.glob("*.txt")):
+        if _is_hidden(p): continue
         add_unique(txt_paths, p)
 
     csv_paths: dict[str, Path] = {}
     for p in sorted(work_dir.glob("*.csv")):
+        if _is_hidden(p): continue
         add_unique(csv_paths, p)
 
-    folder_paths = sorted([p for p in work_dir.iterdir() if p.is_dir()])
+    folder_paths = sorted([p for p in work_dir.iterdir() if p.is_dir() and not _is_hidden(p)])
 
     numpy_paths: dict[str, Path] = {}
     for folder in folder_paths:
         for p in sorted(folder.glob("*.npy")):
+            if _is_hidden(p): continue
             add_unique(numpy_paths, p)
 
     maze_merged_rec = None
     for rec_path in work_dir.glob("*.rec"):
+        if _is_hidden(rec_path): continue
         if "maze_merged" in rec_path.name.lower():
             maze_merged_rec = rec_path
             break

@@ -1,9 +1,0 @@
-numpy
-pandas
-openpyxl
-opencv-python
-tqdm
-ultralytics>=8.3.0
-sahi
-torch
-torchvision

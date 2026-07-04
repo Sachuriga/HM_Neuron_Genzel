@@ -140,31 +140,31 @@ if exist "%TRODES_EXPORT_CMD%" (
 REM 2. SYNC CHECK
 echo.
 echo [STEP 2] Running Sync Script...
-if exist ".\src\Video_LED_Sync_using_ICA.py" (
-    python -u ./src/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
+if exist ".\src\tracker\Video_LED_Sync_using_ICA.py" (
+    python -u ./src/tracker/Video_LED_Sync_using_ICA.py -i "%IP%" -o "%OP%" -f %FREQ%
 )
 
 REM 3. STITCH CHECK
 echo.
 echo [STEP 3] Running Stitching...
-if exist ".\src\join_views.py" (
-    python -u ./src/join_views.py "%IP%"
+if exist ".\src\tracker\join_views.py" (
+    python -u ./src/tracker/join_views.py "%IP%"
 )
 
 REM 4. TRACKER CHECK
 echo.
 echo [STEP 4] Running Tracker...
 if exist "%IP%\stitched.mp4" (
-    if exist ".\src\TrackerYolov.py" (
-        python -u ./src/TrackerYolov.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
+    if exist ".\src\tracker\TrackerYolov11.py" (
+        python -u ./src/tracker/TrackerYolov11.py --input_folder "%IP%" --output_folder "%OP%" --onnx_weight "%ONNX_WEIGHTS_PATH%"
     )
 )
 
 REM 5. PLOT CHECK
 echo.
 echo [STEP 5] Running Plotting...
-if exist "plot_trials.py" (
-    python -u ./src/plot_trials.py -o "%OP%"
+if exist ".\src\tracker\plot_trials.py" (
+    python -u ./src/tracker/plot_trials.py -o "%OP%"
 )
 
 echo.

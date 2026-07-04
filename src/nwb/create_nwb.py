@@ -35,7 +35,17 @@ import sys
 import os
 import argparse
 from pathlib import Path
-from colorama import Fore, Style, init
+try:
+    from colorama import Fore, Style, init
+except ModuleNotFoundError:
+    # colorama is purely cosmetic (colored terminal output). Fall back to
+    # no-op shims so the NWB step runs fine without it installed.
+    class _NoColor:
+        def __getattr__(self, _):
+            return ""
+    Fore = Style = _NoColor()
+    def init(*args, **kwargs):
+        pass
 import pickle
 
 import numpy as np
@@ -51,7 +61,17 @@ from pynwb.file import Subject
 from hdmf.common import VectorData, DynamicTable
 from hdmf.container import Container
 
-# imported from self coded tools
+# imported from self coded tools.
+# The shared tool modules live in <repo>/src/tools. This script is launched with
+# the cwd set to its own folder (src/nwb), so make the import work regardless of
+# cwd: add src/ to sys.path so `import tools.*` resolves, and src/tools/ so the
+# bare imports inside those modules (e.g. `from pathnames import ...`) resolve.
+_SRC_DIR = Path(__file__).resolve().parent.parent          # <repo>/src
+_TOOLS_DIR = _SRC_DIR / "tools"                            # <repo>/src/tools
+for _p in (str(_SRC_DIR), str(_TOOLS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from tools.pathnames import find_paths, parse_folder_name, find_session_folders
 from tools.process_log import process_log
 from tools.process_txt import process_txt
@@ -59,6 +79,22 @@ import tools.process_dataframe as pdf
 
 # colorama
 init()
+
+# resolves a lookup key against a {normalized_key: Path} dict.
+# First tries an exact (case-insensitive) match on the normalized key; if that
+# misses, falls back to a suffix/substring match so e.g. a file whose normalized
+# key ends with "coordinates_full_with_frames" is still found regardless of any
+# extra prefix tokens (behaves like globbing "*Coordinates_Full_with_frames").
+def resolve_path(key, paths):
+    k = key.lower()
+    if k in paths:
+        return paths[k]
+    # prefer an exact suffix match (key is the tail of the normalized key),
+    # then fall back to a plain substring match; also check the real filename.
+    for cand_key, path in paths.items():
+        if cand_key.endswith(k) or k in cand_key or k in path.stem.lower():
+            return path
+    return None
 
 # safely read and load files from found paths based on a key (for more information read pathnames.py doc)
 # every .ext is loaded using the corresponding function
@@ -79,9 +115,13 @@ def safe_read(key, paths, ext):
     else:
         raise Exception("Invalid .ext!")
     try:
-        # pathname is not case sensitive
-        result = function(paths.get(key.lower()))
-        if print_loading: print(f"Loaded {key} [Shape: {result.shape}]")
+        # pathname is not case sensitive; resolve exact-or-suffix match
+        path = resolve_path(key, paths)
+        if path is None:
+            if print_loading: print(f"{key}.{ext} not found.")
+            return None
+        result = function(path)
+        if print_loading: print(f"Loaded {key} from {path.name} [Shape: {result.shape}]")
         return result
     except:
         if print_loading: print(f"{key}.{ext} not loaded.")
@@ -476,6 +516,19 @@ if __name__ == "__main__":
         session_folder, note = parse_folder_name(Path(args.session_folder).name)
         notes = [note]
         session_folders = [Path(root + input_folder + session_folder)]
+    else:
+        # Only package op* output folders (op6, op12, ...) — that is where the
+        # per-session NWB data (coordinates, trials, LFP) lives. This skips ip*,
+        # yolov_models, and other non-session folders so we don't scan the whole
+        # data root. An explicit --session_folder (above) bypasses this filter.
+        def _is_op_folder(name):
+            n = name.lower()
+            return n.startswith("op") and len(n) > 2 and n[2].isdigit()
+        kept = [(f, nt) for f, nt in zip(session_folders, notes) if _is_op_folder(f.name)]
+        session_folders = [f for f, _ in kept]
+        notes = [nt for _, nt in kept]
+        print(f"Filtered to {len(session_folders)} op* folder(s): "
+              f"{[f.name for f in session_folders]}")
 
     if args.sf:
         print("Found session folders: \n")
@@ -517,6 +570,14 @@ if __name__ == "__main__":
         else:
             df = df_coordinates_with_frames
 
+        # Skip sessions without positional data — Coordinates_Full_with_frames.csv
+        # is required to build the NWB behavior module. Without it df is None and
+        # everything downstream (df.columns, position objects) would crash.
+        if df is None:
+            print(f"{Fore.RED}[SKIP] Session '{session_folders[session_i].name}': "
+                  f"no Coordinates_Full_with_frames.csv found; skipping.{Style.RESET_ALL}")
+            continue
+
 
         # --- METADATA --- # Can change this
 
@@ -524,7 +585,6 @@ if __name__ == "__main__":
         # start time of session
         # timezone
         timezone = tz.gettz('Europe/Amsterdam')
-        no_timestamp_available = False
 
         if 'Time (seconds)' in df.columns:
             index_time_zero = find_index_time_zero(df)
@@ -536,7 +596,6 @@ if __name__ == "__main__":
         else:
             # No timestamps available, try to get session date from txt file
             session_date = None
-            no_timestamp_available = True
             session_folder_head = str(session_folders[session_i].name)
             if session_folder_head.isdigit() and len(session_folder_head) == 8: # if folder is date
                 try:
@@ -561,24 +620,6 @@ if __name__ == "__main__":
         nwb_keywords=["behavior", "ephys", "maze"]
         nwb_related_publications="N/A"
 
-        # dropbox metadata (might not work if URL not working)
-        # get the share URL from dropbox and change dl=0 suffix to dl=1 to allow direct downloading of the file
-        # also needs the key in the URL, but this should be included if you share it while having access
-        dropbox_URL = "https://www.dropbox.com/scl/fi/0rkk028xb77zxn182nlnr/Hexmaze_Baseline_Ephys-1_R1-2_alldata_work.xlsx?rlkey=n1egmdsb86r48yw8tq7w07ih2&st=zpbtjn3u&dl=1"
-        dropbox_df = pd.read_excel(dropbox_URL, engine="openpyxl")
-        # match session date to dropbox metadata to extract more information about the session
-        session_date_str = f"{str(nwb_session_start_time.day).zfill(2)}.{str(nwb_session_start_time.month).zfill(2)}.{nwb_session_start_time.year}"
-        current_session_mask = dropbox_df['Date'] == session_date_str
-        
-        if current_session_mask.any():
-            nwb_experimenter = dropbox_df[current_session_mask]['Experimenter'].values[0]
-            # add notes to notes list, takes notes from dropbox comment column and adds it to the notes for the session
-            notes[session_i] = notes[session_i] + "\nTrial Notes:\n"+ "\n".join(f"Trial {x_i+1}: {x.strip()}" 
-                                                            for x_i, x in enumerate(dropbox_df[current_session_mask]['comment'])
-                                                             if pd.notna(x))
-            if no_timestamp_available: # take time from dropbox if no timestamps available in data
-                nwb_session_start_time = nwb_session_start_time.replace(hour=dropbox_df[current_session_mask]['Time'].values[0].hour,
-                                                                        minute=dropbox_df[current_session_mask]['Time'].values[0].minute)
         # rat/subject metadata
         rat_nr = str(args.rat_nr)
         subject_id = rat_nr.zfill(3)
@@ -667,16 +708,44 @@ if __name__ == "__main__":
         if df_txt is not None:
             behavior_module.add(trials_table)
 
-        # save nwbfile to the op folder, named after the session's .rec file
-        # (maze_merged_rec); fall back to the session folder name if no .rec found
-        if paths.maze_merged_rec is not None:
-            output_name = paths.maze_merged_rec.stem + ".nwb"
+        # save nwbfile INTO the op folder itself, named <rat>_<session>.nwb
+        # (e.g. Rat6_20260629.nwb). Both the folder and the rat/session tokens
+        # are taken from the session's own coordinate file, whose name is
+        # "<date>_<Rat#>_Coordinates_Full...": its parent IS the op folder, and
+        # its stem prefix gives the date + rat. Fall back to the discovered
+        # session folder / its name if the coordinate file can't be located.
+        coord_path = (resolve_path('Coordinates_Full_with_frames', paths.csv_paths)
+                      or resolve_path('Coordinates_Full', paths.csv_paths))
+        if coord_path is not None:
+            op_dir = coord_path.parent
+            stem_parts = coord_path.stem.split("_")
         else:
-            output_name = str(session_folders[session_i].stem) + ".nwb"
-        output_path = root + output_folder + output_name
+            op_dir = Path(root + output_folder) / session_folders[session_i].name
+            stem_parts = session_folders[session_i].name.split("_")
+
+        if (len(stem_parts) >= 2 and stem_parts[0].isdigit()
+                and stem_parts[1].lower().startswith("rat")):
+            output_name = f"{stem_parts[1]}_{stem_parts[0]}.nwb"   # Rat6_20260629.nwb
+        else:
+            output_name = f"{session_folders[session_i].name}.nwb"
+
+        output_path = str(op_dir / output_name)
+        # Write to a temp file *next to* the target first, then atomically
+        # replace. This way a failed/interrupted write (common on network
+        # mounts) never truncates or corrupts a previously-good .nwb file,
+        # since NWBHDF5IO("w") zeroes the target the instant it opens.
+        tmp_path = str(op_dir / (output_name + ".tmp"))
         try:
-            with NWBHDF5IO(output_path, "w") as io:
+            with NWBHDF5IO(tmp_path, "w") as io:
                 io.write(nwbfile)
+            os.replace(tmp_path, output_path)
             print(f"Saved to {output_path}!")
-        except:
-            print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {output_path} failed! Path might not exist or is inaccessible.{Style.RESET_ALL}")
+        except Exception as e:
+            # Clean up the partial temp file so it doesn't linger.
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {output_path} failed: "
+                  f"{type(e).__name__}: {e}{Style.RESET_ALL}")

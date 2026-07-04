@@ -25,3 +25,6 @@ networkx             # plot_trials + node analysis (hex maze graph)
 openpyxl             # node analysis + RecordingMeta.xlsx reading
 tqdm                 # progress bars (CPU LFP/motion export)
 spikeinterface      # CPU spike sorting (no CUDA)
+pynwb                # NWB packaging (create_nwb.py)
+colorama             # colored terminal output (create_nwb.py; optional)
+python-dateutil      # create_nwb.py timezone/date parsing
