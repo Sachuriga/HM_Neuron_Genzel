@@ -66,11 +66,12 @@ MENU = [
     ("n", "Node Analysis"),
     ("w", "nwblfp (NWB / LFP package)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
+    ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
 ]
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v"]
 
 
 # ------------------------------------------------------------
@@ -461,6 +462,9 @@ def main():
 
     if has["u"]:
         _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", ops, config)
+
+    if has["v"]:
+        _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", ops, config)
 
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
     print("\n" + "=" * 56)

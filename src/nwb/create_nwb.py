@@ -631,9 +631,13 @@ if __name__ == "__main__":
         if 'Time (seconds)' in df.columns:
             index_time_zero = find_index_time_zero(df)
             ts = df_coordinates_with_frames['Timestamp'][index_time_zero]
-            from datetime import timedelta
-            nwb_session_start_time = datetime(1970, 1, 1) + timedelta(seconds=float(ts))
-            nwb_session_start_time = nwb_session_start_time.replace(tzinfo=timezone)
+            # ts is a unix timestamp (seconds since 1970-01-01 UTC). Convert the
+            # instant to a tz-aware Amsterdam datetime with fromtimestamp so that
+            # session_start_time.timestamp() round-trips back to ts. (The old code
+            # built a naive-UTC wallclock and .replace(tzinfo=...)-stamped Amsterdam
+            # onto it WITHOUT converting, leaving session_start_time off by the tz
+            # offset — its .timestamp() was ~2 h behind the true recording time.)
+            nwb_session_start_time = datetime.fromtimestamp(float(ts), tz=timezone)
 
         else:
             # No timestamps available, try to get session date from txt file
