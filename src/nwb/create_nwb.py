@@ -204,12 +204,26 @@ def add_subject():
 # creates timeseries
 # uses global variables lfp_*
 def create_timeseries():
+    data = np.asarray(lfp_data)
+    ts = np.asarray(lfp_timestamps).reshape(-1)
+    n = ts.shape[0]
+    # pynwb needs time on axis 0. If a 2D array has time on axis 1, transpose.
+    if data.ndim == 2 and data.shape[0] != n and data.shape[1] == n:
+        data = data.T
+    # If the lengths still differ (e.g. the LFP and its timestamps were built from
+    # a different number of concatenated .rec sessions), truncate both to the
+    # common length so the TimeSeries is valid instead of crashing.
+    if data.shape[0] != n:
+        m = min(data.shape[0], n)
+        print(f"{Fore.YELLOW}[LFP] data ({data.shape[0]}) and timestamps ({n}) "
+              f"length mismatch; truncating both to {m}.{Style.RESET_ALL}")
+        data, ts = data[:m], ts[:m]
     return TimeSeries(
         name=lfp_name,
         description=lfp_description,
-        data=lfp_data,
+        data=data,
         unit=lfp_unit,
-        timestamps=lfp_timestamps,
+        timestamps=ts,
     )
 
 # add timeseries to nwbfile
