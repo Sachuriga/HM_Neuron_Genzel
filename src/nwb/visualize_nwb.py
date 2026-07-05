@@ -47,15 +47,15 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
-from scipy.optimize import curve_fit
 
 from pynwb import NWBHDF5IO
 
-# --- cell-type thresholds ---
-# Rule (firing-rate first): FR > 10 Hz => interneuron; else pyramidal only if the
-# spike is wide (peak half-width > 0.425 ms), otherwise interneuron.
-PHW_THRESH_S = 0.425e-3   # 0.425 ms peak half-width
-RATE_THRESH_HZ = 10.0     # firing rate
+# Shared metric functions + thresholds (same code that step u persists into the
+# NWB), so displayed and stored values are identical. See spike_metrics.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spike_metrics import (  # noqa: E402
+    waveform_metrics, autocorrelogram, acg_tau_rise, classify_cell_type,
+    TROUGH_PEAK_THRESH_S, ACG_TAU_RISE_THRESH_MS, RATE_THRESH_HZ)
 
 # --- spatial frame (plot_trials.py convention) ---
 # Pixel -> metre scaling and the fixed maze frame, copied from plot_trials.py so
@@ -381,44 +381,6 @@ def load_amplitudes(phy, cluster_id):
 
 
 # ------------------------------------------------------------
-#                 waveform metrics (recomputed from template)
-# ------------------------------------------------------------
-def waveform_metrics(wf, fs):
-    """Recompute waveform metrics from a mean template (n_samples, n_channels) on
-    the peak channel (largest peak-to-peak). Durations in SECONDS. The metrics
-    stored in the NWB were unreliable (NaNs / wrong half-widths), so step v
-    recomputes them here. Returns {} if the template is unusable."""
-    w = np.asarray(wf, dtype=float)
-    if w.ndim == 1:
-        w = w[:, None]
-    if w.size == 0 or not np.isfinite(w).all():
-        return {}
-    ch = int(np.argmax(w.ptp(axis=0)))
-    s = w[:, ch]
-    n = s.size
-    if n < 4 or s.ptp() == 0:
-        return {}
-    dt = 1.0 / fs
-    trough_i = int(np.argmin(s)); trough_v = float(s[trough_i])
-    peak_i = trough_i + int(np.argmax(s[trough_i:])) if trough_i < n - 1 else trough_i
-    peak_v = float(s[peak_i])
-
-    def _half_width(center_i, level, below):
-        cond = (s <= level) if below else (s >= level)
-        l = r = center_i
-        while l - 1 >= 0 and cond[l - 1]:
-            l -= 1
-        while r + 1 < n and cond[r + 1]:
-            r += 1
-        return (r - l) * dt
-
-    return {"peak_channel": ch,
-            "peak_to_trough_s": (peak_i - trough_i) * dt,
-            "trough_half_width_s": _half_width(trough_i, trough_v / 2.0, True) if trough_v < 0 else np.nan,
-            "peak_half_width_s": _half_width(peak_i, peak_v / 2.0, False) if peak_v > 0 else np.nan}
-
-
-# ------------------------------------------------------------
 #                 rate maps
 # ------------------------------------------------------------
 def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
@@ -583,38 +545,50 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
         print(f"  spatial: {bin_cm:g} cm bins ({bins[0]}x{bins[1]}), smooth {sigma:g} bin, "
               f"speed gate {speed:g} m/s")
 
-        nspk = udf["num_spikes"].astype(float) if "num_spikes" in udf else \
-            pd.Series([len(nwb.units["spike_times"][i]) for i in range(len(udf))], index=udf.index)
-        udf["firing_rate_hz"] = nspk / duration
-
-        # Recompute waveform metrics from the mean template (the stored ones were
-        # unreliable). Sampling rate from phy params, else 30 kHz.
-        fs = 30000.0
-        if phy is not None:
-            try:
-                fs = float(_read_phy_params(phy)["sample_rate"])
-            except Exception:
-                pass
-        phw = pd.Series(np.nan, index=udf.index)   # peak half-width (s), recomputed
-        p2t = pd.Series(np.nan, index=udf.index)   # peak-to-trough (s), recomputed
-        thw = pd.Series(np.nan, index=udf.index)   # trough half-width (s), recomputed
-        if has_wf:
-            for i, (uid, r) in enumerate(udf.iterrows()):
-                mm = waveform_metrics(r["waveform_mean"], fs)
-                phw.iloc[i] = mm.get("peak_half_width_s", np.nan)
-                p2t.iloc[i] = mm.get("peak_to_trough_s", np.nan)
-                thw.iloc[i] = mm.get("trough_half_width_s", np.nan)
-        elif "peak_half_width" in udf:
-            phw = udf["peak_half_width"].astype(float)
-        udf["peak_half_width"] = phw               # override with recomputed values
-        udf["peak_to_trough_recomp"] = p2t
-        udf["trough_half_width_recomp"] = thw
-        # pyramidal only if slow AND wide-spiked (peak half-width); else interneuron
-        is_pyr = (udf["firing_rate_hz"] <= RATE_THRESH_HZ) & (phw > PHW_THRESH_S)
-        udf["cell_type"] = np.where(is_pyr, "pyramidal", "interneuron")
-
         ql = udf["quality_label"].astype(str) if "quality_label" in udf else \
             pd.Series("good", index=udf.index)
+
+        # Prefer the metrics + cell_type that step u persisted into the NWB (same
+        # spike_metrics code), so displayed == stored. Recompute only for older
+        # NWBs written before step u added them.
+        stored = all(c in udf.columns for c in
+                     ("cell_type", "acg_tau_rise_ms", "trough_to_peak_s", "peak_half_width_s"))
+        if "firing_rate_hz" not in udf.columns:
+            nspk = udf["num_spikes"].astype(float) if "num_spikes" in udf else \
+                pd.Series([len(nwb.units["spike_times"][i]) for i in range(len(udf))], index=udf.index)
+            udf["firing_rate_hz"] = nspk / duration
+        if stored:
+            print("  using unit metrics + cell_type stored by step u.")
+        else:
+            print("  recomputing unit metrics (NWB predates step-u metrics)...")
+            fs = 30000.0
+            if phy is not None:
+                try:
+                    fs = float(_read_phy_params(phy)["sample_rate"])
+                except Exception:
+                    pass
+            phw = pd.Series(np.nan, index=udf.index)
+            p2t = pd.Series(np.nan, index=udf.index)
+            thw = pd.Series(np.nan, index=udf.index)
+            tau = pd.Series(np.nan, index=udf.index)
+            for i, (uid, r) in enumerate(udf.iterrows()):
+                if has_wf:
+                    mm = waveform_metrics(r["waveform_mean"], fs)
+                    phw.iloc[i] = mm.get("peak_half_width_s", np.nan)
+                    p2t.iloc[i] = mm.get("peak_to_trough_s", np.nan)
+                    thw.iloc[i] = mm.get("trough_half_width_s", np.nan)
+                if ql.iloc[i] == "good":
+                    tau.iloc[i] = acg_tau_rise(np.asarray(r["spike_times"], dtype=float))
+            udf["peak_half_width_s"] = phw
+            udf["trough_to_peak_s"] = p2t
+            udf["trough_half_width_s"] = thw
+            udf["acg_tau_rise_ms"] = tau
+            fr = udf["firing_rate_hz"]
+            narrow_int = p2t <= TROUGH_PEAK_THRESH_S
+            wide_int = (p2t > TROUGH_PEAK_THRESH_S) & (tau > ACG_TAU_RISE_THRESH_MS)
+            udf["cell_type"] = np.where((fr > RATE_THRESH_HZ) | narrow_int | wide_int,
+                                        "interneuron", "pyramidal")
+
         good = udf[ql == "good"]
         print(f"  {len(udf)} units | good={len(good)} | "
               f"pyr={int((good['cell_type']=='pyramidal').sum())} "
@@ -650,20 +624,26 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
         "phy_cluster_id", "sorting_group", "quality_label", "auto_quality_label",
         "spike_times", "waveform_mean", "cell_type", "electrodes")]
     with PdfPages(str(path)) as pdf:
-        # Page 1: scatter peak half-width vs firing rate
-        fig, ax = plt.subplots(figsize=(8.27, 5.5))
-        for ct, col in (("pyramidal", "#2166ac"), ("interneuron", "#b2182b")):
+        # Page 1: CellExplorer classification plane (trough-to-peak vs acg_tau_rise)
+        # and the firing-rate gate (trough-to-peak vs firing rate).
+        cols = {"pyramidal": "#2166ac", "interneuron": "#b2182b"}
+        fig, (axa, axb) = plt.subplots(1, 2, figsize=(9.5, 4.6))
+        for ct, col in cols.items():
             sub = good[good["cell_type"] == ct]
-            if "peak_half_width" in sub:
-                ax.scatter(sub["peak_half_width"] * 1e3, sub["firing_rate_hz"],
-                           s=22, alpha=0.8, c=col, label=f"{ct} (n={len(sub)})")
-        ax.axvline(PHW_THRESH_S * 1e3, ls="--", c="grey", lw=1)
-        ax.axhline(RATE_THRESH_HZ, ls="--", c="grey", lw=1)
-        ax.set_xlabel("peak half-width (ms)")
-        ax.set_ylabel("firing rate (Hz)")
-        ax.set_yscale("log")
-        ax.set_title(f"{nwb.session_description}\nGood units: peak-to-trough vs firing rate")
-        ax.legend(fontsize=8)
+            axa.scatter(sub["trough_to_peak_s"] * 1e3, sub.get("acg_tau_rise_ms"),
+                        s=22, alpha=0.8, c=col, label=f"{ct} (n={len(sub)})")
+            axb.scatter(sub["trough_to_peak_s"] * 1e3, sub["firing_rate_hz"],
+                        s=22, alpha=0.8, c=col)
+        axa.axvline(TROUGH_PEAK_THRESH_S * 1e3, ls="--", c="grey", lw=1)
+        axa.axhline(ACG_TAU_RISE_THRESH_MS, ls="--", c="grey", lw=1)
+        axa.set_xlabel("trough-to-peak (ms)"); axa.set_ylabel("ACG tau_rise (ms)")
+        axa.set_title("CellExplorer classification"); axa.legend(fontsize=7)
+        axb.axvline(TROUGH_PEAK_THRESH_S * 1e3, ls="--", c="grey", lw=1)
+        axb.axhline(RATE_THRESH_HZ, ls="--", c="grey", lw=1)
+        axb.set_xlabel("trough-to-peak (ms)"); axb.set_ylabel("firing rate (Hz)")
+        axb.set_yscale("log"); axb.set_title("firing-rate gate")
+        fig.suptitle(f"{nwb.session_description}\nGood units: putative cell type", fontsize=10)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
         pdf.savefig(fig); plt.close(fig)
 
         # Page 2+: quality-metric distributions (good units)
@@ -756,58 +736,6 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
                 pdf.savefig(fig); plt.close(fig)
 
 
-def autocorrelogram(spike_times, window_s, bin_s, max_spikes=50000):
-    """Spike-train autocorrelogram: counts of inter-spike lags in [-window,+window]
-    (zero lag excluded). Bin choices follow common multi-scale ACG practice
-    (e.g. CellExplorer, Petersen & Buzsáki): a wide ±500 ms / 5 ms and a narrow
-    ±20 ms / 0.5 ms view. Returns (counts, bin-centres in ms)."""
-    st = np.sort(np.asarray(spike_times, dtype=float))
-    if st.size > max_spikes:                     # cap for runtime on fast cells
-        st = np.sort(np.random.choice(st, max_spikes, replace=False))
-    n = st.size
-    if n < 2:
-        return None, None
-    lo = np.searchsorted(st, st - window_s, side="left")
-    hi = np.searchsorted(st, st + window_s, side="right")
-    diffs = [st[lo[i]:hi[i]] - st[i] for i in range(n)]
-    d = np.concatenate(diffs)
-    d = d[d != 0]
-    edges = np.arange(-window_s, window_s + bin_s, bin_s)
-    counts, edges = np.histogram(d, bins=edges)
-    centres = (edges[:-1] + edges[1:]) / 2 * 1000.0   # ms
-    return counts, centres
-
-
-def _acg_triple_exp(x, tau_decay, tau_rise, c, d, asymptote, tau_burst, h, t0):
-    """CellExplorer triple-exponential ACG model (fit_ACG). x in ms."""
-    return np.maximum(
-        c * (np.exp(-(x - t0) / tau_decay) - d * np.exp(-(x - t0) / tau_rise))
-        + h * np.exp(-((x - t0) ** 2) / (tau_burst ** 2)) + asymptote, 0.0)
-
-
-def acg_tau_rise(spike_times):
-    """ACG rise-time constant (ms) via CellExplorer's triple-exponential fit to the
-    narrow (0–50 ms, 0.5 ms bins) autocorrelogram — cellexplorer.org cell-type
-    classification. Returns (tau_rise_ms, fit_ok). NaN if the fit fails."""
-    counts, centres = autocorrelogram(spike_times, window_s=0.05, bin_s=0.0005)
-    if counts is None:
-        return np.nan
-    pos = centres > 0
-    x, y = centres[pos], counts[pos].astype(float)
-    if y.size < 10 or y.max() <= 0:
-        return np.nan
-    y = y / y.max()                     # normalise amplitude
-    #             tau_decay tau_rise  c    d  asymp tau_burst  h    t0
-    p0 = [20.0, 1.0, 1.0, 2.0, 0.1, 1.5, 0.1, 1.0]
-    lb = [1.0, 0.1, 0.0, 0.0, -1.0, 0.1, 0.0, 0.0]
-    ub = [500.0, 50.0, 10.0, 15.0, 2.0, 5.0, 10.0, 20.0]
-    try:
-        popt, _ = curve_fit(_acg_triple_exp, x, y, p0=p0, bounds=(lb, ub), maxfev=10000)
-        return float(popt[1])           # tau_rise
-    except Exception:
-        return np.nan
-
-
 def _plot_acg(ax, spike_times, window_s, bin_s, label):
     counts, centres = autocorrelogram(spike_times, window_s, bin_s)
     if counts is not None:
@@ -891,25 +819,27 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
             ax_wf.set_title("mean waveform template")
 
         ax_txt = fig.add_subplot(gs[1, 1]); ax_txt.axis("off")
-        phw_ms = float(row.get("peak_half_width", np.nan)) * 1e3      # recomputed
-        p2t_ms = float(row.get("peak_to_trough_recomp", np.nan)) * 1e3
-        thw_ms = float(row.get("trough_half_width_recomp", np.nan)) * 1e3
-        tau_rise = acg_tau_rise(spike_times)                         # CellExplorer
+        p2t_ms = float(row.get("trough_to_peak_s", np.nan)) * 1e3     # trough-to-peak
+        phw_ms = float(row.get("peak_half_width_s", np.nan)) * 1e3
+        thw_ms = float(row.get("trough_half_width_s", np.nan)) * 1e3
+        tau_rise = float(row.get("acg_tau_rise_ms", np.nan))         # CellExplorer
         tau_str = f"{tau_rise:.2f} ms" if np.isfinite(tau_rise) else "n/a"
         lines = [
             f"cluster id: {cid}",
             f"cell type: {row['cell_type'].upper()}",
             f"quality: {row.get('quality_label', '?')}",
             f"firing rate: {row['firing_rate_hz']:.2f} Hz",
-            f"peak half-width: {phw_ms:.3f} ms   (recomputed)",
-            f"peak-to-trough: {p2t_ms:.3f} ms",
-            f"trough half-width: {thw_ms:.3f} ms",
+            f"trough-to-peak: {p2t_ms:.3f} ms   (recomputed)",
+            f"peak half-width: {phw_ms:.3f} ms",
             f"ACG tau_rise: {tau_str}   (CellExplorer)",
             f"n spikes: {int(row.get('num_spikes', len(spike_times)))}",
             f"SNR: {float(row.get('snr', np.nan)):.2f}",
             "",
-            f"rule: pyramidal if FR<={RATE_THRESH_HZ:.0f}Hz & phw>{PHW_THRESH_S*1e3:.3f}ms",
-            "       else interneuron",
+            "rule (CellExplorer + FR gate):",
+            f" FR>{RATE_THRESH_HZ:.0f}Hz -> interneuron",
+            f" else t2p<={TROUGH_PEAK_THRESH_S*1e3:.3f}ms -> narrow int",
+            f" else t2p>{TROUGH_PEAK_THRESH_S*1e3:.3f} & tau>{ACG_TAU_RISE_THRESH_MS:.0f}ms -> wide int",
+            " else pyramidal",
         ]
         if pf_lines:
             lines += [""] + pf_lines

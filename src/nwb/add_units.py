@@ -12,12 +12,16 @@ Runs AFTER step [w] (create_nwb.py). For each op folder it:
                                    the human good/noise truth) -> quality_label;
                                    quality_check_labels.csv (automated) is also
                                    kept as auto_quality_label for reference
-      * mean waveform template     from curated_templates.npy (saved by step r);
-                                   if absent, the analyzer is rebuilt from the
-                                   phy recording to compute them (slower).
+      * mean waveform template     ALWAYS recomputed here by rebuilding the analyzer
+                                   from the phy recording (reads recording.dat);
+                                   a stale curated_templates.npy is never trusted.
+  - recomputes, from the fresh templates + spikes, authoritative waveform metrics
+    (trough-to-peak, peak/trough half-width), the CellExplorer ACG tau_rise and the
+    putative cell_type (see spike_metrics.py) — the NWB template-metric CSVs were
+    unreliable.
   - appends an NWB Units table with spike_times, waveform_mean, one column per
-    quality/template metric, plus quality_label (manual cluster_group.tsv),
-    auto_quality_label, phy_cluster_id and sorting_group.
+    quality/template metric, the recomputed metrics + cell_type, plus quality_label
+    (manual cluster_group.tsv), auto_quality_label, phy_cluster_id, sorting_group.
 
 Phy's own templates.npy is NOT used: it is keyed by the pre-curation cluster ids
 and goes stale after merges/splits.
@@ -34,6 +38,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from pynwb import NWBHDF5IO
+
+# shared metric functions (also used by step v) — same code computes what we store
+# here and what visualize_nwb.py shows, so they can't drift apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spike_metrics import waveform_metrics, acg_tau_rise, classify_cell_type  # noqa: E402
 
 # NOTE: the spikeinterface-based phy loaders (used only for the template-rebuild
 # fallback) are imported lazily inside _load_templates, so the fast path (reading
@@ -99,21 +108,17 @@ def _read_auto_labels(phy):
 def _load_templates(phy, n_jobs=4):
     """Return (templates_by_unit, n_samples, n_channels).
 
-    Prefer curated_templates.npy (written by runner step r). If it is missing,
+    ALWAYS rebuilds the analyzer from the phy recording to compute fresh curated
     rebuild the analyzer from the phy recording and compute templates. Returns
     ({}, 0, 0) on failure (caller then writes units without waveform_mean)."""
     tpl_file = phy / "curated_templates.npy"
     ids_file = phy / "curated_template_unit_ids.npy"
-    if tpl_file.exists() and ids_file.exists():
-        templates = np.load(tpl_file)                 # (n_units, n_samples, n_channels)
-        unit_ids = np.load(ids_file)
-        by_unit = {int(u): templates[i] for i, u in enumerate(unit_ids)}
-        print(f"  Loaded curated templates for {len(by_unit)} unit(s) from "
-              f"curated_templates.npy {templates.shape}.")
-        return by_unit, templates.shape[1], templates.shape[2]
-
-    print("  curated_templates.npy not found — rebuilding analyzer from the phy "
-          "recording to compute templates (this reads recording.dat)...")
+    # ALWAYS recompute the curated templates here (step u), rebuilding the analyzer
+    # from the phy recording — never trust a cached curated_templates.npy, which can
+    # be stale from an earlier curation. The freshly computed templates are saved
+    # (overwriting the cache) and used for waveform_mean + the recomputed metrics.
+    print("  Recomputing curated templates from the phy recording "
+          "(rebuilding analyzer; this reads recording.dat)...")
     try:
         import spikeinterface.full as si
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
@@ -133,7 +138,7 @@ def _load_templates(phy, n_jobs=4):
         templates = np.asarray(analyzer.get_extension("templates").get_data())
         unit_ids = np.asarray(analyzer.unit_ids)
         by_unit = {int(u): templates[i] for i, u in enumerate(unit_ids)}
-        # Cache for next time so we don't rebuild again.
+        # Save the freshly computed templates (overwrite any stale cache).
         try:
             np.save(tpl_file, templates)
             np.save(ids_file, unit_ids)
@@ -212,8 +217,16 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
     t_cols = list(template.columns)
     group_name = phy.parent.name  # the *_sorting_output folder
 
+    # sampling rate (for waveform metrics) and session duration (for firing rate)
+    try:
+        fs = float(_read_phy_params(phy)["sample_rate"])
+    except Exception:
+        fs = 30000.0
+    duration = max((s.max() for s in spikes.values() if s.size), default=0.0) or 1.0
+
     units = []
     for u in unit_ids:
+        st = spikes.get(u, np.array([], dtype=np.float64))
         rec = {
             "phy_cluster_id": int(u),
             "sorting_group": group_name,
@@ -221,11 +234,26 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
             # falling back to the automated label only if a unit is missing there.
             "quality_label": manual.get(u, auto.get(u, "unsorted")),
             "auto_quality_label": auto.get(u, "unsorted"),
-            "spike_times": spikes.get(u, np.array([], dtype=np.float64)),
+            "spike_times": st,
             "_metrics": {},
         }
         if have_wf:
             rec["waveform_mean"] = np.asarray(templates_by_unit[u], dtype=np.float64)
+
+        # --- recomputed waveform metrics + ACG tau_rise + putative cell type ---
+        # (the spikeinterface template-metrics CSVs were unreliable; these are the
+        #  authoritative, self-consistent values, computed the same way as step v.)
+        wm = waveform_metrics(rec["waveform_mean"], fs) if have_wf else {}
+        t2p = wm.get("peak_to_trough_s", np.nan)
+        tau = acg_tau_rise(st)
+        fr = float(len(st)) / duration
+        rec["firing_rate_hz"] = fr
+        rec["trough_to_peak_s"] = t2p
+        rec["peak_half_width_s"] = wm.get("peak_half_width_s", np.nan)
+        rec["trough_half_width_s"] = wm.get("trough_half_width_s", np.nan)
+        rec["acg_tau_rise_ms"] = tau
+        rec["cell_type"] = classify_cell_type(fr, t2p, tau)
+
         for col in q_cols:
             rec["_metrics"][col] = _num(quality.at[u, col]) if u in quality.index else np.nan
         for col in t_cols:
@@ -281,10 +309,9 @@ def add_units_to_nwb(output_folder, n_jobs=4, skip_waveforms=False):
 
     if not have_wf_all:
         print("\n" + "*" * 70)
-        print("WARNING: no waveform_mean will be attached — curated_templates.npy was")
-        print("not found in the phy folder(s) and could not be rebuilt from the phy")
-        print("recording. Run the recompute step [r] (it now saves curated_templates.npy)")
-        print("BEFORE step [u], then regenerate the NWB (step w) and re-run step u.")
+        print("WARNING: no waveform_mean will be attached — the analyzer rebuild failed")
+        print("(missing phy recording.dat, or spikeinterface not available). Waveform")
+        print("metrics + cell_type will also be missing. Check the phy_export recording.")
         print("*" * 70)
 
     _write_units(nwb_path, all_units, metric_cols, have_wf_all)
@@ -310,8 +337,23 @@ def _write_units(nwb_path, all_units, metric_cols, have_wf):
         nwbfile.add_unit_column(name="auto_quality_label",
                                 description="Automated good/mua/noise quality-check label "
                                             "from quality_check_labels.csv (for reference).")
+        # recomputed, authoritative unit metrics + putative cell type (step u)
+        extra_cols = {
+            "firing_rate_hz": "Mean firing rate (n_spikes / session duration), Hz.",
+            "trough_to_peak_s": "Trough-to-peak duration on the peak channel, seconds "
+                                "(recomputed from the mean waveform).",
+            "peak_half_width_s": "Peak half-width, seconds (recomputed from the mean waveform).",
+            "trough_half_width_s": "Trough half-width, seconds (recomputed from the mean waveform).",
+            "acg_tau_rise_ms": "ACG rise time constant, ms (CellExplorer triple-exponential "
+                               "fit to the 0-50ms autocorrelogram).",
+            "cell_type": "Putative cell type (CellExplorer criteria + FR gate): interneuron "
+                         "if FR>10Hz, or trough-to-peak<=0.425ms, or (>0.425ms & tau_rise>6ms); "
+                         "else pyramidal.",
+        }
         for col in metric_cols:
             nwbfile.add_unit_column(name=col, description=f"Curated metric '{col}'.")
+        for col, desc in extra_cols.items():
+            nwbfile.add_unit_column(name=col, description=desc)
 
         for rec in all_units:
             kwargs = dict(
@@ -323,6 +365,8 @@ def _write_units(nwb_path, all_units, metric_cols, have_wf):
             )
             for col in metric_cols:
                 kwargs[col] = rec["_metrics"].get(col, np.nan)
+            for col in extra_cols:
+                kwargs[col] = rec[col]
             if have_wf:
                 kwargs["waveform_mean"] = rec["waveform_mean"]
             nwbfile.add_unit(**kwargs)
