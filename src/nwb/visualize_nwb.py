@@ -8,7 +8,7 @@ ideally waveform_mean). For each op folder it reads:
                                     (amplitudes.npy for the amplitude-vs-time plot)
   - RecordingMeta.xlsx            <op>/RecordingMeta.xlsx   (per-trial Trial_Type + times)
 
-and writes PDFs into <op>/nwb_viz/:
+and writes PDFs into <op>/visualization/:
 
   summary.pdf
     - scatter of peak-to-trough duration vs firing rate (good units, coloured by
@@ -511,7 +511,7 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
     phys = find_phy_folders(output_folder)
     phy = phys[0] if phys else None
 
-    out_dir = Path(output_folder) / "nwb_viz"
+    out_dir = Path(output_folder) / "visualization"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"NWB: {nwb_path}")
