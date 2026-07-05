@@ -569,17 +569,25 @@ if __name__ == "__main__":
         notes = [note]
         session_folders = [Path(root + input_folder + session_folder)]
     else:
-        # Only package op* output folders (op6, op12, ...) — that is where the
-        # per-session NWB data (coordinates, trials, LFP) lives. This skips ip*,
-        # yolov_models, and other non-session folders so we don't scan the whole
-        # data root. An explicit --session_folder (above) bypasses this filter.
-        def _is_op_folder(name):
-            n = name.lower()
-            return n.startswith("op") and len(n) > 2 and n[2].isdigit()
-        kept = [(f, nt) for f, nt in zip(session_folders, notes) if _is_op_folder(f.name)]
+        # Package op* output folders (op6, op12, ...) AND session-date-named
+        # folders (YYYYMMDD) — both hold the per-session NWB data (coordinates,
+        # trials, LFP). A date folder is only kept if its name also appears in a
+        # file/subfolder inside it (so it really is that session's folder). This
+        # skips ip*, yolov_models, etc. An explicit --session_folder bypasses this.
+        def _keep_session_folder(f):
+            n = f.name
+            if n.lower().startswith("op") and len(n) > 2 and n[2].isdigit():
+                return True
+            if len(n) == 8 and n.isdigit():
+                try:
+                    return any(n in c.name for c in f.iterdir())
+                except OSError:
+                    return False
+            return False
+        kept = [(f, nt) for f, nt in zip(session_folders, notes) if _keep_session_folder(f)]
         session_folders = [f for f, _ in kept]
         notes = [nt for _, nt in kept]
-        print(f"Filtered to {len(session_folders)} op* folder(s): "
+        print(f"Filtered to {len(session_folders)} op*/session folder(s): "
               f"{[f.name for f in session_folders]}")
 
     if args.sf:

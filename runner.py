@@ -356,6 +356,37 @@ def _run_per_op(label, tag, script, ops, config, extra_ip=None):
     print(f"\n[MASTER] {label} complete for all {total} folder(s).")
 
 
+def _is_date_name(name):
+    return len(name) == 8 and name.isdigit()
+
+
+def sequential_targets(root, ops):
+    """Folder targets for the steps that don't need an ip folder (c/r/u/v). Besides
+    the op* folders derived from ip*, include every op* folder in the root AND every
+    session-date-named folder (YYYYMMDD) whose name ALSO appears in a file/subfolder
+    inside it — i.e. the folder really belongs to that session (e.g. '20260629'
+    holding 'Rat6_20260629.nwb' or 'Rat6_HM_..._20260629_..._sorting_output').
+    Returns a list of (folder, folder) pairs (ip unused by these steps)."""
+    seen = {}
+    for _ip, op in ops:
+        seen[op.resolve()] = op
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        key = d.resolve()
+        if key in seen:
+            continue
+        if d.name.startswith("op"):
+            seen[key] = d
+        elif _is_date_name(d.name):
+            try:
+                if any(d.name in c.name for c in d.iterdir()):
+                    seen[key] = d
+            except OSError:
+                pass
+    return [(op, op) for op in seen.values()]
+
+
 # ------------------------------------------------------------
 #                 MASTER
 # ------------------------------------------------------------
@@ -392,10 +423,18 @@ def main():
     ip_dirs = sorted(d for d in root.glob("ip*") if d.is_dir())
     if not ip_dirs:
         print(f"[WARNING] No ip* folders found under {root}")
-    ops = []  # list of (ip_path, op_path)
+    ops = []  # list of (ip_path, op_path) — for ip-dependent steps (workers/7/9)
     for ip_path in ip_dirs:
         num = ip_path.name[len("ip"):]
         ops.append((ip_path, root / f"op{num}"))
+
+    # Targets for the ip-INDEPENDENT steps (c/r/u/v): op* folders + session-date
+    # folders whose name matches a file inside them. This lets those steps run on
+    # session-named folders, not just op*.
+    seq_ops = sequential_targets(root, ops)
+    if seq_ops:
+        print(f"[DEBUG] ip-independent step targets: "
+              f"{', '.join(op.name for _i, op in seq_ops)}")
 
     # --- Launch parallel workers (one background thread per ip/op pair) ---
     tmp = Path(tempfile.gettempdir())
@@ -435,9 +474,9 @@ def main():
     if has["7"]:
         _run_per_op("SORTING", "SORT", "./src/sorter/sorting.py", ops, config, extra_ip=True)
     if has["c"]:
-        _run_per_op("CONTINUE-AFTER-SORTING", "CONT", "./src/sorter/continue_sorting.py", ops, config)
+        _run_per_op("CONTINUE-AFTER-SORTING", "CONT", "./src/sorter/continue_sorting.py", seq_ops, config)
     if has["r"]:
-        _run_per_op("RECOMPUTE-METRICS (curated Phy)", "RECOMP", "./src/sorter/recompute_metrics.py", ops, config)
+        _run_per_op("RECOMPUTE-METRICS (curated Phy)", "RECOMP", "./src/sorter/recompute_metrics.py", seq_ops, config)
 
     if has["9"]:
         print("\n" + "=" * 56)
@@ -461,10 +500,10 @@ def main():
             print(f"[NWB] create_nwb.py NOT found at: {SCRIPT_DIR / 'src/nwb/create_nwb.py'}")
 
     if has["u"]:
-        _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", ops, config)
+        _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", seq_ops, config)
 
     if has["v"]:
-        _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", ops, config)
+        _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
 
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
     print("\n" + "=" * 56)
