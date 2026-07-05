@@ -650,7 +650,7 @@ if __name__ == "__main__":
         # source for rat id / date / repeat / day / session / goal node.
         rec_meta = read_recording_meta(session_folders[session_i])
 
-        if 'Time (seconds)' in df.columns:
+        if 'Time (seconds)' in df.columns and 'Timestamp' in df_coordinates_with_frames.columns:
             index_time_zero = find_index_time_zero(df)
             ts = df_coordinates_with_frames['Timestamp'][index_time_zero]
             # ts is a unix timestamp (seconds since 1970-01-01 UTC). Convert the
