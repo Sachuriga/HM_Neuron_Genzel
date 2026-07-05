@@ -44,6 +44,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
 
@@ -204,6 +205,77 @@ def place_field_mask(rate, frac=0.5):
     return lab == pk
 
 
+def place_fields(rate, field_frac=0.5, min_peak_hz=0.5, min_field_bins=6):
+    """List of boolean masks, one per place field: connected regions >= field_frac
+    * peak with >= min_field_bins bins and an in-field peak >= min_peak_hz. A cell
+    can have several fields (large maze)."""
+    if rate is None or not rate.count():
+        return []
+    lam = rate.filled(0.0)
+    peak = float(lam.max())
+    if peak <= 0:
+        return []
+    labmap, ncc = label((lam >= field_frac * peak) & ~np.ma.getmaskarray(rate))
+    fields = []
+    for c in range(1, ncc + 1):
+        comp = labmap == c
+        if comp.sum() >= min_field_bins and lam[comp].max() >= min_peak_hz:
+            fields.append(comp)
+    return fields
+
+
+def place_field_metrics(x, y, t, spike_times, extent, bins, dt, sigma, speed_thresh,
+                        goal_xy=None, t0=None, t1=None,
+                        field_frac=0.5, min_peak_hz=0.5, min_field_bins=6):
+    """Place-coding metrics for one cell over a window (defaults: a place field is
+    a connected region >= 50% of the peak, >= 6 bins ~ a 15 cm field at 5 cm bins,
+    with an in-field peak >= 0.5 Hz; a cell CAN have several fields on this large
+    maze):
+      n_fields      : # place fields = connected regions >= field_frac*peak with
+                      >= min_field_bins bins and an in-field peak >= min_peak_hz
+      spatial_info  : Skaggs spatial information (bits/spike)
+      selectivity   : peak rate / mean rate
+      field_goal_m  : mean distance (m) from each field's centroid to the goal node
+    Returns (metrics_dict, rate, extent)."""
+    rate, occ, ext = make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
+                                   t0=t0, t1=t1, speed_thresh=speed_thresh, return_occ=True)
+    nan = {"n_fields": 0, "spatial_info": np.nan, "selectivity": np.nan,
+           "field_goal_m": np.nan, "peak": 0.0}
+    if rate is None or not rate.count():
+        return nan, rate, ext
+    lam = rate.filled(0.0)
+    p_occ = occ.filled(0.0)
+    tot = p_occ.sum()
+    if tot <= 0:
+        return nan, rate, ext
+    p = p_occ / tot
+    lam_mean = float((p * lam).sum())
+    peak = float(lam.max())
+    if lam_mean <= 0:
+        return {**nan, "peak": peak}, rate, ext
+    # Skaggs spatial information (bits/spike)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = lam / lam_mean
+        terms = np.where(lam > 0, p * ratio * np.log2(np.where(ratio > 0, ratio, 1.0)), 0.0)
+    spatial_info = float(np.nansum(terms))
+    selectivity = peak / lam_mean
+    # all place fields + centroids (a cell can have several on this large maze)
+    fields = place_fields(rate, field_frac, min_peak_hz, min_field_bins)
+    ny, nx = rate.shape
+    dists = []
+    n_fields = len(fields)
+    for comp in fields:
+        iy, ix = np.where(comp)
+        cx = ext[0] + (ix.mean() + 0.5) * (ext[1] - ext[0]) / nx
+        cy = ext[2] + (iy.mean() + 0.5) * (ext[3] - ext[2]) / ny
+        if goal_xy is not None:
+            dists.append(float(np.hypot(cx - goal_xy[0], cy - goal_xy[1])))
+    return ({"n_fields": n_fields, "spatial_info": spatial_info,
+             "selectivity": selectivity,
+             "field_goal_m": float(np.mean(dists)) if dists else np.nan,
+             "peak": peak}, rate, ext)
+
+
 # ------------------------------------------------------------
 #                 speed – firing-rate correlation
 # ------------------------------------------------------------
@@ -311,7 +383,7 @@ def load_amplitudes(phy, cluster_id):
 #                 rate maps
 # ------------------------------------------------------------
 def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
-                  t0=None, t1=None, speed_thresh=0.0):
+                  t0=None, t1=None, speed_thresh=0.0, return_occ=False):
     """Firing-rate (place-field) map, Hz: binned spike counts / occupancy, EXACTLY
     the plot_trials.py occupancy convention (count * dt seconds per bin), and
     masked to bins the animal actually visited (occupancy > 0) so nothing is drawn
@@ -334,7 +406,7 @@ def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
     good = np.isfinite(x) & np.isfinite(y)
     x, y, t = x[good], y[good], t[good]
     if x.size < 2:
-        return None, extent
+        return (None, None, extent) if return_occ else (None, extent)
 
     # speed (position units / s), aligned to each position sample
     speed = np.zeros_like(x)
@@ -347,6 +419,7 @@ def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
     # occupancy (seconds per bin) from moving samples — plot_trials convention
     occ, _, _ = np.histogram2d(x[move], y[move], bins=[nx, ny], range=rng)
     occ = occ.T * dt
+    occ_raw = occ.copy()   # unsmoothed seconds/bin, for spatial-information p(bin)
 
     # spike positions (interpolated onto the trajectory), speed-gated the same way
     if spike_times.size:
@@ -368,6 +441,8 @@ def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
     with np.errstate(divide="ignore", invalid="ignore"):
         rate = np.where(occ > 0, spk / occ, 0.0)
     rate = np.ma.masked_where(~visited, rate)   # draw ONLY on visited bins
+    if return_occ:
+        return rate, np.ma.masked_where(~visited, occ_raw), extent
     return rate, extent
 
 
@@ -549,40 +624,76 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
                 fig.tight_layout(rect=[0, 0, 1, 0.97])
                 pdf.savefig(fig); plt.close(fig)
 
-        # Last page: actual PLACE-FIELD AREAS of all pyramidal good cells, one
-        # colour each — each cell's main field (connected region >=50% of its peak
-        # rate) drawn as a filled patch over the grey trajectory.
+        # ---- pyramidal place fields ----
+        # Overlaying filled fields hid small cells behind big ones and blurred
+        # overlaps, so instead: (1) a field-OUTLINE overlay (no occlusion), and
+        # (2) small-multiple mini rate maps, one per cell, sorted by spatial info.
         pyr = good[good["cell_type"] == "pyramidal"]
-        fig, ax = plt.subplots(figsize=(8.27, 6.0))
-        if pos is not None and len(pyr):
-            x, y, t = pos
-            ax.plot(x, y, color="0.88", lw=0.3, zorder=0)
-            cmap = plt.get_cmap("gist_rainbow")
-            n = len(pyr)
-            drawn = 0
-            for i, (uid, row) in enumerate(pyr.iterrows()):
-                st = np.asarray(row["spike_times"], dtype=float)
-                rate, ext = make_rate_map(x, y, t, st, extent, bins, dt, sigma, speed_thresh=speed)
-                mask = place_field_mask(rate, frac=0.5)
-                if mask is None or not mask.any():
-                    continue
-                # fill the field area; contourf treats mask row 0 as ymin, matching
-                # the inverted y-limits set below.
-                try:
-                    ax.contourf(mask.astype(float), levels=[0.5, 1.5], extent=ext,
-                                colors=[cmap(i / max(n - 1, 1))], alpha=0.4, zorder=1)
-                except Exception:
-                    continue
-                drawn += 1
-            ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[3], extent[2])
-            ax.set_aspect("equal", "box")
-            ax.set_title(f"Place-field areas of {drawn} putative pyramidal cells "
-                         f"(main field >=50% peak, one colour per cell)")
-        else:
+        if pos is None or not len(pyr):
+            fig, ax = plt.subplots(figsize=(8.27, 6.0))
             ax.text(0.5, 0.5, "no position data / no pyramidal cells",
                     ha="center", va="center", transform=ax.transAxes)
-        ax.set_xticks([]); ax.set_yticks([])
-        pdf.savefig(fig); plt.close(fig)
+            ax.set_xticks([]); ax.set_yticks([])
+            pdf.savefig(fig); plt.close(fig)
+        else:
+            x, y, t = pos
+            cells = []   # (cid, rate, ext, metrics, [all field masks])
+            for uid, row in pyr.iterrows():
+                st = np.asarray(row["spike_times"], dtype=float)
+                m, rate, ext = place_field_metrics(x, y, t, st, extent, bins, dt, sigma, speed)
+                cid = int(row["phy_cluster_id"]) if "phy_cluster_id" in row else int(uid)
+                cells.append((cid, rate, ext, m, place_fields(rate)))
+            # sort by spatial information (best place cells first); NaN last
+            cells.sort(key=lambda c: -(c[3]["spatial_info"] if np.isfinite(c[3]["spatial_info"]) else -1e9))
+
+            # (1) outline overlay — ALL fields of each cell, one colour per cell,
+            #     cells with most total field area drawn first so small sit on top
+            fig, ax = plt.subplots(figsize=(8.27, 6.0))
+            ax.plot(x, y, color="0.9", lw=0.3, zorder=0)
+            cmap = plt.get_cmap("gist_rainbow")
+            order = sorted(range(len(cells)),
+                           key=lambda i: -sum(int(f.sum()) for f in cells[i][4]))
+            drawn = 0
+            handles = []
+            for rank, i in enumerate(order):
+                cid, rate, ext, m, fields = cells[i]
+                if not fields:
+                    continue
+                col = cmap(rank / max(len(cells) - 1, 1))
+                for fmask in fields:                 # draw EVERY field of the cell
+                    try:
+                        ax.contour(fmask.astype(float), levels=[0.5], extent=ext,
+                                   colors=[col], linewidths=1.1, zorder=2)
+                    except Exception:
+                        pass
+                handles.append(Line2D([0], [0], color=col, lw=2,
+                                      label=f"u{cid} ({len(fields)})"))
+                drawn += 1
+            ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[3], extent[2])
+            ax.set_aspect("equal", "box"); ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(f"Place-field outlines of {drawn} pyramidal cells "
+                         f"(ALL fields >=50% peak, one colour per cell)")
+            # legend maps each colour -> unit id (n fields); placed outside the maze
+            ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
+                      fontsize=5, ncol=2, frameon=False, handlelength=1.2,
+                      labelspacing=0.3, columnspacing=1.0, title="unit (nF)",
+                      title_fontsize=6)
+            pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+            # (2) small multiples — one mini rate map per cell, best-tuned first
+            ncols, nrows = 5, 5
+            per = ncols * nrows
+            for start in range(0, len(cells), per):
+                chunk = cells[start:start + per]
+                fig, axes = plt.subplots(nrows, ncols, figsize=(8.27, 9.5), squeeze=False)
+                for ax, (cid, rate, ext, m, _mask) in zip(axes.ravel(), chunk):
+                    si = f"{m['spatial_info']:.2f}" if np.isfinite(m["spatial_info"]) else "n/a"
+                    _draw_map(ax, rate, ext, f"u{cid} SI={si} nF={m['n_fields']}")
+                for ax in axes.ravel()[len(chunk):]:
+                    ax.axis("off")
+                fig.suptitle("Pyramidal place fields (sorted by spatial info)", fontsize=11)
+                fig.tight_layout(rect=[0, 0, 1, 0.97])
+                pdf.savefig(fig); plt.close(fig)
 
 
 def autocorrelogram(spike_times, window_s, bin_s, max_spikes=50000):
@@ -620,8 +731,38 @@ def _plot_acg(ax, spike_times, window_s, bin_s, label):
     ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
 
 
+def _pyramidal_epochs(trials, t):
+    """Epochs over which to compute place-field metrics + their goal node. If the
+    2nd free-roaming (type-4/5) trial is a type-5 GOAL-SWITCH trial, split into
+    before/after it (different goals); otherwise one whole-session epoch."""
+    specials = [s for s in trials if s[0] in (4, 5)]
+    if len(specials) >= 2 and specials[1][0] == 5:
+        gb, ga = specials[0][1], specials[1][1]        # goal before / after switch
+        s0, s1 = specials[1][2], specials[1][3]
+        return [("before FR2", float(t.min()), s0, gb),
+                ("after FR2", s1, float(t.max()), ga)]
+    goals = [g for (_tt, g, _a, _b) in trials if g is not None]
+    g = max(set(goals), key=goals.count) if goals else None
+    return [("whole", float(t.min()), float(t.max()), g)]
+
+
 def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
                     pos, extent, bins, dt, sigma, speed, trials, nodes):
+    # Place-field metrics (pyramidal cells only), split before/after a type-5
+    # goal-switch free-roaming trial when present.
+    pf_lines = []
+    if pos is not None and row.get("cell_type") == "pyramidal":
+        px, py, pt = pos
+        pf_lines.append("place fields (pyr):")
+        for lab, e0, e1, g in _pyramidal_epochs(trials, pt):
+            m, _, _ = place_field_metrics(px, py, pt, spike_times, extent, bins, dt,
+                                          sigma, speed, goal_xy=nodes.get(g), t0=e0, t1=e1)
+            si = f"{m['spatial_info']:.2f}" if np.isfinite(m['spatial_info']) else "n/a"
+            sel = f"{m['selectivity']:.1f}" if np.isfinite(m['selectivity']) else "n/a"
+            d = f"{m['field_goal_m']:.2f}m" if np.isfinite(m['field_goal_m']) else "n/a"
+            pf_lines.append(f" {lab} (goal {g}): nF={m['n_fields']} "
+                            f"SI={si} sel={sel} d2goal={d}")
+
     with PdfPages(str(path)) as pdf:
         # ---- Page 1: summary info ----
         fig = plt.figure(figsize=(8.27, 9.0))
@@ -641,12 +782,18 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
             w = np.asarray(wf, dtype=float)
             if w.ndim == 1:
                 w = w[:, None]
-            # stored as (n_samples, n_channels)
-            for ch in range(w.shape[1]):
-                ax_wf.plot(w[:, ch], lw=1, label=f"ch{ch}")
-            ax_wf.set_title("mean waveform template")
+            # waveform_mean is (n_samples, all_channels) but sparse — only this
+            # unit's tetrode channels are non-zero. Plot ONLY those, coloured 'cool'.
+            active = np.where(w.ptp(axis=0) > 1e-6)[0]
+            if active.size == 0:
+                active = np.arange(w.shape[1])
+            cmap_wf = plt.get_cmap("cool")
+            for j, ch in enumerate(active):
+                ax_wf.plot(w[:, ch], lw=1.2, color=cmap_wf(j / max(len(active) - 1, 1)),
+                           label=f"ch{ch}")
+            ax_wf.set_title(f"mean waveform template ({len(active)} ch)")
             ax_wf.set_xlabel("sample")
-            if w.shape[1] <= 6:
+            if len(active) <= 8:
                 ax_wf.legend(fontsize=6, ncol=2)
         else:
             ax_wf.text(0.5, 0.5, "no waveform_mean\n(regenerate NWB via r→w→u)",
@@ -667,8 +814,10 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
             f"rule: pyramidal if FR<={RATE_THRESH_HZ:.0f}Hz & phw>{PHW_THRESH_S*1e3:.3f}ms",
             "       else interneuron",
         ]
+        if pf_lines:
+            lines += [""] + pf_lines
         ax_txt.text(0.02, 0.98, "\n".join(lines), va="top", ha="left",
-                    family="monospace", fontsize=9, transform=ax_txt.transAxes)
+                    family="monospace", fontsize=8, transform=ax_txt.transAxes)
 
         # autocorrelograms: wide (±500 ms, 5 ms bins) and narrow (±20 ms, 0.5 ms bins)
         _plot_acg(fig.add_subplot(gs[2, 0]), spike_times, 0.5, 0.005, "±500 ms, 5 ms bins")
