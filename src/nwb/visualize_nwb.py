@@ -120,8 +120,8 @@ def load_position(nwb):
 
 
 def read_trials_raw(op_folder):
-    """Per-trial (type, goal_node, start_unix, end_unix) from RecordingMeta.xlsx,
-    in the raw unix clock. Returns [] if unavailable."""
+    """Per-trial (type, goal_node, start_node, start_unix, end_unix) from
+    RecordingMeta.xlsx, in the raw unix clock. Returns [] if unavailable."""
     metas = list(Path(op_folder).glob("RecordingMeta.xlsx"))
     if not metas:
         return []
@@ -134,6 +134,14 @@ def read_trials_raw(op_folder):
     if not need <= set(df.columns):
         print("  RecordingMeta.xlsx missing Trial_Type/trial_start_time/trial_end_time.")
         return []
+
+    def _first_int(v):
+        # Start_Nodes may be a single node or a comma-list; take the first.
+        try:
+            return int(str(v).split(",")[0])
+        except (TypeError, ValueError):
+            return None
+
     trials = []
     for _, r in df.iterrows():
         if pd.isna(r["trial_start_time"]) or pd.isna(r["trial_end_time"]):
@@ -143,7 +151,9 @@ def read_trials_raw(op_folder):
         except (TypeError, ValueError):
             ttype = -1
         goal = int(r["Goal_Node"]) if "Goal_Node" in df.columns and pd.notna(r["Goal_Node"]) else None
-        trials.append((ttype, goal, float(r["trial_start_time"]), float(r["trial_end_time"])))
+        start = _first_int(r["Start_Nodes"]) if "Start_Nodes" in df.columns and pd.notna(r["Start_Nodes"]) else None
+        trials.append((ttype, goal, start,
+                       float(r["trial_start_time"]), float(r["trial_end_time"])))
     return trials
 
 
@@ -153,7 +163,7 @@ def align_trials(raw_trials, nwb_start, t_min, t_max):
     create_nwb), but older ones are off by the tz offset (session_start_time was
     tz-stamped without converting). We try both readings and keep whichever lands
     the most trials inside the recording's position coverage [t_min, t_max].
-    Returns [(type, goal_node, t0_rel, t1_rel), ...]."""
+    Returns [(type, goal_node, start_node, t0_rel, t1_rel), ...]."""
     if not raw_trials:
         return []
     cands = []
@@ -167,9 +177,9 @@ def align_trials(raw_trials, nwb_start, t_min, t_max):
         pass
     if not cands:
         return []
-    in_range = lambda off: sum(1 for (_tt, _g, s, e) in raw_trials if t_min <= s - off <= t_max)
+    in_range = lambda off: sum(1 for (_tt, _g, _s, s, e) in raw_trials if t_min <= s - off <= t_max)
     off = max(cands, key=in_range)
-    return [(tt, g, s - off, e - off) for (tt, g, s, e) in raw_trials]
+    return [(tt, g, sn, s - off, e - off) for (tt, g, sn, s, e) in raw_trials]
 
 
 def load_nodes():
@@ -183,6 +193,36 @@ def load_nodes():
         return {int(r.id): (r.x / SCALE_X, r.y / SCALE_Y) for r in df.itertuples()}
     except Exception:
         return {}
+
+
+_MAZE_EDGES = None
+
+
+def _maze_edges(nodes):
+    """Adjacent-node line segments (metres) for the faint hexmaze background —
+    pairs of nodes within ~1.35x the median nearest-neighbour spacing. Cached."""
+    global _MAZE_EDGES
+    if _MAZE_EDGES is not None:
+        return _MAZE_EDGES
+    _MAZE_EDGES = []
+    pts = np.array(list(nodes.values())) if nodes else np.empty((0, 2))
+    if len(pts) >= 2:
+        d = np.sqrt(((pts[:, None] - pts[None, :]) ** 2).sum(-1))
+        np.fill_diagonal(d, np.inf)
+        thr = 1.35 * float(np.median(d.min(axis=1)))
+        _MAZE_EDGES = [(pts[i], pts[j]) for i, j in np.argwhere(np.triu(d <= thr, 1))]
+    return _MAZE_EDGES
+
+
+def draw_maze(ax, nodes):
+    """Faint hexmaze in the background: node-to-node corridors + node dots, so the
+    maze layout is visible even where the cell/trajectory has no data."""
+    if not nodes:
+        return
+    for p1, p2 in _maze_edges(nodes):
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color="0.82", lw=0.6, zorder=0)
+    pts = np.array(list(nodes.values()))
+    ax.scatter(pts[:, 0], pts[:, 1], s=3, c="0.72", zorder=0)
 
 
 def place_field_mask(rate, frac=0.5):
@@ -447,13 +487,17 @@ def make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
     return rate, extent
 
 
-def _draw_map(ax, rate, extent, title, vmax=None):
+def _draw_map(ax, rate, extent, title, vmax=None, nodes=None):
     """Draw a rate map. `vmax` sets the colour-scale ceiling; when None it falls
-    back to 75% of this map's own peak. Callers pass a shared vmax so all of one
-    unit's maps use the same colour scale."""
+    back to 75% of this map's own peak. `nodes` draws the faint hexmaze behind the
+    map (shows through the transparent, unvisited bins)."""
     ax.set_xticks([]); ax.set_yticks([])
+    if nodes:
+        draw_maze(ax, nodes)
     if rate is None:
-        ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[3], extent[2])
+        if not nodes:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
         ax.set_title(title, fontsize=8)
         return
     peak = float(np.ma.max(rate)) if rate.count() else 0.0
@@ -464,20 +508,32 @@ def _draw_map(ax, rate, extent, title, vmax=None):
     # so the maze AND any goal-node marker line up between the two panels.
     im = ax.imshow(rate, origin="lower", extent=extent, aspect="equal",
                    cmap="jet", interpolation="nearest", vmin=0, vmax=vmax)
-    ax.set_ylim(extent[3], extent[2])
+    ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[3], extent[2])
     ax.set_title(f"{title}\npeak {peak:.1f} Hz", fontsize=8)
     return im
 
 
-def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None, goal_xy=None):
+def _mark_goal_start(ax, goal_xy, start_xy):
+    if goal_xy is not None:
+        ax.scatter(*goal_xy, marker="*", s=260, c="gold", edgecolors="k",
+                   linewidths=0.8, zorder=5, label="goal")
+    if start_xy is not None:
+        ax.scatter(*start_xy, marker="o", s=90, facecolor="none", edgecolors="lime",
+                   linewidths=1.8, zorder=5, label="start")
+
+
+def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None,
+                    goal_xy=None, start_xy=None, nodes=None):
     """Classic spike-on-trajectory plot: grey path + red spikes at the animal's
-    position when each spike occurred. Restricted to [t0,t1] when given. All
-    panels share `extent` (the full maze) so trials are directly comparable.
-    `goal_xy` (metres) marks the goal node with a gold star."""
+    position when each spike occurred. Restricted to [t0,t1] when given. All panels
+    share `extent`. `nodes` draws the faint hexmaze behind; `goal_xy` marks the goal
+    node (gold star) and `start_xy` the trial's start node (green ring)."""
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_aspect("equal")
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[3], extent[2])   # inverted: camera y grows downward
+    if nodes:
+        draw_maze(ax, nodes)
     if t0 is not None:
         m = (t >= t0) & (t <= t1)
         x, y, t = x[m], y[m], t[m]
@@ -485,18 +541,14 @@ def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None, g
     if x.size < 2:
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
         ax.set_title(title, fontsize=8)
-        if goal_xy is not None:
-            ax.scatter(*goal_xy, marker="*", s=260, c="gold", edgecolors="k",
-                       linewidths=0.8, zorder=5)
+        _mark_goal_start(ax, goal_xy, start_xy)
         return
-    ax.plot(x, y, color="0.8", lw=0.4, zorder=1)
+    ax.plot(x, y, color="0.5", lw=0.4, zorder=1)
     if spike_times.size:
         sx = np.interp(spike_times, t, x, left=np.nan, right=np.nan)
         sy = np.interp(spike_times, t, y, left=np.nan, right=np.nan)
         ax.scatter(sx, sy, s=4, c="red", alpha=0.5, edgecolors="none", zorder=2)
-    if goal_xy is not None:
-        ax.scatter(*goal_xy, marker="*", s=260, c="gold", edgecolors="k",
-                   linewidths=0.8, zorder=5)
+    _mark_goal_start(ax, goal_xy, start_xy)
     ax.set_title(f"{title}\n{int(spike_times.size)} spk", fontsize=8)
 
 
@@ -604,7 +656,7 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
         nodes = load_nodes()   # maze-node coords (metres) to mark the goal node
 
         # ---- summary.pdf ----
-        _write_summary(out_dir / "summary.pdf", udf, good, pos, extent, bins, dt, sigma, speed, nwb)
+        _write_summary(out_dir / "summary.pdf", udf, good, pos, extent, bins, dt, sigma, speed, nwb, nodes)
 
         # ---- one PDF per good unit ----
         for uid, row in good.iterrows():
@@ -619,7 +671,7 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
         io.close()
 
 
-def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
+def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb, nodes=None):
     metric_cols = [c for c in udf.columns if c not in (
         "phy_cluster_id", "sorting_group", "quality_label", "auto_quality_label",
         "spike_times", "waveform_mean", "cell_type", "electrodes")]
@@ -638,10 +690,12 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
         axa.axhline(ACG_TAU_RISE_THRESH_MS, ls="--", c="grey", lw=1)
         axa.set_xlabel("trough-to-peak (ms)"); axa.set_ylabel("ACG tau_rise (ms)")
         axa.set_title("CellExplorer classification"); axa.legend(fontsize=7)
+        axa.set_xlim(left=0); axa.set_ylim(bottom=0)        # axes start from 0
         axb.axvline(TROUGH_PEAK_THRESH_S * 1e3, ls="--", c="grey", lw=1)
         axb.axhline(RATE_THRESH_HZ, ls="--", c="grey", lw=1)
         axb.set_xlabel("trough-to-peak (ms)"); axb.set_ylabel("firing rate (Hz)")
-        axb.set_yscale("log"); axb.set_title("firing-rate gate")
+        axb.set_yscale("log"); axb.set_title("firing-rate gate")   # y log: can't start at 0
+        axb.set_xlim(left=0)
         fig.suptitle(f"{nwb.session_description}\nGood units: putative cell type", fontsize=10)
         fig.tight_layout(rect=[0, 0, 1, 0.94])
         pdf.savefig(fig); plt.close(fig)
@@ -689,6 +743,7 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
             # (1) outline overlay — ALL fields of each cell, one colour per cell,
             #     cells with most total field area drawn first so small sit on top
             fig, ax = plt.subplots(figsize=(8.27, 6.0))
+            draw_maze(ax, nodes)
             ax.plot(x, y, color="0.9", lw=0.3, zorder=0)
             cmap = plt.get_cmap("gist_rainbow")
             order = sorted(range(len(cells)),
@@ -728,7 +783,7 @@ def _write_summary(path, udf, good, pos, extent, bins, dt, sigma, speed, nwb):
                 fig, axes = plt.subplots(nrows, ncols, figsize=(8.27, 9.5), squeeze=False)
                 for ax, (cid, rate, ext, m, _mask) in zip(axes.ravel(), chunk):
                     si = f"{m['spatial_info']:.2f}" if np.isfinite(m["spatial_info"]) else "n/a"
-                    _draw_map(ax, rate, ext, f"u{cid} SI={si} nF={m['n_fields']}")
+                    _draw_map(ax, rate, ext, f"u{cid} SI={si} nF={m['n_fields']}", nodes=nodes)
                 for ax in axes.ravel()[len(chunk):]:
                     ax.axis("off")
                 fig.suptitle("Pyramidal place fields (sorted by spatial info)", fontsize=11)
@@ -756,10 +811,10 @@ def _pyramidal_epochs(trials, t):
     specials = [s for s in trials if s[0] in (4, 5)]
     if len(specials) >= 2 and specials[1][0] == 5:
         gb, ga = specials[0][1], specials[1][1]        # goal before / after switch
-        s0, s1 = specials[1][2], specials[1][3]
+        s0, s1 = specials[1][3], specials[1][4]        # 2nd-special t0, t1
         return [("before FR2", float(t.min()), s0, gb),
                 ("after FR2", s1, float(t.max()), ga)]
-    goals = [g for (_tt, g, _a, _b) in trials if g is not None]
+    goals = [g for (_tt, g, _sn, _a, _b) in trials if g is not None]
     g = max(set(goals), key=goals.count) if goals else None
     return [("whole", float(t.min()), float(t.max()), g)]
 
@@ -867,35 +922,40 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
         unit_vmax = 0.75 * full_peak if full_peak > 0 else None
 
         # ---- one page per window: spike-on-path + its rate map (2 plots) ----
-        _spatial_page(pdf, *args, f"Unit {cid} — full duration", vmax=unit_vmax)
+        _spatial_page(pdf, *args, f"Unit {cid} — full duration", vmax=unit_vmax, nodes=nodes)
 
-        for i, (tt, gn, t0, t1) in enumerate(trials):
-            _spatial_page(pdf, *args, f"Unit {cid} — trial {i+1}  (type {tt}, goal {gn})",
-                          t0=t0, t1=t1, vmax=unit_vmax, goal_xy=nodes.get(gn))
+        for i, (tt, gn, sn, t0, t1) in enumerate(trials):
+            _spatial_page(pdf, *args,
+                          f"Unit {cid} — trial {i+1}  (type {tt}, goal {gn}, start {sn})",
+                          t0=t0, t1=t1, vmax=unit_vmax,
+                          goal_xy=nodes.get(gn), start_xy=nodes.get(sn), nodes=nodes)
 
         # free-roaming (special) trials: the long ~10-min type-4 / type-5 trials.
         # Shown at the end, one page each, named freeroaming 1/2/3 with their type.
-        specials = [(tt, gn, t0, t1) for (tt, gn, t0, t1) in trials if tt in (4, 5)]
-        for i, (tt, gn, t0, t1) in enumerate(specials):
+        specials = [(tt, gn, sn, t0, t1) for (tt, gn, sn, t0, t1) in trials if tt in (4, 5)]
+        for i, (tt, gn, sn, t0, t1) in enumerate(specials):
             _spatial_page(pdf, *args,
-                          f"Unit {cid} — freeroaming {i+1} (type {tt}, goal {gn})",
-                          t0=t0, t1=t1, vmax=unit_vmax, goal_xy=nodes.get(gn))
+                          f"Unit {cid} — freeroaming {i+1} (type {tt}, goal {gn}, start {sn})",
+                          t0=t0, t1=t1, vmax=unit_vmax,
+                          goal_xy=nodes.get(gn), start_xy=nodes.get(sn), nodes=nodes)
 
         # rate map before / after the 2nd free-roaming trial (spatial remapping)
         if len(specials) >= 2:
-            _tt2, g2, s0, s1 = specials[1]
+            _tt2, g2, _sn2, s0, s1 = specials[1]
             _spatial_page(pdf, *args, f"Unit {cid} — before freeroaming 2 (goal {g2})",
-                          t0=float(t.min()), t1=s0, vmax=unit_vmax, goal_xy=nodes.get(g2))
+                          t0=float(t.min()), t1=s0, vmax=unit_vmax,
+                          goal_xy=nodes.get(g2), nodes=nodes)
             _spatial_page(pdf, *args, f"Unit {cid} — after freeroaming 2 (goal {g2})",
-                          t0=s1, t1=float(t.max()), vmax=unit_vmax, goal_xy=nodes.get(g2))
+                          t0=s1, t1=float(t.max()), vmax=unit_vmax,
+                          goal_xy=nodes.get(g2), nodes=nodes)
 
         # ---- speed–firing-rate correlation page (whole length + 3 free-roaming
         #      trials + before/after the 2nd free-roaming trial) ----
         speed_windows = [("whole length", None, None)]
-        for i, (tt, gn, s0, s1) in enumerate(specials):
+        for i, (tt, gn, sn, s0, s1) in enumerate(specials):
             speed_windows.append((f"freeroaming {i+1} (type {tt})", s0, s1))
         if len(specials) >= 2:
-            _tt2, g2, s0, s1 = specials[1]
+            _tt2, g2, _sn2, s0, s1 = specials[1]
             speed_windows.append(("before freeroaming 2", float(t.min()), s0))
             speed_windows.append(("after freeroaming 2", s1, float(t.max())))
         color = "tab:blue" if row.get("cell_type") == "pyramidal" else "tab:cyan"
@@ -903,19 +963,20 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
 
 
 def _spatial_page(pdf, x, y, t, spike_times, extent, bins, dt, sigma, speed,
-                  title, t0=None, t1=None, vmax=None, goal_xy=None):
-    """One portrait PDF page holding exactly two stacked plots: spike-on-path on
-    top and its rate map below. `vmax` is the shared per-unit colour ceiling;
-    `goal_xy` (metres) marks the trial's goal node on both panels."""
+                  title, t0=None, t1=None, vmax=None, goal_xy=None, start_xy=None,
+                  nodes=None):
+    """One portrait PDF page: spike-on-path on top, rate map below. `nodes` draws
+    the faint hexmaze behind both; `goal_xy`/`start_xy` mark the trial's goal (gold
+    star) and start node (green ring) on both panels."""
     fig, (axp, axr) = plt.subplots(2, 1, figsize=(8.27, 11.69))   # A4 portrait
     plot_spike_path(axp, x, y, t, spike_times, "spikes on path", extent,
-                    t0=t0, t1=t1, goal_xy=goal_xy)
+                    t0=t0, t1=t1, goal_xy=goal_xy, start_xy=start_xy, nodes=nodes)
+    if axp.get_legend_handles_labels()[1]:
+        axp.legend(fontsize=6, loc="upper right", framealpha=0.6)
     rate, ext = make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
                               t0=t0, t1=t1, speed_thresh=speed)
-    im = _draw_map(axr, rate, ext, "rate map", vmax=vmax)
-    if goal_xy is not None:
-        axr.scatter(*goal_xy, marker="*", s=260, facecolor="none",
-                    edgecolors="k", linewidths=1.4, zorder=5)
+    im = _draw_map(axr, rate, ext, "rate map", vmax=vmax, nodes=nodes)
+    _mark_goal_start(axr, goal_xy, start_xy)
     if im is not None:
         lbl = f"Hz (scale 0–{vmax:.1f})" if vmax else "Hz"
         fig.colorbar(im, ax=axr, fraction=0.046, label=lbl)

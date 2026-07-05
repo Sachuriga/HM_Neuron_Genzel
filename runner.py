@@ -67,11 +67,12 @@ MENU = [
     ("w", "nwblfp (NWB / LFP package)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
+    ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
 ]
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "s"]
 
 
 # ------------------------------------------------------------
@@ -504,6 +505,17 @@ def main():
 
     if has["v"]:
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
+
+    if has["s"]:
+        # cross-session aggregation over ALL NWBs under the root (one call, not per-op)
+        print("\n" + "=" * 56)
+        print("[MASTER] Running SESSION-SUMMARY (cross-session per-animal plots)...")
+        print("=" * 56)
+        if Path("./src/nwb/session_summary.py").exists():
+            rc = run([PYTHON, "-u", "./src/nwb/session_summary.py", "--root", root, "--config", config])
+            print("[SUMMARY] Done." if rc == 0 else "[SUMMARY] Python exited with error.")
+        else:
+            print("[SUMMARY] session_summary.py NOT found.")
 
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
     print("\n" + "=" * 56)
