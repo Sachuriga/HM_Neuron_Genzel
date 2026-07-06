@@ -20,6 +20,90 @@ from scipy.spatial.distance import pdist, squareform
 from scipy import stats 
 
 # --- Helper Functions ---
+def load_decoded_track(work_dir):
+    """Load a decoded-position track written by the decoder (step b) into
+    <op>/decoding/decoded_*.npz, or None if absent. Prefers the richest unit set
+    (e.g. good+mua over good). Coordinates are in the scaled metre frame."""
+    dec_dir = Path(work_dir) / "decoding"
+    files = sorted(dec_dir.glob("decoded_*.npz")) if dec_dir.exists() else []
+    if not files:
+        return None
+    try:
+        d = np.load(files[-1], allow_pickle=True)      # last = good_mua > good
+        # match on the UNIX clock (== the log's 'sys_time'); fall back to relative.
+        tkey = "t_unix" if "t_unix" in d.files else "t"
+        return {"t": np.asarray(d[tkey], float),
+                "dx": np.asarray(d["decoded_x"], float),
+                "dy": np.asarray(d["decoded_y"], float),
+                "quality": str(d["quality"])}
+    except Exception as e:
+        print(f"Could not read decoded track ({e}).")
+        return None
+
+
+def load_all_decoded_tracks(work_dir):
+    """Load every decoded-position track (good, good+mua, ...) from
+    <op>/decoding/decoded_*.npz. Returns a list of dicts with the decoded and the
+    actual path (scaled metre frame) + time, one per unit set. Empty if none."""
+    dec_dir = Path(work_dir) / "decoding"
+    files = sorted(dec_dir.glob("decoded_*.npz")) if dec_dir.exists() else []
+    out = []
+    for fp in files:
+        try:
+            d = np.load(fp, allow_pickle=True)
+            tkey = "t_unix" if "t_unix" in d.files else "t"
+            out.append({
+                "t": np.asarray(d[tkey], float),
+                "dx": np.asarray(d["decoded_x"], float),
+                "dy": np.asarray(d["decoded_y"], float),
+                "ax": np.asarray(d["actual_x"], float) if "actual_x" in d.files else None,
+                "ay": np.asarray(d["actual_y"], float) if "actual_y" in d.files else None,
+                "err": np.asarray(d["err"], float) if "err" in d.files else None,
+                "quality": str(d["quality"]),
+            })
+        except Exception as e:
+            print(f"Could not read {fp.name} ({e}).")
+    return out
+
+
+def build_df_from_coords(work_dir, input_dir):
+    """Build the position dataframe from Coordinates_Full_with_frames.csv (Rat_X/Y,
+    Trial_Num, Timestamp) + stitched_framewise_seconds.csv (relative seconds) —
+    cleaner and consistent with the decoder/NWB — instead of the raw .log. Returns
+    (df, file_stem) with the same schema the log path produces, or (None, None)."""
+    def _first(pat):
+        for d in (work_dir, input_dir):
+            hits = sorted(Path(d).glob(pat))
+            if hits:
+                return hits[0]
+        return None
+    coords = _first("*Coordinates_Full_with_frames.csv") or _first("*Coordinates_Full.csv")
+    if coords is None:
+        return None, None
+    cf = pd.read_csv(coords)
+    if not {"Rat_X", "Rat_Y"}.issubset(cf.columns):
+        return None, None
+    # relative seconds (same clock as the decoder) from the framewise file (same length)
+    secs = pd.Series([np.nan] * len(cf))
+    fw = _first("*framewise_seconds.csv")
+    if fw is not None:
+        f = pd.read_csv(fw)
+        sc = [c for c in f.columns if "second" in c.lower()]
+        if sc and len(f) == len(cf):
+            secs = pd.to_numeric(f[sc[0]], errors="coerce").reset_index(drop=True)
+    df = pd.DataFrame({
+        "x": pd.to_numeric(cf["Rat_X"], errors="coerce"),
+        "y": pd.to_numeric(cf["Rat_Y"], errors="coerce"),
+        "trial_id": pd.to_numeric(cf.get("Trial_Num"), errors="coerce"),
+        "video_seconds": secs.to_numpy(),
+        "sys_time": pd.to_numeric(cf.get("Timestamp"), errors="coerce"),
+        "event": "rat_position",
+    }).dropna(subset=["x", "y", "trial_id"])
+    df["trial_id"] = df["trial_id"].astype(int)
+    return df, Path(coords).stem
+
+
+
 
 def parse_video_to_seconds(ts_str):
     """Parses HH:MM:SS.mmm strings into total seconds."""
@@ -179,20 +263,36 @@ if __name__ == "__main__":
     work_dir = Path(args.output_folder)
     input_dir = Path(args.input_folder) # Add this line
 
+    # Decoded position track (written by the position decoder, step b), if present.
+    # When available it is overlaid on each trial's trajectory; otherwise the plots
+    # are unchanged. Coordinates are already in the scaled (X_SCALE_DEN) metre frame.
+    decoded = load_decoded_track(work_dir)
+    if decoded is not None:
+        print(f"Found decoded track ({decoded['quality']}, {len(decoded['t'])} bins) "
+              f"— overlaying on trial plots.")
+    # every unit set (good, good+mua, ...) for the dedicated decoded-track pages
+    decoded_all = load_all_decoded_tracks(work_dir)
+
     if not work_dir.exists():
         sys.exit(f"Error: The directory {work_dir} does not exist.")
     if not input_dir.exists():
         sys.exit(f"Error: The directory {input_dir} does not exist.") # Good practice to check this too
 
-    # 1. Find logs
-    LOG_GLOB = str(work_dir / "*.log")
-    log_paths = sorted(glob.glob(LOG_GLOB, recursive=True))
-    
-    if not log_paths:
-        sys.exit(f"No .log files found in {work_dir}")
-
-    print(f"Found {len(log_paths)} log files in {work_dir}")
-    log_file_stem = Path(log_paths[0]).stem
+    # 1. Positions: prefer the full coordinate CSV (Rat_X/Y + Trial_Num + framewise
+    #    seconds) — cleaner and on the same clock as the decoder. Fall back to .log.
+    coords_df, coords_stem = build_df_from_coords(work_dir, input_dir)
+    if coords_df is not None:
+        print(f"Using Coordinates_Full ({len(coords_df)} positions, "
+              f"{coords_df['trial_id'].nunique()} trials) instead of the .log.")
+        log_paths = []
+        log_file_stem = coords_stem
+    else:
+        LOG_GLOB = str(work_dir / "*.log")
+        log_paths = sorted(glob.glob(LOG_GLOB, recursive=True))
+        if not log_paths:
+            sys.exit(f"No Coordinates_Full CSV or .log files found in {work_dir}")
+        print(f"Found {len(log_paths)} log files in {work_dir}")
+        log_file_stem = Path(log_paths[0]).stem
 
     # --- 1b. Find and Parse Node Sequence Text File ---
     TXT_GLOB = str(work_dir / "*.txt")
@@ -321,10 +421,12 @@ if __name__ == "__main__":
             all_dfs.append(pd.DataFrame(rows_new))
             print(f" -> Extracted {len(rows_new)} rows.")
 
-    if not all_dfs:
+    if coords_df is not None:
+        df = coords_df                       # positions came from Coordinates_Full
+    elif not all_dfs:
         sys.exit("No valid data parsed from logs.")
-
-    df = pd.concat(all_dfs, ignore_index=True)
+    else:
+        df = pd.concat(all_dfs, ignore_index=True)
 
     # --- 3. Cleanup ---
     for col in ["video_seconds", "x", "y", "sys_time"]:
@@ -359,6 +461,10 @@ if __name__ == "__main__":
     records = []
     grouped = pos_df.groupby("trial_id", sort=False)
     
+    # Prefer UNIX 'sys_time' for the trial window — that is the clock the decoded
+    # track is matched on (t_unix). Fall back to video_seconds.
+    _tcol = ("sys_time" if "sys_time" in pos_df.columns
+             else "video_seconds" if "video_seconds" in pos_df.columns else None)
     for tid, g in grouped:
         if g.empty: continue
         g_valid = g.dropna(subset=["x", "y"])
@@ -370,7 +476,10 @@ if __name__ == "__main__":
         xy_seq = list(zip(g_valid["x"], g_valid["y"]))
         records.append({
             "trial_id": tid,
-            "xy": xy_seq
+            "xy": xy_seq,
+            # trial time window (for overlaying decoded position, step 5 + decoder)
+            "t0": float(g_valid[_tcol].min()) if _tcol else None,
+            "t1": float(g_valid[_tcol].max()) if _tcol else None,
         })
 
     per_trial_df = pd.DataFrame.from_records(records)
@@ -623,8 +732,10 @@ if __name__ == "__main__":
             })
 
             # --- Setup Figure ---
-            fig = plt.figure(figsize=(12, 23)) 
-            gs = fig.add_gridspec(6, 2, height_ratios=[0.3, 1, 1, 1, 0.6, 0.6]) 
+            n_dec = len(decoded_all)
+            fig = plt.figure(figsize=(12, 23 + (3 if n_dec else 0)))
+            _hr = [0.3, 1, 1, 1, 0.6, 0.6] + ([1.1] if n_dec else [])
+            gs = fig.add_gridspec(len(_hr), 2, height_ratios=_hr)
 
             ax_text = fig.add_subplot(gs[0, :])
             ax_text.axis('off')
@@ -636,6 +747,11 @@ if __name__ == "__main__":
             ax3 = fig.add_subplot(gs[3, 1])
             ax4 = fig.add_subplot(gs[4, :])
             ax5 = fig.add_subplot(gs[5, :])
+            # per-trial decoded-path panels (one per unit set), added on the last row
+            dec_axes = []
+            if n_dec:
+                dec_gs = gs[6, :].subgridspec(1, n_dec)
+                dec_axes = [fig.add_subplot(dec_gs[0, j]) for j in range(n_dec)]
 
             wrapped_seq = textwrap.fill(seq_str, width=110)
             failed_header = "*** FAILED — goal not reached ***\n" if trial_failed else ""
@@ -664,6 +780,7 @@ if __name__ == "__main__":
             sc = ax0.scatter(x_plot, y_plot, c=speed_vis, s=10, vmax=1, cmap='hot', rasterized=True)
             fig.colorbar(sc, ax=ax0, fraction=0.025, pad=0.02, label="Speed (m/s)")
             ax0.set_title(f"Trial {trial_id}{title_tag}: Speed Track", color=title_color)
+            # (decoded position now has its own per-trial panels on the bottom row)
 
             if len(x_plot) >= 2:
                 pts = np.column_stack([x_plot, y_plot])
@@ -774,6 +891,31 @@ if __name__ == "__main__":
                 ax.grid(True, alpha=0.3)
                 ax.set_xlim(0, 9)
                 ax.set_ylim(5, 0)
+
+            # decoded position for THIS trial, one panel per unit set (good, good+mua):
+            # grey = actual path, colored = decoded, 'cool' colormap by within-trial time.
+            for axd, trk in zip(dec_axes, decoded_all):
+                if nodes_data is not None:
+                    axd.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=22,
+                                facecolors='none', edgecolors='grey', linewidths=1,
+                                alpha=0.25, zorder=1)
+                t0, t1 = row.get("t0"), row.get("t1")
+                if t0 is not None and t1 is not None:
+                    m = (trk["t"] >= t0) & (trk["t"] <= t1)
+                    if m.any():
+                        tt = trk["t"][m]
+                        ct = (tt - tt.min()) / (tt.max() - tt.min()) if tt.max() > tt.min() else np.zeros_like(tt)
+                        if trk["ax"] is not None:
+                            axd.plot(trk["ax"][m], trk["ay"][m], "-", color="lightgrey",
+                                     lw=1.2, alpha=0.9, zorder=2)
+                        axd.scatter(trk["dx"][m], trk["dy"][m], c=ct, cmap="cool",
+                                    s=12, vmin=0, vmax=1, zorder=4)
+                if gx_scaled is not None:
+                    axd.scatter(gx_scaled, gy_scaled, marker="*", s=180, color="gold",
+                                edgecolors="k", linewidths=0.5, zorder=6)
+                axd.set_title(f"Decoded path — {trk['quality']}", fontsize=10)
+                axd.set_aspect("equal", adjustable="box")
+                axd.grid(True, alpha=0.3); axd.set_xlim(0, 9); axd.set_ylim(5, 0)
 
             fig.tight_layout()
             pdf.savefig(fig)
@@ -1167,5 +1309,38 @@ if __name__ == "__main__":
             pdf.savefig(fig_graph)
             plt.close(fig_graph)
 
-        
+        # --- Part D: Decoded position track (one page per unit set) ---
+        # Actual path and decoded path side by side, both color-coded by (normalized)
+        # time with the same 'cool' colormap the trajectory plots use, so the decoded
+        # track can be read against the animal's true path over the session.
+        for trk in decoded_all:
+            if trk["ax"] is None or len(trk["dx"]) == 0:
+                continue
+            t = trk["t"]
+            ct = (t - t.min()) / (t.max() - t.min()) if t.max() > t.min() else np.zeros_like(t)
+            fig_dec, (axA, axD) = plt.subplots(1, 2, figsize=(20, 9))
+            for pane, (xx, yy, ttl) in ((axA, (trk["ax"], trk["ay"], "Actual path")),
+                                        (axD, (trk["dx"], trk["dy"], "Decoded path"))):
+                sc = pane.scatter(xx, yy, c=ct, cmap="cool", s=12,
+                                  vmin=0, vmax=1, rasterized=True, zorder=4)
+                if nodes_data is not None:
+                    pane.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=90,
+                                 facecolors='none', edgecolors='grey',
+                                 linewidths=1.5, alpha=0.3, zorder=2)
+                pane.set_title(ttl, fontsize=14)
+                pane.set_aspect("equal", adjustable="box")
+                pane.set_xlim(0, 9); pane.set_ylim(5, 0)
+                pane.grid(True, alpha=0.3)
+            cb = fig_dec.colorbar(sc, ax=[axA, axD], fraction=0.02, pad=0.02)
+            cb.set_label("Session time (normalized 0 to 1)")
+            med = np.nanmedian(trk["err"]) if trk["err"] is not None else np.nan
+            fig_dec.suptitle(f"Decoded position track — units: {trk['quality']}"
+                             + (f"   (median error {med:.2f} m)" if np.isfinite(med) else ""),
+                             fontsize=16)
+            pdf.savefig(fig_dec)
+            plt.close(fig_dec)
+        if decoded_all:
+            print(f"Added {len(decoded_all)} decoded-track page(s): "
+                  f"{', '.join(t['quality'] for t in decoded_all)}.")
+
     print(f"Done. PDF saved to {pdf_path}")

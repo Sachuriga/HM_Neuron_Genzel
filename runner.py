@@ -67,12 +67,14 @@ MENU = [
     ("w", "nwblfp (NWB / LFP package)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
+    ("b", "Bayesian position decoder per session (DECODE_QUALITY=good|good,mua)"),
+    ("m", "Neural population UMAP per session (good and good+mua; Gardner et al. 2022)"),
     ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
 ]
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "s"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "s"]
 
 
 # ------------------------------------------------------------
@@ -505,6 +507,42 @@ def main():
 
     if has["v"]:
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
+
+    if has["b"]:
+        quals = os.environ.get("DECODE_QUALITY", "good").replace(",", " ").split() or ["good"]
+        folds = os.environ.get("DECODE_FOLDS", "1")   # 1 = train on all data; >1 = CV
+        print("\n" + "=" * 56)
+        print(f"[MASTER] Running POSITION-DECODER sequentially "
+              f"(units: {'+'.join(quals)}, folds: {folds})...")
+        print("=" * 56)
+        total = len(seq_ops)
+        for i, (_ip, op) in enumerate(seq_ops, 1):
+            print(f"\n[DECODE {i}/{total}] Decoding: {op}")
+            if Path("./src/nwb/decode_position.py").exists():
+                rc = run([PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
+                          "--config", config, "--folds", folds, "--quality", *quals])
+                print(f"[DECODE {i}/{total}] {'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+            else:
+                print("[DECODE] decode_position.py NOT found.")
+        print(f"\n[MASTER] Position-decoder complete for all {total} folder(s).")
+
+    if has["m"]:
+        # UMAP population embedding per session, both GOOD-only and GOOD+MUA.
+        print("\n" + "=" * 56)
+        print("[MASTER] Running NEURAL-UMAP sequentially (good and good+mua)...")
+        print("=" * 56)
+        total = len(seq_ops)
+        for i, (_ip, op) in enumerate(seq_ops, 1):
+            print(f"\n[UMAP {i}/{total}] Embedding: {op}")
+            if Path("./src/nwb/neural_umap.py").exists():
+                for quals in (["good"], ["good", "mua"]):
+                    rc = run([PYTHON, "-u", "./src/nwb/neural_umap.py", "--output_folder", op,
+                              "--config", config, "--quality", *quals])
+                    print(f"[UMAP {i}/{total}] units {'+'.join(quals)}: "
+                          f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+            else:
+                print("[UMAP] neural_umap.py NOT found.")
+        print(f"\n[MASTER] Neural-UMAP complete for all {total} folder(s).")
 
     if has["s"]:
         # cross-session aggregation over ALL NWBs under the root (one call, not per-op)
