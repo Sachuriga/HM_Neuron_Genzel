@@ -511,16 +511,22 @@ def main():
     if has["b"]:
         quals = os.environ.get("DECODE_QUALITY", "good").replace(",", " ").split() or ["good"]
         folds = os.environ.get("DECODE_FOLDS", "1")   # 1 = train on all data; >1 = CV
+        # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
+        # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
+        leads = os.environ.get("DECODE_LEADS", "0 1 3").split()
         print("\n" + "=" * 56)
         print(f"[MASTER] Running POSITION-DECODER sequentially "
-              f"(units: {'+'.join(quals)}, folds: {folds})...")
+              f"(units: {'+'.join(quals)}, folds: {folds}, leads: {' '.join(leads) or 'none'})...")
         print("=" * 56)
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
             print(f"\n[DECODE {i}/{total}] Decoding: {op}")
             if Path("./src/nwb/decode_position.py").exists():
-                rc = run([PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
-                          "--config", config, "--folds", folds, "--quality", *quals])
+                cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
+                       "--config", config, "--folds", folds, "--quality", *quals]
+                if leads:                       # multi-lead comparison PDF + lead-0 npz
+                    cmd += ["--leads", *leads]
+                rc = run(cmd)
                 print(f"[DECODE {i}/{total}] {'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
             else:
                 print("[DECODE] decode_position.py NOT found.")

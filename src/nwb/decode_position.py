@@ -61,9 +61,14 @@ def _smooth2d(flat, nx, ny, sigma):
 
 
 def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
-                   sigma=1.0, n_chunks=100):
+                   sigma=1.0, n_chunks=100, lead_s=0.0, save=True, plot=True):
     """Cross-validated Bayesian decoding for one session NWB. Returns a dict of
-    results (or None) and writes a PDF next to it."""
+    results (or None) and writes a PDF next to it.
+
+    lead_s > 0 turns the decoder into a PREDICTOR of the future position: each
+    spike is associated with where the animal will be `lead_s` seconds later, so
+    decoding a spike-count bin yields the predicted position `lead_s` seconds
+    ahead, compared against the true future position."""
     io = NWBHDF5IO(str(nwb_path), mode="r", load_namespaces=True)
     try:
         nwb = io.read()
@@ -97,11 +102,13 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         cedges = np.linspace(t[0], t[-1], n_chunks + 1)
         samp_fold = (np.clip(np.digitize(t, cedges) - 1, 0, n_chunks - 1)) % folds
 
-        # per-spike spatial bin + fold
+        # per-spike spatial bin + fold. For prediction (lead_s>0) each spike is
+        # tied to the position lead_s seconds LATER, so tuning curves map spikes
+        # to the animal's future location.
         spk = []
         for uid, st in units:
-            sx = np.interp(st, t, x, left=np.nan, right=np.nan)
-            sy = np.interp(st, t, y, left=np.nan, right=np.nan)
+            sx = np.interp(st + lead_s, t, x, left=np.nan, right=np.nan)
+            sy = np.interp(st + lead_s, t, y, left=np.nan, right=np.nan)
             ok = np.isfinite(sx) & np.isfinite(sy)
             sbid = (np.clip(np.digitize(sy[ok], ye) - 1, 0, ny - 1) * nx
                     + np.clip(np.digitize(sx[ok], xe) - 1, 0, nx - 1))
@@ -119,10 +126,17 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         sb = np.clip(np.digitize(t, edges) - 1, 0, nb - 1)
         vs = good
         cnt = np.bincount(sb[vs], minlength=nb).astype(float)
-        ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
-        ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
         occupied = cnt > 0
         tc_mid = (edges[:-1] + edges[1:]) / 2
+        if lead_s:
+            # target = the TRUE position lead_s seconds after each bin centre
+            ax_ = np.interp(tc_mid + lead_s, t, x, left=np.nan, right=np.nan)
+            ay_ = np.interp(tc_mid + lead_s, t, y, left=np.nan, right=np.nan)
+            occupied = occupied & np.isfinite(ax_) & np.isfinite(ay_)
+            ax_ = np.nan_to_num(ax_); ay_ = np.nan_to_num(ay_)
+        else:
+            ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
+            ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
         bin_fold = (np.clip(np.digitize(tc_mid, cedges) - 1, 0, n_chunks - 1)) % folds
 
         decoded_x = np.full(nb, np.nan); decoded_y = np.full(nb, np.nan)
@@ -168,6 +182,7 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         chance = np.hypot(cx[rc] - ax_[dec], cy[rc] - ay_[dec])
         res = {"nwb": nwb_path.name, "quality": "+".join(sorted(qualities)),
                "mode": ("full-data" if folds <= 1 else f"{folds}-fold CV"),
+               "lead_s": float(lead_s),
                "n_units": nU, "n_bins": int(dec.sum()),
                "median_err_m": float(np.median(err)), "mean_err_m": float(np.mean(err)),
                "median_chance_m": float(np.median(chance))}
@@ -177,26 +192,45 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         # offset from session-relative seconds to the UNIX clock (= session_start_unix);
         # taken from the raw-vs-aligned trial times so it matches align_trials exactly.
         off = (raw[0][3] - trials[0][3]) if (raw and trials) else 0.0
-        # persist the decoded track so step 5 (plot_trials) can overlay it per trial.
-        # Save time in BOTH clocks: t (session-relative s) and t_unix (UNIX s, which
-        # is what plot_trials' log 'sys_time' uses). Coordinates are scaled metres.
-        out_dir = nwb_path.parent / "decoding"; out_dir.mkdir(exist_ok=True)
-        np.savez(out_dir / f"decoded_{'_'.join(sorted(qualities))}.npz",
-                 t=tc_mid[dec], t_unix=tc_mid[dec] + off,
-                 actual_x=ax_[dec], actual_y=ay_[dec],
-                 decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
-                 quality="+".join(sorted(qualities)), scale_x=V.SCALE_X, scale_y=V.SCALE_Y)
-        _plot(nwb_path, res, tc_mid[dec], ax_[dec], ay_[dec],
-              decoded_x[dec], decoded_y[dec], err, chance, V.load_nodes(), qualities, trials)
+        # carry the decoded arrays on the result so callers (e.g. the multi-lead
+        # comparison) can reuse them without re-reading the NWB.
+        res.update({"t": tc_mid[dec], "actual_x": ax_[dec], "actual_y": ay_[dec],
+                    "decoded_x": decoded_x[dec], "decoded_y": decoded_y[dec],
+                    "err": err, "chance": chance, "trials": trials})
+
+        out_dir = nwb_path.parent / "decoding"
+        tag = "_".join(sorted(qualities))
+        # prediction runs get a distinct 'predicted_..._lead{n}s' name so they do NOT
+        # clobber the 0-lag decoded_*.npz that plot_trials overlays per trial.
+        stem = f"decoded_{tag}" if not lead_s else f"predicted_{tag}_lead{lead_s:g}s"
+        if save:
+            # persist the decoded track so step 5 (plot_trials) can overlay it per
+            # trial. Save time in BOTH clocks: t (session-relative s) and t_unix
+            # (UNIX s, which plot_trials' log 'sys_time' uses). Coords = scaled metres.
+            out_dir.mkdir(exist_ok=True)
+            np.savez(out_dir / f"{stem}.npz",
+                     t=tc_mid[dec], t_unix=tc_mid[dec] + off,
+                     actual_x=ax_[dec], actual_y=ay_[dec],
+                     decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
+                     quality="+".join(sorted(qualities)), lead_s=float(lead_s),
+                     scale_x=V.SCALE_X, scale_y=V.SCALE_Y)
+        if plot:
+            _plot(nwb_path, res, tc_mid[dec], ax_[dec], ay_[dec],
+                  decoded_x[dec], decoded_y[dec], err, chance, V.load_nodes(), qualities,
+                  trials, stem=stem)
         return res
     finally:
         io.close()
 
 
-def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities, trials=None):
+def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities,
+          trials=None, stem=None):
     out_dir = nwb_path.parent / "decoding"
     out_dir.mkdir(exist_ok=True)
-    out = out_dir / f"decode_{'_'.join(sorted(qualities))}.pdf"
+    stem = stem or f"decoded_{'_'.join(sorted(qualities))}"
+    # decoded_x -> decode_x.pdf ; predicted_..._lead1s -> predict_..._lead1s.pdf
+    out = out_dir / (stem.replace("decoded_", "decode_", 1)
+                     .replace("predicted_", "predict_", 1) + ".pdf")
     with PdfPages(str(out)) as pdf:
         fig = plt.figure(figsize=(11, 8))
         gs = fig.add_gridspec(2, 2)
@@ -229,12 +263,15 @@ def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities, 
             f"session: {res['nwb']}",
             f"units: {res['quality']} (n={res['n_units']})",
             f"training: {res['mode']}",
+            f"prediction lead: {res.get('lead_s', 0.0):g} s",
             f"decoded bins: {res['n_bins']}",
             f"median error: {res['median_err_m']:.2f} m",
             f"mean error:   {res['mean_err_m']:.2f} m",
             f"median chance: {res['median_chance_m']:.2f} m",
         ]), va="top", family="monospace", fontsize=10, transform=ax.transAxes)
-        fig.suptitle(f"Position decoding — {nwb_path.stem}", fontsize=13)
+        _lead = res.get("lead_s", 0.0)
+        _kind = f"Position prediction (+{_lead:g}s)" if _lead else "Position decoding"
+        fig.suptitle(f"{_kind} — {nwb_path.stem}", fontsize=13)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig); plt.close(fig)
 
@@ -270,12 +307,181 @@ def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities, 
           f"chance {res['median_chance_m']:.2f} m)")
 
 
-def run(output_folder, qualities, **kw):
+def decode_leads(nwb_path, qualities, leads=(0.0, 1.0, 3.0), **kw):
+    """Decode at several prediction leads (seconds ahead) and write ONE combined
+    comparison PDF. lead 0 = decode the current position; lead>0 = predict the
+    future position. The single-lead .npz files are NOT written here (save=False),
+    so the per-trial overlay used by plot_trials is left untouched."""
+    kw.pop("lead_s", None)
+    results = []
+    for L in leads:
+        print(f"  lead {L:g}s ...", end=" ", flush=True)
+        # lead 0 == the ordinary decoded track: persist its .npz so plot_trials'
+        # per-trial overlay keeps working; other leads are comparison-only.
+        r = decode_session(nwb_path, qualities, lead_s=float(L),
+                           save=(float(L) == 0.0), plot=False, **kw)
+        if r is None:
+            print("skipped."); continue
+        print(f"median err {r['median_err_m']:.2f} m")
+        results.append(r)
+    if results:
+        _plot_leads(nwb_path, qualities, results)
+    return results
+
+
+def _pick_window(results):
+    """Pick a representative trial window (session-relative t0, t1) that has the
+    most decoded bins across the lead-0 result; fall back to the first 60 s."""
+    r0 = results[0]
+    best, best_n = None, 0
+    for (_tt, _gn, _sn, t0, t1) in (r0.get("trials") or []):
+        n = int(((r0["t"] >= t0) & (r0["t"] <= t1)).sum())
+        if n > best_n:
+            best, best_n = (t0, t1), n
+    if best is not None and best_n >= 10:
+        return best
+    t = r0["t"]
+    return (float(t.min()), float(t.min()) + 60.0) if len(t) else (0.0, 60.0)
+
+
+def _plot_leads(nwb_path, qualities, results):
+    """Multi-page comparison of prediction leads: (1) error/correlation dashboard,
+    (2) actual-vs-predicted trajectory per lead over one trial, (3) 'prediction
+    reach' arrows from the current position to the predicted future position."""
+    import matplotlib.cm as cm
+    nodes = V.load_nodes()
+    ext = V.MAZE_EXTENT
+    leads = [r["lead_s"] for r in results]
+    colors = cm.viridis(np.linspace(0.15, 0.85, len(results)))
+    tag = "+".join(sorted(qualities))
+    out = nwb_path.parent / "decoding" / f"decode_leads_{'_'.join(sorted(qualities))}.pdf"
+    out.parent.mkdir(exist_ok=True)
+    chance = float(np.median(results[0]["chance"]))
+
+    with PdfPages(str(out)) as pdf:
+        # ---- Page 1: dashboard ----
+        fig = plt.figure(figsize=(12, 9))
+        gs = fig.add_gridspec(2, 2)
+
+        # median error vs lead (+ chance)
+        ax = fig.add_subplot(gs[0, 0])
+        med = [r["median_err_m"] for r in results]
+        ax.plot(leads, med, "-o", color="#2166ac", lw=2)
+        for L, m in zip(leads, med):
+            ax.annotate(f"{m:.2f}", (L, m), textcoords="offset points",
+                        xytext=(0, 8), ha="center", fontsize=9)
+        ax.axhline(chance, ls="--", color="0.5", label=f"chance {chance:.2f} m")
+        ax.set_xlabel("prediction lead (s)"); ax.set_ylabel("median error (m)")
+        ax.set_title("Prediction error vs lead"); ax.set_ylim(bottom=0)
+        ax.legend(fontsize=8); ax.spines[["top", "right"]].set_visible(False)
+
+        # error distributions per lead
+        ax = fig.add_subplot(gs[0, 1])
+        for r, c in zip(results, colors):
+            ax.hist(r["err"], bins=40, density=True, histtype="step", lw=1.8,
+                    color=c, label=f"lead {r['lead_s']:g}s (med {r['median_err_m']:.2f})")
+        ax.set_xlabel("error (m)"); ax.set_ylabel("density")
+        ax.set_title("Error distribution per lead"); ax.legend(fontsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+
+        # actual-vs-predicted correlation vs lead (x and y)
+        ax = fig.add_subplot(gs[1, 0])
+        rx = [np.corrcoef(r["actual_x"], r["decoded_x"])[0, 1] for r in results]
+        ry = [np.corrcoef(r["actual_y"], r["decoded_y"])[0, 1] for r in results]
+        ax.plot(leads, rx, "-o", label="X", color="#1b7837")
+        ax.plot(leads, ry, "-s", label="Y", color="#762a83")
+        ax.set_xlabel("prediction lead (s)"); ax.set_ylabel("corr(actual, predicted)")
+        ax.set_title("Predicted vs actual correlation"); ax.set_ylim(0, 1)
+        ax.legend(fontsize=8); ax.spines[["top", "right"]].set_visible(False)
+
+        # text summary
+        ax = fig.add_subplot(gs[1, 1]); ax.axis("off")
+        lines = [f"session: {results[0]['nwb']}",
+                 f"units: {tag} (n={results[0]['n_units']})",
+                 f"training: {results[0]['mode']}",
+                 f"chance: {chance:.2f} m", "", "lead    median   mean    corrX  corrY"]
+        for r, cxx, cyy in zip(results, rx, ry):
+            lines.append(f"{r['lead_s']:>4g}s  {r['median_err_m']:6.2f}  "
+                         f"{r['mean_err_m']:6.2f}  {cxx:5.2f}  {cyy:5.2f}")
+        ax.text(0.02, 0.98, "\n".join(lines), va="top", family="monospace",
+                fontsize=10, transform=ax.transAxes)
+        fig.suptitle(f"Position prediction across leads — {nwb_path.stem} — {tag}",
+                     fontsize=14)
+        fig.tight_layout(rect=[0, 0, 1, 0.96]); pdf.savefig(fig); plt.close(fig)
+
+        # ---- Page 2: trajectory per lead over one representative trial ----
+        t0, t1 = _pick_window(results)
+        fig, axes = plt.subplots(1, len(results), figsize=(5.2 * len(results), 5.4),
+                                 squeeze=False)
+        for ax, r in zip(axes[0], results):
+            if nodes:
+                V.draw_maze(ax, nodes)
+            m = (r["t"] >= t0) & (r["t"] <= t1)
+            ax.plot(r["actual_x"][m], r["actual_y"][m], "-", color="0.55", lw=1.4,
+                    zorder=1, label="actual path")
+            tt = r["t"][m]
+            ct = (tt - tt.min()) / (tt.max() - tt.min()) if m.sum() > 1 and tt.max() > tt.min() else np.zeros(m.sum())
+            ax.scatter(r["decoded_x"][m], r["decoded_y"][m], c=ct, cmap="cool", s=16,
+                       vmin=0, vmax=1, zorder=3, label="predicted")
+            ax.set_aspect("equal"); ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[3], ext[2])
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(f"lead {r['lead_s']:g}s — median err {np.median(r['err'][m]) if m.any() else np.nan:.2f} m",
+                         fontsize=10)
+        axes[0][0].legend(fontsize=8, loc="upper right")
+        fig.suptitle(f"Actual (grey) vs predicted (time-coloured) over one trial "
+                     f"[{t0:.0f}-{t1:.0f}s] — {tag}", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.95]); pdf.savefig(fig); plt.close(fig)
+
+        # ---- Page 3: prediction-reach arrows ----
+        # At sampled moments draw an arrow from the animal's CURRENT position (lead-0
+        # actual) to the predicted position at each lead — longer leads should reach
+        # further along the upcoming path. Capped to a short sub-window so the arrows
+        # stay legible instead of turning into a hairball.
+        r0 = results[0]
+        w0, w1 = t0, min(t1, t0 + 45.0)
+        fig, axes = plt.subplots(1, len(results), figsize=(5.2 * len(results), 5.4),
+                                 squeeze=False)
+        m0 = (r0["t"] >= w0) & (r0["t"] <= w1)
+        # sample ~every 1.5 s within the window on the lead-0 time base
+        tsel = r0["t"][m0]
+        step = max(1, int(round(1.5 / (np.median(np.diff(tsel)) if len(tsel) > 1 else 0.5))))
+        keep_i = np.arange(0, len(tsel), step)
+        for ax, r in zip(axes[0], results):
+            if nodes:
+                V.draw_maze(ax, nodes)
+            ax.plot(r0["actual_x"][m0], r0["actual_y"][m0], "-", color="0.7", lw=1.2, zorder=1)
+            m = (r["t"] >= w0) & (r["t"] <= w1)
+            axs, ays = r0["actual_x"][m0], r0["actual_y"][m0]
+            dxs, dys = r["decoded_x"][m], r["decoded_y"][m]
+            n = min(len(axs), len(dxs))
+            for i in keep_i:
+                if i >= n:
+                    break
+                ax.annotate("", xy=(dxs[i], dys[i]), xytext=(axs[i], ays[i]),
+                            arrowprops=dict(arrowstyle="->", color="#d62728", lw=1.3, alpha=0.85),
+                            zorder=4)
+            ax.scatter(axs[keep_i[keep_i < n]], ays[keep_i[keep_i < n]], s=26,
+                       color="#1b7837", zorder=5, label="current position")
+            ax.set_aspect("equal"); ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[3], ext[2])
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(f"lead {r['lead_s']:g}s", fontsize=11)
+        axes[0][0].legend(fontsize=8, loc="upper right")
+        fig.suptitle("Prediction reach: arrow = current position -> predicted position "
+                     f"(sampled ~1.5 s, {w0:.0f}-{w1:.0f}s) — {tag}", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.95]); pdf.savefig(fig); plt.close(fig)
+
+    print(f"  wrote {out}  (leads {', '.join(f'{L:g}s' for L in leads)})")
+
+
+def run(output_folder, qualities, leads=None, **kw):
     nwb_path = V.find_nwb_file(output_folder)
     if nwb_path is None:
         print(f"No .nwb under '{output_folder}' (run steps w/u first). Skipping."); return
     print(f"Decoding {nwb_path} using units: {'+'.join(sorted(qualities))}")
-    decode_session(nwb_path, qualities, **kw)
+    if leads:
+        decode_leads(nwb_path, qualities, leads=leads, **kw)
+    else:
+        decode_session(nwb_path, qualities, **kw)
 
 
 if __name__ == "__main__":
@@ -289,10 +495,20 @@ if __name__ == "__main__":
     ap.add_argument("--time_bin", type=float, default=0.5, help="decoding time bin (s).")
     ap.add_argument("--folds", type=int, default=1,
                     help="1 = train on ALL data (in-sample); >1 = that many CV folds.")
+    ap.add_argument("--lead_s", type=float, default=0.0,
+                    help="predict the position this many seconds in the FUTURE "
+                         "(0 = decode current position; e.g. --lead_s 1.0).")
+    ap.add_argument("--leads", type=float, nargs="+", default=None,
+                    help="compare several prediction leads in ONE PDF, e.g. "
+                         "--leads 0 1 3 (writes decode_leads_<quality>.pdf, no npz).")
     args = ap.parse_args()
     try:
-        run(args.output_folder, args.quality, bin_cm=args.bin_cm,
-            time_bin=args.time_bin, folds=args.folds)
+        if args.leads:
+            run(args.output_folder, args.quality, leads=args.leads,
+                bin_cm=args.bin_cm, time_bin=args.time_bin, folds=args.folds)
+        else:
+            run(args.output_folder, args.quality, bin_cm=args.bin_cm,
+                time_bin=args.time_bin, folds=args.folds, lead_s=args.lead_s)
     except Exception as e:
         print(f"[decode] Failed: {e}")
         traceback.print_exc()
