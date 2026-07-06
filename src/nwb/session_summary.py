@@ -33,6 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import f_oneway, ttest_ind
 from pynwb import NWBHDF5IO
 
 try:
@@ -66,6 +67,63 @@ def _subtype(cell_type, t2p_s):
     if np.isfinite(t2p_s) and t2p_s <= SM.TROUGH_PEAK_THRESH_S:
         return "narrow interneuron"
     return "wide interneuron"
+
+
+# ------------------------------------------------------------
+#                 statistics (ANOVA + post-hoc)
+# ------------------------------------------------------------
+def _groups_by(units, group_col, value_col, order=None):
+    """{group -> finite values} for a metric, using the whole/before epoch rows
+    (one value per neuron per session, matching the plotted line)."""
+    d = units[units["epoch"].isin(["whole", "before"])]
+    out = {}
+    for g, sub in d.groupby(group_col):
+        v = pd.to_numeric(sub[value_col], errors="coerce").to_numpy()
+        out[str(g)] = v[np.isfinite(v)]
+    if order is not None:
+        out = {str(k): out.get(str(k), np.array([])) for k in order}
+    return out
+
+
+def _oneway_anova(groups):
+    """One-way ANOVA across groups (dict or list). Returns (F, p, k, N)."""
+    gs = [g for g in (groups.values() if isinstance(groups, dict) else groups) if len(g) >= 2]
+    if len(gs) < 2:
+        return np.nan, np.nan, len(gs), int(sum(len(g) for g in gs))
+    F, p = f_oneway(*gs)
+    return float(F), float(p), len(gs), int(sum(len(g) for g in gs))
+
+
+def _holm(pvals):
+    """Holm–Bonferroni adjusted p-values."""
+    pvals = np.asarray(pvals, float)
+    m = len(pvals)
+    adj = np.empty(m)
+    prev = 0.0
+    for rank, idx in enumerate(np.argsort(pvals)):
+        prev = max(prev, min((m - rank) * pvals[idx], 1.0))
+        adj[idx] = prev
+    return adj
+
+
+def _posthoc(groups, scope, metric):
+    """Pairwise Welch t-tests between session groups with Holm correction."""
+    keys = [k for k, v in groups.items() if len(v) >= 2]
+    pairs, praw = [], []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a, b = groups[keys[i]], groups[keys[j]]
+            tv, p = ttest_ind(a, b, equal_var=False)
+            pairs.append((keys[i], keys[j], len(a), len(b), float(np.mean(a)),
+                          float(np.mean(b)), float(tv), float(p)))
+            praw.append(p)
+    padj = _holm(praw) if praw else []
+    rows = []
+    for (l1, l2, n1, n2, m1, m2, tv, p), pa in zip(pairs, padj):
+        rows.append({"scope": scope, "metric": metric, "group1": l1, "group2": l2,
+                     "n1": n1, "n2": n2, "mean1": m1, "mean2": m2, "t": tv,
+                     "p_raw": p, "p_holm": float(pa), "sig": "*" if pa < 0.05 else ""})
+    return rows
 
 
 def _unit_metrics(nwb, udf, fs=30000.0):
@@ -168,20 +226,39 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
                 max(5, int(round((ext[3] - ext[2]) / bm))))
         nodes = V.load_nodes()
 
-        def pyr_metrics(goal_xy, t0=None, t1=None):
-            acc = {k: [] for k in _PF_KEYS}
-            for _uid, row in pyr.iterrows():
-                st = np.asarray(row["spike_times"], dtype=float)
+        # Per-unit datapoints (for statistics) + the session-level means (for the
+        # plots). A base row carries the unit's identity + waveform/ACG metrics.
+        pyr_idx = list(good.index[good["cell_type"] == "pyramidal"])
+        unit_rows = []
+
+        def _base(idx):
+            r = um.loc[idx]
+            uid = int(udf.loc[idx, "phy_cluster_id"]) if "phy_cluster_id" in udf.columns else int(idx)
+            return {"animal": out["animal"], "date": date, "repeat": repeat,
+                    "session": session, "unit_id": uid, "quality_label": "good",
+                    "cell_type": r["cell_type"], "subtype": r["subtype"],
+                    "firing_rate_hz": r["firing_rate_hz"],
+                    "trough_to_peak_s": r["trough_to_peak_s"],
+                    "acg_tau_rise_ms": r["acg_tau_rise_ms"]}
+
+        def _pyr_epoch(epoch, goal_node, t0, t1):
+            """Compute per-pyramidal-unit place-field metrics for one epoch, append
+            each unit's datapoint row, and return the session mean per metric."""
+            gxy = nodes.get(goal_node)
+            means = {k: [] for k in _PF_KEYS}
+            for idx in pyr_idx:
+                st = np.asarray(udf.loc[idx, "spike_times"], dtype=float)
                 m, _, _ = V.place_field_metrics(x, y, t, st, ext, bins, dt, sigma, speed,
-                                                goal_xy=goal_xy, t0=t0, t1=t1)
+                                                goal_xy=gxy, t0=t0, t1=t1)
+                d = _base(idx); d["epoch"] = epoch; d["goal_node"] = goal_node
                 for k in _PF_KEYS:
-                    acc[k].append(m[k])
+                    d[k] = m[k]; means[k].append(m[k])
+                unit_rows.append(d)
             return {k: (float(np.nanmean(v)) if np.any(np.isfinite(v)) else np.nan)
-                    for k, v in acc.items()}
+                    for k, v in means.items()}
 
         # Split into before/after the type-5 (goal-switch) trial ONLY for RxS1
-        # sessions with repeat > 1 (R1S1 and all S>1 stay whole-session), because
-        # the goal changes at the type-5 trial in those sessions.
+        # sessions with repeat > 1 (R1S1 and all S>1 stay whole-session).
         type5 = None
         if session == 1 and repeat and repeat > 1:
             raw = V.read_trials_raw(nwb_path.parent)
@@ -192,23 +269,31 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
                 _tt, g5, _sn, t50, t51 = type5
                 gb = [g for (tt, g, sn, a, b) in trials if b <= t50 and g is not None]
                 goal_before = Counter(gb).most_common(1)[0][0] if gb else None
-                pre = pyr_metrics(nodes.get(goal_before), t0=float(t.min()), t1=t50)
-                post = pyr_metrics(nodes.get(g5), t0=t51, t1=float(t.max()))
+                pre = _pyr_epoch("before", goal_before, float(t.min()), t50)
+                post = _pyr_epoch("after", g5, t51, float(t.max()))
                 out["split"] = True
                 for k in _PF_KEYS:
                     out[k] = pre[k]; out[k + "_post"] = post[k]
         if type5 is None:
-            goal = _session_goal(nwb, udf)
-            whole = pyr_metrics(nodes.get(goal))
+            whole = _pyr_epoch("whole", _session_goal(nwb, udf), None, None)
             for k in _PF_KEYS:
                 out[k] = whole[k]
+
+        # interneuron good units: one datapoint row each (no place fields)
+        for idx in good.index[good["cell_type"] != "pyramidal"]:
+            d = _base(idx); d["epoch"] = "whole"; d["goal_node"] = None
+            for k in _PF_KEYS:
+                d[k] = np.nan
+            unit_rows.append(d)
+        out["unit_rows"] = pd.DataFrame(unit_rows)
         return out
     finally:
         io.close()
 
 
-def _plot_animal(pdf, animal, sessions):
+def _plot_animal(pdf, animal, sessions, units_df=None):
     sessions = sorted(sessions, key=lambda s: s["date"])
+    dates = [s["date"] for s in sessions]
     x = np.arange(len(sessions))
     labels = [f"{s['date']}\nR{s['repeat']}·S{s['session']}" for s in sessions]
 
@@ -240,6 +325,12 @@ def _plot_animal(pdf, animal, sessions):
             ax.plot(x, col(key + "_post"), "s", color="#d62728", label="after type5")
             ax.legend(fontsize=6)
         ax.set_title(title); ax.set_ylabel(ylab)
+        if units_df is not None:        # per-animal one-way ANOVA across sessions
+            _F, p, k, N = _oneway_anova(_groups_by(units_df, "date", key, order=dates))
+            if np.isfinite(p):
+                ax.text(0.98, 0.03, f"1-way ANOVA p={p:.3g} (k={k})", transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=7,
+                        color="#b2182b" if p < 0.05 else "0.3")
     for ax in axes.ravel():
         ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=6, rotation=0)
         ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
@@ -274,6 +365,66 @@ def _plot_scatter(pdf, animal, units):
     pdf.savefig(fig); plt.close(fig)
 
 
+def _label_order(labels):
+    def key(s):
+        r = re.search(r"R(\d+)", s); ss = re.search(r"S(\d+)", s)
+        return (int(r.group(1)) if r else 0, int(ss.group(1)) if ss else 0)
+    return sorted(labels, key=key)
+
+
+def _plot_combined(pdf, units_all):
+    """All animals pooled: pyramidal place-field metrics per session (grouped by
+    R{repeat}S{session} label), box + mean, annotated with the pooled one-way ANOVA."""
+    d = units_all[units_all["epoch"].isin(["whole", "before"])].copy()
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    for ax, (key, title, ylab) in zip(axes.ravel(), [
+        ("spatial_info", "pyramidal spatial information", "bits/spike"),
+        ("selectivity", "pyramidal selectivity", "peak/mean"),
+        ("n_fields", "pyramidal # place fields", "n fields"),
+        ("field_goal_m", "pyramidal field-to-goal distance", "metres"),
+    ]):
+        groups = _groups_by(d, "session_label", key)
+        labs = [l for l in _label_order(groups) if len(groups[l])]
+        data = [groups[l] for l in labs]
+        xx = np.arange(len(labs))
+        if data:
+            ax.boxplot(data, positions=xx, widths=0.6, showfliers=False)
+            ax.plot(xx, [np.mean(g) for g in data], "o-", color="#2166ac")
+        _F, p, k, N = _oneway_anova(groups)
+        if np.isfinite(p):
+            ax.text(0.98, 0.97, f"1-way ANOVA p={p:.3g} (k={k}, N={N})", transform=ax.transAxes,
+                    ha="right", va="top", fontsize=8, color="#b2182b" if p < 0.05 else "0.3")
+        ax.set_title(title); ax.set_ylabel(ylab)
+        ax.set_xticks(xx); ax.set_xticklabels(labs, fontsize=7)
+        ax.set_ylim(bottom=0)
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    n_an = units_all["animal"].nunique()
+    fig.suptitle(f"All animals combined ({n_an}) — pyramidal metrics by session", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    pdf.savefig(fig); plt.close(fig)
+
+
+def _stats_tables(animal_units, units_all):
+    """Per-animal (grouped by date) + combined (grouped by session label) one-way
+    ANOVA and post-hoc pairwise tables for each pyramidal metric."""
+    anova, posthoc = [], []
+    for animal in sorted(animal_units):
+        u = animal_units[animal]
+        dates = sorted(u["date"].unique())
+        for key in _PF_KEYS:
+            g = _groups_by(u, "date", key, order=dates)
+            F, p, k, N = _oneway_anova(g)
+            anova.append({"scope": animal, "metric": key, "F": F, "p": p, "k_groups": k, "N": N})
+            posthoc += _posthoc(g, animal, key)
+    for key in _PF_KEYS:
+        g = _groups_by(units_all, "session_label", key)
+        g = {l: g[l] for l in _label_order(g)}
+        F, p, k, N = _oneway_anova(g)
+        anova.append({"scope": "ALL", "metric": key, "F": F, "p": p, "k_groups": k, "N": N})
+        posthoc += _posthoc(g, "ALL", key)
+    return pd.DataFrame(anova), pd.DataFrame(posthoc)
+
+
 def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
     root = Path(root)
     # Cross-session summary uses only the session NWBs, which sit at most a few
@@ -301,37 +452,59 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
             print(f"  Failed on {p}: {e}")
             traceback.print_exc()
 
+    # per-animal per-neuron datapoints (with a session_label for pooled grouping)
+    animal_units = {}
+    for animal in sorted(by_animal):
+        urows = [s["unit_rows"] for s in by_animal[animal]
+                 if isinstance(s.get("unit_rows"), pd.DataFrame) and not s["unit_rows"].empty]
+        if urows:
+            u = pd.concat(urows, ignore_index=True)
+            u["session_label"] = ("R" + u["repeat"].astype("Int64").astype(str)
+                                  + "S" + u["session"].astype("Int64").astype(str))
+            animal_units[animal] = u
+    units_all = pd.concat(animal_units.values(), ignore_index=True) if animal_units else pd.DataFrame()
+
     out = root / "session_summary.pdf"
     with PdfPages(str(out)) as pdf:
         for animal in sorted(by_animal):
-            _plot_animal(pdf, animal, by_animal[animal])
+            _plot_animal(pdf, animal, by_animal[animal], animal_units.get(animal))
             units = [s["units"] for s in by_animal[animal] if s.get("units") is not None]
             if units:
                 _plot_scatter(pdf, animal, pd.concat(units, ignore_index=True))
+        if not units_all.empty and units_all["animal"].nunique() > 1:
+            _plot_combined(pdf, units_all)       # all animals pooled
     print(f"\nWrote {out} ({len(by_animal)} animal(s)).")
 
-    # export the per-session table to Excel (before/after type5 columns for splits)
+    # per-session summary table (before/after type5 columns for splits)
     cols = (["animal", "date", "repeat", "session", "split",
              "n_good", "n_mua", "n_pyr", "n_int"]
             + [k for key in _PF_KEYS for k in (key, key + "_post")])
-    rows = [{c: s.get(c) for c in cols}
-            for animal in sorted(by_animal)
-            for s in sorted(by_animal[animal], key=lambda z: z["date"])]
-    df = pd.DataFrame(rows, columns=cols)
-    # per-unit table (all good units, all sessions) on its own sheet
-    all_units = pd.concat([s["units"] for a in by_animal for s in by_animal[a]
-                           if s.get("units") is not None], ignore_index=True) \
-        if any(s.get("units") is not None for a in by_animal for s in by_animal[a]) else pd.DataFrame()
+    df = pd.DataFrame([{c: s.get(c) for c in cols}
+                       for animal in sorted(by_animal)
+                       for s in sorted(by_animal[animal], key=lambda z: z["date"])], columns=cols)
+    ucols = ["animal", "date", "repeat", "session", "session_label", "epoch", "unit_id",
+             "quality_label", "cell_type", "subtype", "firing_rate_hz", "trough_to_peak_s",
+             "acg_tau_rise_ms", "goal_node"] + list(_PF_KEYS)
+    units_dp = units_all.reindex(columns=ucols) if not units_all.empty else pd.DataFrame()
+    anova_df, posthoc_df = _stats_tables(animal_units, units_all) if animal_units else (pd.DataFrame(), pd.DataFrame())
+
     xlsx = root / "session_summary.xlsx"
     try:
         with pd.ExcelWriter(xlsx) as xw:
             df.to_excel(xw, index=False, sheet_name="sessions")
-            if not all_units.empty:
-                all_units.to_excel(xw, index=False, sheet_name="units")
-        print(f"Wrote {xlsx}")
+            if not units_dp.empty:
+                units_dp.to_excel(xw, index=False, sheet_name="units")
+            if not anova_df.empty:
+                anova_df.to_excel(xw, index=False, sheet_name="anova")
+            if not posthoc_df.empty:
+                posthoc_df.to_excel(xw, index=False, sheet_name="posthoc")
+        print(f"Wrote {xlsx} (sessions: {len(df)}, unit datapoints: {len(units_dp)}, "
+              f"anova: {len(anova_df)}, posthoc: {len(posthoc_df)} rows)")
     except Exception as e:
-        df.to_csv(root / "session_summary.csv", index=False)
-        print(f"Could not write xlsx ({e}); wrote session_summary.csv instead.")
+        for name, d in [("", df), ("_units", units_dp), ("_anova", anova_df), ("_posthoc", posthoc_df)]:
+            if not d.empty:
+                d.to_csv(root / f"session_summary{name}.csv", index=False)
+        print(f"Could not write xlsx ({e}); wrote CSVs instead.")
 
 
 if __name__ == "__main__":
