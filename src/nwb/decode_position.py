@@ -470,6 +470,38 @@ def _plot_leads(nwb_path, qualities, results):
                      f"(sampled ~1.5 s, {w0:.0f}-{w1:.0f}s) — {tag}", fontsize=12)
         fig.tight_layout(rect=[0, 0, 1, 0.95]); pdf.savefig(fig); plt.close(fig)
 
+        # ---- Per-trial pages: actual vs predicted for EVERY trial, one column per
+        # lead. grey = actual path, colour = predicted (within-trial time), * = goal.
+        trials = results[0].get("trials") or []
+        rows_pp, cols = 4, len(results)
+        for start in range(0, len(trials), rows_pp):
+            chunk = trials[start:start + rows_pp]
+            fig, axes = plt.subplots(len(chunk), cols, figsize=(4.6 * cols, 3.4 * len(chunk)),
+                                     squeeze=False)
+            for ri, (ttype, goal, _snode, tt0, tt1) in enumerate(chunk):
+                for ci, r in enumerate(results):
+                    ax = axes[ri][ci]
+                    if nodes:
+                        V.draw_maze(ax, nodes)
+                    m = (r["t"] >= tt0) & (r["t"] <= tt1)
+                    ax.plot(r["actual_x"][m], r["actual_y"][m], "-", color="0.55",
+                            lw=1.2, zorder=1)
+                    tt = r["t"][m]
+                    ct = (tt - tt.min()) / (tt.max() - tt.min()) if m.sum() > 1 and tt.max() > tt.min() else np.zeros(m.sum())
+                    ax.scatter(r["decoded_x"][m], r["decoded_y"][m], c=ct, cmap="cool",
+                               s=14, vmin=0, vmax=1, zorder=3)
+                    if nodes.get(goal) is not None:
+                        ax.scatter(*nodes[goal], marker="*", s=90, c="gold",
+                                   edgecolors="k", lw=0.5, zorder=5)
+                    ax.set_aspect("equal"); ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[3], ext[2])
+                    ax.set_xticks([]); ax.set_yticks([])
+                    e = float(np.median(r["err"][m])) if m.any() else float("nan")
+                    ax.set_title(f"trial {start + ri + 1} (type {ttype}) — "
+                                 f"lead {r['lead_s']:g}s, err {e:.2f} m", fontsize=8)
+            fig.suptitle(f"Per-trial actual (grey) vs predicted (time-coloured) — {tag}",
+                         fontsize=12)
+            fig.tight_layout(rect=[0, 0, 1, 0.97]); pdf.savefig(fig); plt.close(fig)
+
     print(f"  wrote {out}  (leads {', '.join(f'{L:g}s' for L in leads)})")
 
 

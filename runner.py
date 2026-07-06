@@ -509,25 +509,28 @@ def main():
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
 
     if has["b"]:
-        quals = os.environ.get("DECODE_QUALITY", "good").replace(",", " ").split() or ["good"]
         folds = os.environ.get("DECODE_FOLDS", "1")   # 1 = train on all data; >1 = CV
         # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
         # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
         leads = os.environ.get("DECODE_LEADS", "0 1 3").split()
+        # always produce BOTH a good-only and a good+mua decode per session.
+        qual_sets = [["good"], ["good", "mua"]]
         print("\n" + "=" * 56)
         print(f"[MASTER] Running POSITION-DECODER sequentially "
-              f"(units: {'+'.join(quals)}, folds: {folds}, leads: {' '.join(leads) or 'none'})...")
+              f"(good and good+mua, folds: {folds}, leads: {' '.join(leads) or 'none'})...")
         print("=" * 56)
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
             print(f"\n[DECODE {i}/{total}] Decoding: {op}")
             if Path("./src/nwb/decode_position.py").exists():
-                cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
-                       "--config", config, "--folds", folds, "--quality", *quals]
-                if leads:                       # multi-lead comparison PDF + lead-0 npz
-                    cmd += ["--leads", *leads]
-                rc = run(cmd)
-                print(f"[DECODE {i}/{total}] {'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+                for quals in qual_sets:
+                    cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
+                           "--config", config, "--folds", folds, "--quality", *quals]
+                    if leads:                   # multi-lead comparison PDF + lead-0 npz
+                        cmd += ["--leads", *leads]
+                    rc = run(cmd)
+                    print(f"[DECODE {i}/{total}] units {'+'.join(quals)}: "
+                          f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
             else:
                 print("[DECODE] decode_position.py NOT found.")
         print(f"\n[MASTER] Position-decoder complete for all {total} folder(s).")

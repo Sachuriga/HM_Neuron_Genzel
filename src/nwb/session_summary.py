@@ -164,6 +164,23 @@ def _unit_metrics(nwb, udf, fs=30000.0):
     return out
 
 
+def _decode_accuracy(session_dir):
+    """Median decoding error (m) per unit set, read from the decoder's (step b)
+    decoded_*.npz. Returns {} when a session has no decoding output."""
+    d = Path(session_dir) / "decoding"
+    out = {}
+    for tag, key in (("good", "dec_err_good"), ("good_mua", "dec_err_good_mua")):
+        f = d / f"decoded_{tag}.npz"
+        if f.exists():
+            try:
+                z = np.load(f, allow_pickle=True)
+                if "err" in z and len(z["err"]):
+                    out[key] = float(np.median(z["err"]))
+            except Exception:
+                pass
+    return out
+
+
 def _session_goal(nwb, udf):
     """Dominant goal node id for the session: most common in the Trials_Data table,
     else parsed from session_description ('Goal_Node G'). None if unavailable."""
@@ -203,9 +220,11 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
         session = int(ses.group(1)) if ses else None
         out = {"animal": f"Rat{int(subj)}" if str(subj).isdigit() else str(subj),
                "date": date, "repeat": repeat, "session": session, "split": False,
-               "n_good": 0, "n_mua": 0, "n_pyr": 0, "n_int": 0}
+               "n_good": 0, "n_mua": 0, "n_pyr": 0, "n_int": 0,
+               "dec_err_good": np.nan, "dec_err_good_mua": np.nan}
         for k in _PF_KEYS:
             out[k] = np.nan; out[k + "_post"] = np.nan
+        out.update(_decode_accuracy(nwb_path.parent))   # decoding accuracy (step b)
         if nwb.units is None or len(nwb.units.id) == 0:
             return out
         udf = nwb.units.to_dataframe()
@@ -323,7 +342,19 @@ def _plot_animal(pdf, animal, sessions, units_df=None):
     any_split = any(s.get("split") for s in sessions)
     metric_axes = [axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1],
                    axes[3, 0], axes[3, 1], axes[4, 0]]
-    axes[4, 1].axis("off")
+    # decoding accuracy across sessions (median position-decoding error, step b)
+    axd = axes[4, 1]
+    eg, em = col("dec_err_good"), col("dec_err_good_mua")
+    if np.isfinite(eg).any() or np.isfinite(em).any():
+        axd.plot(x, eg, "o-", color="#2166ac", label="good")
+        axd.plot(x, em, "s-", color="#b2182b", label="good+mua")
+        axd.set_title("decoding accuracy (median error)"); axd.set_ylabel("error (m)")
+        axd.legend(fontsize=8)
+        axd.set_xticks(x); axd.set_xticklabels(labels, fontsize=6)
+        axd.spines["top"].set_visible(False); axd.spines["right"].set_visible(False)
+        axd.set_ylim(bottom=0)
+    else:
+        axd.axis("off")
     for ax, (key, title, ylab) in zip(metric_axes, _PF_PLOT):
         ax.plot(x, col(key), "o-", color="#2166ac",
                 label="whole / before type5" if any_split else None)
@@ -479,7 +510,7 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
 
     # per-session summary table (before/after type5 columns for splits)
     cols = (["animal", "date", "repeat", "session", "split",
-             "n_good", "n_mua", "n_pyr", "n_int"]
+             "n_good", "n_mua", "n_pyr", "n_int", "dec_err_good", "dec_err_good_mua"]
             + [k for key in _PF_KEYS for k in (key, key + "_post")])
     df = pd.DataFrame([{c: s.get(c) for c in cols}
                        for animal in sorted(by_animal)
