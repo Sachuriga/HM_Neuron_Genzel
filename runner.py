@@ -509,15 +509,19 @@ def main():
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
 
     if has["b"]:
-        folds = os.environ.get("DECODE_FOLDS", "1")   # 1 = train on all data; >1 = CV
+        # viz_folds=1 -> the continuous decoded_*.npz track plot_trials overlays is
+        # full-data (smooth). cv_folds -> the reported accuracy (comparison PDF +
+        # step-s summary) is cross-validated, i.e. tested on held-out data.
+        folds = os.environ.get("DECODE_FOLDS", "1")          # visualisation track
+        cv_folds = os.environ.get("DECODE_CV_FOLDS", "5")    # accuracy (held-out)
         # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
         # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
         leads = os.environ.get("DECODE_LEADS", "0 1 3").split()
         # always produce BOTH a good-only and a good+mua decode per session.
         qual_sets = [["good"], ["good", "mua"]]
         print("\n" + "=" * 56)
-        print(f"[MASTER] Running POSITION-DECODER sequentially "
-              f"(good and good+mua, folds: {folds}, leads: {' '.join(leads) or 'none'})...")
+        print(f"[MASTER] Running POSITION-DECODER sequentially (good and good+mua, "
+              f"viz folds: {folds}, CV folds: {cv_folds}, leads: {' '.join(leads) or 'none'})...")
         print("=" * 56)
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
@@ -526,8 +530,8 @@ def main():
                 for quals in qual_sets:
                     cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
                            "--config", config, "--folds", folds, "--quality", *quals]
-                    if leads:                   # multi-lead comparison PDF + lead-0 npz
-                        cmd += ["--leads", *leads]
+                    if leads:                   # CV accuracy PDF + full-data lead-0 npz
+                        cmd += ["--leads", *leads, "--cv_folds", cv_folds]
                     rc = run(cmd)
                     print(f"[DECODE {i}/{total}] units {'+'.join(quals)}: "
                           f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")

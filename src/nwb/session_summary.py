@@ -164,18 +164,36 @@ def _unit_metrics(nwb, udf, fs=30000.0):
     return out
 
 
+_DEC_QUALS = ("good", "good_mua")           # file tags
+_DEC_LEADS = (0.0, 1.0, 3.0)                 # prediction leads (s) shown in summary
+
+
+def _dec_key(qtag, lead):
+    return f"dec_err_{qtag}_lead{lead:g}"
+
+
 def _decode_accuracy(session_dir):
-    """Median decoding error (m) per unit set, read from the decoder's (step b)
-    decoded_*.npz. Returns {} when a session has no decoding output."""
+    """Median decoding error (m) per unit set AND per prediction lead, read from the
+    decoder's (step b) leads_summary_*.npz (falls back to decoded_*.npz for lead 0).
+    Returns {} when a session has no decoding output."""
     d = Path(session_dir) / "decoding"
     out = {}
-    for tag, key in (("good", "dec_err_good"), ("good_mua", "dec_err_good_mua")):
-        f = d / f"decoded_{tag}.npz"
+    for qtag in _DEC_QUALS:
+        f = d / f"leads_summary_{qtag}.npz"
         if f.exists():
             try:
                 z = np.load(f, allow_pickle=True)
+                for L, m in zip(np.asarray(z["leads"], float), np.asarray(z["median_err"], float)):
+                    out[_dec_key(qtag, float(L))] = float(m)
+                continue
+            except Exception:
+                pass
+        g = d / f"decoded_{qtag}.npz"          # fallback: lead-0 only
+        if g.exists():
+            try:
+                z = np.load(g, allow_pickle=True)
                 if "err" in z and len(z["err"]):
-                    out[key] = float(np.median(z["err"]))
+                    out[_dec_key(qtag, 0.0)] = float(np.median(z["err"]))
             except Exception:
                 pass
     return out
@@ -220,8 +238,10 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
         session = int(ses.group(1)) if ses else None
         out = {"animal": f"Rat{int(subj)}" if str(subj).isdigit() else str(subj),
                "date": date, "repeat": repeat, "session": session, "split": False,
-               "n_good": 0, "n_mua": 0, "n_pyr": 0, "n_int": 0,
-               "dec_err_good": np.nan, "dec_err_good_mua": np.nan}
+               "n_good": 0, "n_mua": 0, "n_pyr": 0, "n_int": 0}
+        for qtag in _DEC_QUALS:                        # decoding accuracy per lead
+            for L in _DEC_LEADS:
+                out[_dec_key(qtag, L)] = np.nan
         for k in _PF_KEYS:
             out[k] = np.nan; out[k + "_post"] = np.nan
         out.update(_decode_accuracy(nwb_path.parent))   # decoding accuracy (step b)
@@ -342,14 +362,23 @@ def _plot_animal(pdf, animal, sessions, units_df=None):
     any_split = any(s.get("split") for s in sessions)
     metric_axes = [axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1],
                    axes[3, 0], axes[3, 1], axes[4, 0]]
-    # decoding accuracy across sessions (median position-decoding error, step b)
+    # decoding accuracy across sessions (median error, step b) at every lead:
+    # colour = unit set (good/good+mua), line style = prediction lead (0/1/3 s).
     axd = axes[4, 1]
-    eg, em = col("dec_err_good"), col("dec_err_good_mua")
-    if np.isfinite(eg).any() or np.isfinite(em).any():
-        axd.plot(x, eg, "o-", color="#2166ac", label="good")
-        axd.plot(x, em, "s-", color="#b2182b", label="good+mua")
+    _qcol = {"good": "#2166ac", "good_mua": "#b2182b"}
+    _qlab = {"good": "good", "good_mua": "good+mua"}
+    _lsty = {0.0: "-", 1.0: "--", 3.0: ":"}
+    any_dec = False
+    for qtag in _DEC_QUALS:
+        for L in _DEC_LEADS:
+            vals = col(_dec_key(qtag, L))
+            if np.isfinite(vals).any():
+                any_dec = True
+                axd.plot(x, vals, marker="o", ms=4, color=_qcol[qtag],
+                         ls=_lsty.get(L, "-"), label=f"{_qlab[qtag]} +{L:g}s")
+    if any_dec:
         axd.set_title("decoding accuracy (median error)"); axd.set_ylabel("error (m)")
-        axd.legend(fontsize=8)
+        axd.legend(fontsize=6, ncol=2)
         axd.set_xticks(x); axd.set_xticklabels(labels, fontsize=6)
         axd.spines["top"].set_visible(False); axd.spines["right"].set_visible(False)
         axd.set_ylim(bottom=0)
@@ -510,7 +539,8 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
 
     # per-session summary table (before/after type5 columns for splits)
     cols = (["animal", "date", "repeat", "session", "split",
-             "n_good", "n_mua", "n_pyr", "n_int", "dec_err_good", "dec_err_good_mua"]
+             "n_good", "n_mua", "n_pyr", "n_int"]
+            + [_dec_key(q, L) for q in _DEC_QUALS for L in _DEC_LEADS]
             + [k for key in _PF_KEYS for k in (key, key + "_post")])
     df = pd.DataFrame([{c: s.get(c) for c in cols}
                        for animal in sorted(by_animal)

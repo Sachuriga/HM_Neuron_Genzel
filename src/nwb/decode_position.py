@@ -98,13 +98,28 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         piy = np.clip(np.digitize(y, ye) - 1, 0, ny - 1)
         pbid = piy * nx + pix                            # spatial bin per pos sample
 
-        # chunk / fold assignment (contiguous chunks, round-robin folds)
-        cedges = np.linspace(t[0], t[-1], n_chunks + 1)
-        samp_fold = (np.clip(np.digitize(t, cedges) - 1, 0, n_chunks - 1)) % folds
+        # decode time bins (spike counts + actual position per bin)
+        edges = np.arange(t[0], t[-1] + time_bin, time_bin)
+        nb = len(edges) - 1
+        if nb < 10:
+            print("  session too short — skipping."); return None
 
-        # per-spike spatial bin + fold. For prediction (lead_s>0) each spike is
-        # tied to the position lead_s seconds LATER, so tuning curves map spikes
-        # to the animal's future location.
+        # RANDOM k-fold cross-validation: assign every decode time-bin to a random
+        # fold; position samples and spikes inherit the fold of the bin they fall in.
+        # Random (not contiguous-in-time) folds keep every visited maze region in the
+        # training set, so no test bin lands in a place the model never saw — at the
+        # cost of some leakage between temporally adjacent bins.
+        rng = np.random.default_rng(0)
+        bin_fold = (rng.integers(0, folds, size=nb) if folds > 1
+                    else np.zeros(nb, dtype=int))
+
+        def _fold_of(times):
+            return bin_fold[np.clip(np.digitize(times, edges) - 1, 0, nb - 1)]
+        samp_fold = _fold_of(t)
+
+        # per-spike spatial bin + fold. For prediction (lead_s>0) each spike is tied
+        # to the position lead_s seconds LATER, so tuning curves map spikes to the
+        # animal's future location.
         spk = []
         for uid, st in units:
             sx = np.interp(st + lead_s, t, x, left=np.nan, right=np.nan)
@@ -112,14 +127,8 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
             ok = np.isfinite(sx) & np.isfinite(sy)
             sbid = (np.clip(np.digitize(sy[ok], ye) - 1, 0, ny - 1) * nx
                     + np.clip(np.digitize(sx[ok], xe) - 1, 0, nx - 1))
-            sfold = (np.clip(np.digitize(st[ok], cedges) - 1, 0, n_chunks - 1)) % folds
-            spk.append((sbid, sfold, st[ok]))
+            spk.append((sbid, _fold_of(st[ok]), st[ok]))
 
-        # decode time bins: spike counts + actual position + fold per bin
-        edges = np.arange(t[0], t[-1] + time_bin, time_bin)
-        nb = len(edges) - 1
-        if nb < 10:
-            print("  session too short — skipping."); return None
         counts = np.zeros((nU, nb))
         for u, (uid, st) in enumerate(units):
             counts[u], _ = np.histogram(st, bins=edges)
@@ -137,7 +146,6 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         else:
             ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
             ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
-        bin_fold = (np.clip(np.digitize(tc_mid, cedges) - 1, 0, n_chunks - 1)) % folds
 
         decoded_x = np.full(nb, np.nan); decoded_y = np.full(nb, np.nan)
         min_occ = 0.3                        # only decode over well-sampled bins (s)
@@ -307,25 +315,43 @@ def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities,
           f"chance {res['median_chance_m']:.2f} m)")
 
 
-def decode_leads(nwb_path, qualities, leads=(0.0, 1.0, 3.0), **kw):
+def decode_leads(nwb_path, qualities, leads=(0.0, 1.0, 3.0), cv_folds=5, viz_folds=1, **kw):
     """Decode at several prediction leads (seconds ahead) and write ONE combined
     comparison PDF. lead 0 = decode the current position; lead>0 = predict the
-    future position. The single-lead .npz files are NOT written here (save=False),
-    so the per-trial overlay used by plot_trials is left untouched."""
-    kw.pop("lead_s", None)
+    future position.
+
+    ACCURACY (the comparison PDF + leads_summary that feeds step s) is
+    CROSS-VALIDATED (cv_folds): tuning curves are fit on held-out data and tested
+    on unseen bins, so the reported error reflects generalisation, not in-sample
+    fit. The continuous VISUALISATION track that plot_trials overlays per trial is
+    written separately from a full-data (viz_folds, default 1) lead-0 decode."""
+    kw.pop("lead_s", None); kw.pop("folds", None)
     results = []
     for L in leads:
-        print(f"  lead {L:g}s ...", end=" ", flush=True)
-        # lead 0 == the ordinary decoded track: persist its .npz so plot_trials'
-        # per-trial overlay keeps working; other leads are comparison-only.
-        r = decode_session(nwb_path, qualities, lead_s=float(L),
-                           save=(float(L) == 0.0), plot=False, **kw)
+        print(f"  lead {L:g}s (CV {cv_folds}-fold) ...", end=" ", flush=True)
+        r = decode_session(nwb_path, qualities, lead_s=float(L), folds=cv_folds,
+                           save=False, plot=False, **kw)
         if r is None:
             print("skipped."); continue
         print(f"median err {r['median_err_m']:.2f} m")
         results.append(r)
-    if results:
-        _plot_leads(nwb_path, qualities, results)
+    if not results:
+        return results
+    # visualisation track for plot_trials: full-data (in-sample) lead-0 decode, saved
+    # as decoded_<tag>.npz — smooth continuous trace for the per-trial overlay only.
+    decode_session(nwb_path, qualities, lead_s=0.0, folds=viz_folds,
+                   save=True, plot=False, **kw)
+    # small per-lead accuracy summary so the cross-session summary (step s) can plot
+    # decoding accuracy at every lead without re-decoding (cross-validated values).
+    out_dir = nwb_path.parent / "decoding"; out_dir.mkdir(exist_ok=True)
+    tag = "_".join(sorted(qualities))
+    np.savez(out_dir / f"leads_summary_{tag}.npz",
+             leads=np.array([r["lead_s"] for r in results], float),
+             median_err=np.array([r["median_err_m"] for r in results], float),
+             mean_err=np.array([r["mean_err_m"] for r in results], float),
+             chance=float(np.median(results[0]["chance"])), cv_folds=int(cv_folds),
+             quality=tag)
+    _plot_leads(nwb_path, qualities, results)
     return results
 
 
@@ -532,12 +558,16 @@ if __name__ == "__main__":
                          "(0 = decode current position; e.g. --lead_s 1.0).")
     ap.add_argument("--leads", type=float, nargs="+", default=None,
                     help="compare several prediction leads in ONE PDF, e.g. "
-                         "--leads 0 1 3 (writes decode_leads_<quality>.pdf, no npz).")
+                         "--leads 0 1 3. Accuracy is cross-validated (--cv_folds); "
+                         "the lead-0 visualisation track (decoded_<q>.npz) is full-data.")
+    ap.add_argument("--cv_folds", type=int, default=5,
+                    help="cross-validation folds for the multi-lead accuracy (default 5).")
     args = ap.parse_args()
     try:
         if args.leads:
             run(args.output_folder, args.quality, leads=args.leads,
-                bin_cm=args.bin_cm, time_bin=args.time_bin, folds=args.folds)
+                bin_cm=args.bin_cm, time_bin=args.time_bin,
+                cv_folds=args.cv_folds, viz_folds=args.folds)
         else:
             run(args.output_folder, args.quality, bin_cm=args.bin_cm,
                 time_bin=args.time_bin, folds=args.folds, lead_s=args.lead_s)
