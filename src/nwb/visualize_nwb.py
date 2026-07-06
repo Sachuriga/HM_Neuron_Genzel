@@ -281,7 +281,9 @@ def place_field_metrics(x, y, t, spike_times, extent, bins, dt, sigma, speed_thr
     rate, occ, ext = make_rate_map(x, y, t, spike_times, extent, bins, dt, sigma,
                                    t0=t0, t1=t1, speed_thresh=speed_thresh, return_occ=True)
     nan = {"n_fields": 0, "spatial_info": np.nan, "selectivity": np.nan,
-           "field_goal_m": np.nan, "peak": 0.0}
+           "field_goal_m": np.nan, "field_goal_largest_m": np.nan,
+           "field_goal_2ndlargest_m": np.nan, "field_goal_smallest_m": np.nan,
+           "peak": 0.0}
     if rate is None or not rate.count():
         return nan, rate, ext
     lam = rate.filled(0.0)
@@ -303,17 +305,28 @@ def place_field_metrics(x, y, t, spike_times, extent, bins, dt, sigma, speed_thr
     # all place fields + centroids (a cell can have several on this large maze)
     fields = place_fields(rate, field_frac, min_peak_hz, min_field_bins)
     ny, nx = rate.shape
-    dists = []
+    dists, sizes = [], []
     n_fields = len(fields)
     for comp in fields:
         iy, ix = np.where(comp)
         cx = ext[0] + (ix.mean() + 0.5) * (ext[1] - ext[0]) / nx
         cy = ext[2] + (iy.mean() + 0.5) * (ext[3] - ext[2]) / ny
-        if goal_xy is not None:
-            dists.append(float(np.hypot(cx - goal_xy[0], cy - goal_xy[1])))
+        sizes.append(int(comp.sum()))
+        dists.append(float(np.hypot(cx - goal_xy[0], cy - goal_xy[1]))
+                     if goal_xy is not None else np.nan)
+    # per-field distances ranked by field size (bins): largest / 2nd-largest / smallest
+    largest = second = smallest = np.nan
+    if dists and goal_xy is not None:
+        order = np.argsort(sizes)[::-1]          # descending by size
+        largest = dists[order[0]]
+        second = dists[order[1]] if len(order) >= 2 else np.nan
+        smallest = dists[order[-1]]              # smallest field
     return ({"n_fields": n_fields, "spatial_info": spatial_info,
              "selectivity": selectivity,
-             "field_goal_m": float(np.mean(dists)) if dists else np.nan,
+             "field_goal_m": float(np.nanmean(dists)) if np.any(np.isfinite(dists)) else np.nan,
+             "field_goal_largest_m": largest,
+             "field_goal_2ndlargest_m": second,
+             "field_goal_smallest_m": smallest,
              "peak": peak}, rate, ext)
 
 

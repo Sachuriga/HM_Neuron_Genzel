@@ -53,7 +53,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import visualize_nwb as V          # load_position, place_field_metrics, load_nodes, ...
 import spike_metrics as SM         # waveform_metrics, acg_tau_rise, classify_cell_type
 
-_PF_KEYS = ("spatial_info", "selectivity", "n_fields", "field_goal_m")
+_PF_KEYS = ("spatial_info", "selectivity", "n_fields", "field_goal_m",
+            "field_goal_largest_m", "field_goal_2ndlargest_m", "field_goal_smallest_m")
+_PF_PLOT = [("spatial_info", "pyramidal spatial information", "bits/spike"),
+            ("selectivity", "pyramidal selectivity", "peak/mean"),
+            ("n_fields", "pyramidal # place fields", "n fields"),
+            ("field_goal_m", "field-to-goal (mean of all fields)", "metres"),
+            ("field_goal_largest_m", "field-to-goal (largest field)", "metres"),
+            ("field_goal_2ndlargest_m", "field-to-goal (2nd-largest field)", "metres"),
+            ("field_goal_smallest_m", "field-to-goal (smallest field)", "metres")]
 # 3-way subtype colours for the cell-type scatter
 SUBTYPE_COLORS = {"pyramidal": "#2166ac",            # blue
                   "narrow interneuron": "#d62728",   # red
@@ -300,7 +308,7 @@ def _plot_animal(pdf, animal, sessions, units_df=None):
     def col(key):
         return np.array([s[key] if s[key] is not None else np.nan for s in sessions], dtype=float)
 
-    fig, axes = plt.subplots(3, 2, figsize=(11, 12))
+    fig, axes = plt.subplots(5, 2, figsize=(11, 18))
     # units: good vs mua
     ax = axes[0, 0]; w = 0.4
     ax.bar(x - w / 2, col("n_good"), w, label="good", color="#2166ac")
@@ -313,12 +321,10 @@ def _plot_animal(pdf, animal, sessions, units_df=None):
     ax.set_title("good units: pyramidal vs interneuron"); ax.set_ylabel("count"); ax.legend(fontsize=8)
     # pyramidal metrics: "pre / whole" line + "after type5" markers (RxS1 splits)
     any_split = any(s.get("split") for s in sessions)
-    for ax, key, title, ylab in [
-        (axes[1, 0], "spatial_info", "pyramidal spatial information", "bits/spike"),
-        (axes[1, 1], "selectivity", "pyramidal selectivity", "peak/mean"),
-        (axes[2, 0], "n_fields", "pyramidal # place fields", "mean n fields"),
-        (axes[2, 1], "field_goal_m", "pyramidal field-to-goal distance", "metres"),
-    ]:
+    metric_axes = [axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1],
+                   axes[3, 0], axes[3, 1], axes[4, 0]]
+    axes[4, 1].axis("off")
+    for ax, (key, title, ylab) in zip(metric_axes, _PF_PLOT):
         ax.plot(x, col(key), "o-", color="#2166ac",
                 label="whole / before type5" if any_split else None)
         if any_split:
@@ -331,7 +337,7 @@ def _plot_animal(pdf, animal, sessions, units_df=None):
                 ax.text(0.98, 0.03, f"1-way ANOVA p={p:.3g} (k={k})", transform=ax.transAxes,
                         ha="right", va="bottom", fontsize=7,
                         color="#b2182b" if p < 0.05 else "0.3")
-    for ax in axes.ravel():
+    for ax in [axes[0, 0], axes[0, 1]] + metric_axes:
         ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=6, rotation=0)
         ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
         ax.set_ylim(bottom=0)          # all summary axes start from 0
@@ -376,13 +382,9 @@ def _plot_combined(pdf, units_all):
     """All animals pooled: pyramidal place-field metrics per session (grouped by
     R{repeat}S{session} label), box + mean, annotated with the pooled one-way ANOVA."""
     d = units_all[units_all["epoch"].isin(["whole", "before"])].copy()
-    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
-    for ax, (key, title, ylab) in zip(axes.ravel(), [
-        ("spatial_info", "pyramidal spatial information", "bits/spike"),
-        ("selectivity", "pyramidal selectivity", "peak/mean"),
-        ("n_fields", "pyramidal # place fields", "n fields"),
-        ("field_goal_m", "pyramidal field-to-goal distance", "metres"),
-    ]):
+    fig, axes = plt.subplots(4, 2, figsize=(11, 17))
+    axes.ravel()[-1].axis("off")
+    for ax, (key, title, ylab) in zip(axes.ravel(), _PF_PLOT):
         groups = _groups_by(d, "session_label", key)
         labs = [l for l in _label_order(groups) if len(groups[l])]
         data = [groups[l] for l in labs]
