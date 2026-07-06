@@ -119,14 +119,68 @@ def load_position(nwb):
     return x[order], y[order], t[order]
 
 
+def _pick_file(op, pat):
+    """First op-folder file matching `pat`, skipping macOS AppleDouble sidecars
+    ("._*") that glob would otherwise return first."""
+    return next((p for p in sorted(Path(op).glob(pat))
+                 if not p.name.startswith("._")), None)
+
+
+def _read_csv_tol(p):
+    """read_csv tolerant of the non-UTF-8 bytes (e.g. a degree sign) that some
+    framewise CSVs carry in their headers."""
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return pd.read_csv(p, encoding=enc)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return pd.read_csv(p, encoding="utf-8", encoding_errors="ignore")
+
+
+def _first_int(v):
+    """First integer in a scalar or comma-list (Start_Nodes may be '224' or
+    '224,315'); None if unparseable."""
+    try:
+        return int(str(v).split(",")[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def read_trial_meta(op_folder):
+    """Per-trial (type, goal_node, start_node) from RecordingMeta.xlsx, keyed by
+    1-based trial number (row order == Trial_Num in the coordinate file). Rows are
+    NOT skipped, so numbering stays aligned with the position data's Trial_Num."""
+    meta = _pick_file(op_folder, "RecordingMeta.xlsx") or _pick_file(op_folder, "*RecordingMeta.xlsx")
+    if meta is None:
+        return {}
+    try:
+        df = pd.read_excel(meta, sheet_name=0)
+    except Exception as e:
+        print(f"  Could not read RecordingMeta.xlsx ({e}).")
+        return {}
+    out = {}
+    for i, r in enumerate(df.itertuples(index=False), start=1):
+        d = r._asdict()
+        try:
+            ttype = int(d.get("Trial_Type"))
+        except (TypeError, ValueError):
+            ttype = -1
+        goal = int(d["Goal_Node"]) if pd.notna(d.get("Goal_Node")) else None
+        start = _first_int(d["Start_Nodes"]) if pd.notna(d.get("Start_Nodes")) else None
+        out[i] = (ttype, goal, start)
+    return out
+
+
 def read_trials_raw(op_folder):
     """Per-trial (type, goal_node, start_node, start_unix, end_unix) from
-    RecordingMeta.xlsx, in the raw unix clock. Returns [] if unavailable."""
-    metas = list(Path(op_folder).glob("RecordingMeta.xlsx"))
-    if not metas:
+    RecordingMeta.xlsx, in the raw behavioural-sync unix clock. Fallback only —
+    that clock is offset (and drifts) relative to the video/position clock, so it
+    is not used when the coordinate Trial_Num blocks are available. [] if absent."""
+    meta = _pick_file(op_folder, "RecordingMeta.xlsx") or _pick_file(op_folder, "*RecordingMeta.xlsx")
+    if meta is None:
         return []
     try:
-        df = pd.read_excel(metas[0], sheet_name=0)
+        df = pd.read_excel(meta, sheet_name=0)
     except Exception as e:
         print(f"  Could not read RecordingMeta.xlsx ({e}).")
         return []
@@ -134,14 +188,6 @@ def read_trials_raw(op_folder):
     if not need <= set(df.columns):
         print("  RecordingMeta.xlsx missing Trial_Type/trial_start_time/trial_end_time.")
         return []
-
-    def _first_int(v):
-        # Start_Nodes may be a single node or a comma-list; take the first.
-        try:
-            return int(str(v).split(",")[0])
-        except (TypeError, ValueError):
-            return None
-
     trials = []
     for _, r in df.iterrows():
         if pd.isna(r["trial_start_time"]) or pd.isna(r["trial_end_time"]):
@@ -157,12 +203,72 @@ def read_trials_raw(op_folder):
     return trials
 
 
+def frame_to_seconds(op_folder):
+    """{frame_number: seconds} from stitched_framewise_seconds.csv
+    ('Seconds From Creation'), which IS the clock the NWB position/spike
+    timestamps use. None if unavailable."""
+    st = _pick_file(op_folder, "*stitched_framewise_seconds.csv")
+    if st is None:
+        return None
+    try:
+        df = _read_csv_tol(st)
+    except Exception as e:
+        print(f"  Could not read stitched_framewise_seconds.csv ({e}).")
+        return None
+    fcol = next((c for c in df.columns if "frame" in c.lower()), None)
+    scol = next((c for c in df.columns if "second" in c.lower()), None)
+    if fcol is None or scol is None:
+        return None
+    frames = pd.to_numeric(df[fcol], errors="coerce")
+    secs = pd.to_numeric(df[scol], errors="coerce")
+    ok = frames.notna() & secs.notna()
+    return dict(zip(frames[ok].astype(int), secs[ok].astype(float)))
+
+
+def build_trials(op_folder, nwb_start, t_min, t_max):
+    """Per-trial (type, goal_node, start_node, t0, t1) on the NWB seconds clock.
+
+    Trial windows come from the coordinate file's Trial_Num blocks mapped to
+    seconds via stitched_framewise_seconds.csv — the SAME source plot_trials.py
+    uses — so step v's per-trial panels align with the positions/spikes and with
+    plot_trials. (RecordingMeta's trial_start/end_time live on the behavioural
+    sync clock, which is offset from and drifts against the video clock, so they
+    misplace every trial; they are only a last-resort fallback.) Metadata
+    (type/goal/start) is joined from RecordingMeta by Trial_Num.
+    Falls back to align_trials(read_trials_raw(...)) if the coordinate/seconds
+    files are missing."""
+    coords = (_pick_file(op_folder, "*Coordinates_Full_with_frames.csv")
+              or _pick_file(op_folder, "*Coordinates_Full.csv"))
+    f2s = frame_to_seconds(op_folder)
+    meta = read_trial_meta(op_folder)
+    if coords is not None and f2s is not None:
+        try:
+            cf = _read_csv_tol(coords)
+        except Exception as e:
+            print(f"  Could not read {coords.name} ({e}); falling back to RecordingMeta times.")
+            cf = None
+        if cf is not None and {"Trial_Num", "Frame_Index"} <= set(cf.columns):
+            sec = pd.to_numeric(cf["Frame_Index"], errors="coerce").map(f2s)
+            tnum = pd.to_numeric(cf["Trial_Num"], errors="coerce")
+            trials = []
+            for k, grp in sec.groupby(tnum):
+                g = grp.dropna()
+                if g.empty:
+                    continue
+                tt, goal, start = meta.get(int(k), (-1, None, None))
+                trials.append((tt, goal, start, float(g.min()), float(g.max())))
+            if trials:
+                trials.sort(key=lambda r: r[3])
+                return trials
+            print("  No Trial_Num blocks resolved to seconds; falling back to RecordingMeta times.")
+    return align_trials(read_trials_raw(op_folder), nwb_start, t_min, t_max)
+
+
 def align_trials(raw_trials, nwb_start, t_min, t_max):
-    """Convert raw-unix trials to session-relative seconds, auto-picking the
-    relative-zero unix. New NWBs store a correct session_start_time (fixed
-    create_nwb), but older ones are off by the tz offset (session_start_time was
-    tz-stamped without converting). We try both readings and keep whichever lands
-    the most trials inside the recording's position coverage [t_min, t_max].
+    """Fallback: convert raw-unix RecordingMeta trials to session-relative seconds
+    when the coordinate Trial_Num blocks are unavailable. Recovers the relative
+    zero from session_start_time, trying both the aware and tz-replaced readings
+    and keeping whichever lands the most trials inside [t_min, t_max].
     Returns [(type, goal_node, start_node, t0_rel, t1_rel), ...]."""
     if not raw_trials:
         return []
@@ -659,11 +765,11 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
               f"pyr={int((good['cell_type']=='pyramidal').sum())} "
               f"int={int((good['cell_type']=='interneuron').sum())} | waveforms={has_wf}")
 
-        # trials aligned to the position clock (auto-picks the offset so both the
-        # fixed and legacy-tz NWBs work — see align_trials).
+        # trials on the position/spike seconds clock, from the coordinate
+        # Trial_Num blocks (same source as plot_trials) — see build_trials.
         if pos is not None:
-            trials = align_trials(read_trials_raw(output_folder),
-                                  nwb.session_start_time, float(t.min()), float(t.max()))
+            trials = build_trials(output_folder, nwb.session_start_time,
+                                  float(t.min()), float(t.max()))
         else:
             trials = []
         nodes = load_nodes()   # maze-node coords (metres) to mark the goal node
