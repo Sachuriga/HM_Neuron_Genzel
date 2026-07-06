@@ -185,8 +185,11 @@ def run(cmd, cwd=None, out=None):
     cmd = [str(c) for c in cmd]
     banner = "    $ " + " ".join(cmd)
     print(banner, file=out, flush=True) if out else print(banner)
+    # Force child processes to emit UTF-8 so Unicode in their prints (e.g. the '->'
+    # arrow) does not crash on Windows' default cp1252 console/file encoding.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     try:
-        return subprocess.run(cmd, cwd=cwd, stdout=out, stderr=out).returncode
+        return subprocess.run(cmd, cwd=cwd, stdout=out, stderr=out, env=env).returncode
     except FileNotFoundError as e:
         msg = f"    [ERROR] command not found: {e}"
         print(msg, file=out, flush=True) if out else print(msg)

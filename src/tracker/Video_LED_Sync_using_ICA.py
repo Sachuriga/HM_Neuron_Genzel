@@ -7,6 +7,14 @@ Based on / modified from: https://github.com/genzellab/HM_RAT
 """
 
 import os
+import sys
+# Windows' default console/file encoding (cp1252) cannot encode characters like the
+# '->' arrow used in some prints; force UTF-8 so those prints never crash the run.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import cv2
 import matplotlib
 # Force matplotlib to not use any Xwindow backend.
