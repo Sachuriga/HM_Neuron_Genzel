@@ -17,6 +17,15 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 #                  still covers every frame — only detection/fitting is windowed.
 #                  Defaults to 45 if omitted. Set 0 to disable.
 SYNC_START_SEC=45
+# SYNC_LED       : which LED drives the sync regression.
+#                    auto (default) : prefer blue, fall back to red
+#                    red            : force RED (continuous) — use when the blue
+#                                     LED drops out mid-session but red stays on
+#                    blue           : force BLUE
+#                  The fit is a global line over matched blink edges, so a gap in
+#                  one LED does not break alignment as long as the driving LED has
+#                  edges before and after the gap.
+SYNC_LED=auto
 
 # NWB step (menu [w] nwblfp): rat number passed as --rat_nr to create_nwb.py.
 # Defaults to 1 if not set.

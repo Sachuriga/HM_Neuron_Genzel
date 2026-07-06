@@ -257,6 +257,7 @@ def run_worker(ip, op, steps, out):
 
     freq = os.environ.get("FREQ", FREQ)
     sync_start = os.environ.get("SYNC_START_SEC", "45")
+    sync_led = os.environ.get("SYNC_LED", "auto")        # auto|red|blue (which LED drives sync)
     vcodec = os.environ.get("FFMPEG_VCODEC", "h264_nvenc")
     recs = sorted(ip.glob("*.rec"))
 
@@ -294,9 +295,11 @@ def run_worker(ip, op, steps, out):
 
     # --- STEP 2: LED sync ---
     if "2" in steps and Path("./src/tracker/Video_LED_Sync_using_ICA.py").exists():
-        log(out, f"[STEP 2] Running Sync Script (LED detection starts after {sync_start}s)...")
+        log(out, f"[STEP 2] Running Sync Script (LED detection starts after {sync_start}s, "
+                 f"sync LED: {sync_led})...")
         run([PYTHON, "-u", "./src/tracker/Video_LED_Sync_using_ICA.py",
-             "-i", ip, "-o", op, "-f", freq, "--start-sec", sync_start], out=out)
+             "-i", ip, "-o", op, "-f", freq, "--start-sec", sync_start,
+             "--sync-led", sync_led], out=out)
 
     # --- STEP 3: stitching ---
     if "3" in steps and Path("./src/tracker/join_views.py").exists():

@@ -957,11 +957,19 @@ if __name__ == "__main__":
                         help="Write LED-detection diagnostics to <output>/sync_debug/ "
                              "(localization overlay, crop trace, ICA traces, and "
                              "per-video/per-component CSV summaries).")
-    parser.add_argument("--start-sec", dest='start_sec', type=float, default=SYNC_START_SEC,
+    parser.add_argument("--start-sec", dest='start_sec', type=float,
+                        default=float(os.environ.get('SYNC_START_SEC', SYNC_START_SEC)),
                         help="Skip the first N seconds of each eye video when "
-                             "locating/detecting the LED (default 45; the LED was "
-                             "repositioned early in the session). The per-frame "
+                             "locating/detecting the LED (default 45, or $SYNC_START_SEC; "
+                             "the LED was repositioned early in the session). The per-frame "
                              "timestamp output still covers every frame. Set 0 to disable.")
+    parser.add_argument("--sync-led", dest='sync_led',
+                        default=os.environ.get('SYNC_LED', 'auto').lower(),
+                        choices=['auto', 'red', 'blue'],
+                        help="Which LED drives the sync regression: 'auto' (default; "
+                             "prefer blue, else red), or force 'red'/'blue'. Use 'red' "
+                             "when the blue LED drops out mid-session but red stays on "
+                             "(red is continuous, so the fit is more robust).")
     args = parser.parse_args()
 
     if args.input_path is None:
@@ -1028,7 +1036,21 @@ if __name__ == "__main__":
     # either LED, so only the edge-train alignment differs.
     have_blue = any(df.shape[0] > 0 for df in blue_ica_list)
     have_red  = any(df.shape[0] > 0 for df in red_ica_list)
-    if have_blue:
+    forced_led = getattr(args, 'sync_led', 'auto')
+    if forced_led == 'red' and have_red:
+        print("[sync] SYNC_LED=red: forcing the RED LED to drive the sync "
+              "(robust when blue drops out mid-session but red stays on).")
+        sync_color = 'red'
+    elif forced_led == 'blue' and have_blue:
+        print("[sync] SYNC_LED=blue: forcing the BLUE LED to drive the sync.")
+        sync_color = 'blue'
+    elif forced_led in ('red', 'blue'):
+        print(f"[WARN] SYNC_LED={forced_led} requested but that LED was not detected "
+              f"in any video — falling back to auto.")
+        sync_color = 'blue' if have_blue else ('red' if have_red else None)
+        if sync_color is None:
+            sys.exit("[ERROR] Neither blue nor red LED detected in any video; cannot sync this folder.")
+    elif have_blue:
         sync_color = 'blue'
     elif have_red:
         print("[WARN] No blue LED detected in any video — falling back to RED LED for sync.")
