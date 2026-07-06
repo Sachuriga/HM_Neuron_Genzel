@@ -25,6 +25,8 @@
 import os
 import sys
 import time
+import json
+import shlex
 import shutil
 import tempfile
 import threading
@@ -194,6 +196,40 @@ def run(cmd, cwd=None, out=None):
         msg = f"    [ERROR] command not found: {e}"
         print(msg, file=out, flush=True) if out else print(msg)
         return 127
+
+
+def launch_worker_window(ip, op, steps, marker, title):
+    """Open a NEW terminal window running one parallel worker, so its progress is
+    visible live (the pre-unification 'Job-<ip>' console behaviour). The worker
+    writes `marker` when it finishes so the master can wait for it. Returns True if
+    a window was opened, False to fall back to an in-process background thread."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    args = [sys.executable or PYTHON, "-u", os.path.join(repo, "runner.py"),
+            "--worker", str(ip), str(op), steps, str(marker)]
+    try:
+        if sys.platform.startswith("win"):
+            # start "title" cmd /k <cmd>  — new console that stays open when done.
+            inner = subprocess.list2cmdline(args)
+            subprocess.Popen(f'start "HM Job-{title}" cmd /k {inner}',
+                             shell=True, cwd=repo)
+            return True
+        if sys.platform == "darwin":
+            cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(a) for a in args)
+            subprocess.Popen(["osascript", "-e",
+                              f'tell application "Terminal" to do script {json.dumps(cmd)}'])
+            return True
+        cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(a) for a in args) + "; exec bash"
+        for term in (["gnome-terminal", "--"], ["konsole", "-e"],
+                     ["x-terminal-emulator", "-e"], ["xterm", "-e"]):
+            try:
+                subprocess.Popen(term + ["bash", "-lc", cmd])
+                return True
+            except FileNotFoundError:
+                continue
+        return False
+    except Exception as e:
+        print(f"[WARN] could not open a worker window for {title}: {e}")
+        return False
 
 
 def _tool(var):
@@ -442,28 +478,42 @@ def main():
         print(f"[DEBUG] ip-independent step targets: "
               f"{', '.join(op.name for _i, op in seq_ops)}")
 
-    # --- Launch parallel workers (one background thread per ip/op pair) ---
+    # --- Launch parallel workers. By default each opens its OWN terminal window so
+    # its progress is visible live (set WORKER_WINDOWS=0 to run them as quiet
+    # background threads logging to files instead). ---
     tmp = Path(tempfile.gettempdir())
-    threads, logs, count = [], [], 0
+    use_windows = os.environ.get("WORKER_WINDOWS", "1") != "0"
+    threads, markers, count = [], [], 0
     if parallel_trim:
         for ip_path, op_path in ops:
             print(f"\n[QUEUE] Preparing: {ip_path.name}")
             wait_for_resources()
             count += 1
-            logpath = tmp / f"hm_worker_{ip_path.name}.log"
-            logs.append(logpath)
-            print(f"[MASTER] Launching worker for {ip_path.name} (log: {logpath})")
-            logf = open(logpath, "w")
+            name = ip_path.name
+            marker = tmp / f"hm_worker_{name}.done"
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            opened = launch_worker_window(ip_path, op_path, parallel_steps, marker, name) \
+                if use_windows else False
+            if opened:
+                markers.append((marker, name))
+                print(f"[MASTER] Job launched in its own window: Job-{name}")
+            else:                                   # fallback: background thread + log file
+                logpath = tmp / f"hm_worker_{name}.log"
+                print(f"[MASTER] Launching worker for {name} (log: {logpath})")
+                logf = open(logpath, "w")
 
-            def _job(ip=ip_path, op=op_path, lf=logf):
-                try:
-                    run_worker(ip, op, parallel_steps, lf)
-                finally:
-                    lf.close()
+                def _job(ip=ip_path, op=op_path, lf=logf):
+                    try:
+                        run_worker(ip, op, parallel_steps, lf)
+                    finally:
+                        lf.close()
 
-            t = threading.Thread(target=_job, daemon=True)
-            t.start()
-            threads.append(t)
+                t = threading.Thread(target=_job, daemon=True)
+                t.start()
+                threads.append((t, name))
             print(f"[MASTER] Job launched. Waiting {LAUNCH_GAP}s for stability...")
             time.sleep(LAUNCH_GAP)
 
@@ -471,9 +521,13 @@ def main():
         print("\n" + "=" * 56)
         print(f"[MASTER] Launched {count} parallel job(s). Waiting for all to finish...")
         print("=" * 56)
-        for t, lp in zip(threads, logs):
+        for marker, name in markers:            # windowed workers signal via a marker file
+            while not marker.exists():
+                time.sleep(2)
+            print(f"[MASTER] Worker finished: Job-{name}")
+        for t, name in threads:                 # background-thread workers
             t.join()
-            print(f"[MASTER] Worker finished (log: {lp})")
+            print(f"[MASTER] Worker finished: {name}")
         print("[MASTER] All parallel workers have completed.")
 
     # --- Sequential master steps, in fixed order ---
@@ -577,5 +631,32 @@ def main():
     print("=" * 56)
 
 
+def _worker_main(argv):
+    """Entry point for a single parallel worker launched in its own terminal
+    window: `runner.py --worker <ip> <op> <steps> [<marker>]`. Runs the worker with
+    output to this console and touches <marker> on completion so the master waits."""
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))   # scripts use ./src/... paths
+    ip, op, steps = argv[0], argv[1], argv[2]
+    marker = argv[3] if len(argv) > 3 else None
+    load_config()                                          # inherit paths/FREQ/etc. into env
+    try:
+        run_worker(Path(ip), Path(op), steps, sys.stdout)
+    finally:
+        if marker:
+            try:
+                Path(marker).write_text("done")
+            except Exception:
+                pass
+        print("\n[WORKER] Finished. You can close this window.")
+
+
 if __name__ == "__main__":
-    main()
+    for _s in (sys.stdout, sys.stderr):        # UTF-8 console so '->' etc. never crash
+        try:
+            _s.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        _worker_main(sys.argv[2:])
+    else:
+        main()
