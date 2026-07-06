@@ -271,6 +271,41 @@ def _load_crop_overrides(path):
     return overrides
 
 
+def _load_ica_overrides(path):
+    """Optional per-file override for WHICH demixed ICA component is the BLUE / RED
+    LED, for videos where auto-classification fails — e.g. the blue LED only blinks
+    briefly and its measured frequency misses the 2.5 Hz acceptance gate.
+
+    Reads 'led_ica_override.txt' (or .csv) in the input folder — lines of
+    'filename, color, component_index' ('#' comments allowed), color in {blue, red}.
+    ICA is seeded (random_state=0), so 'ICA signal number: N' is reproducible across
+    runs and safe to pin. Example:
+        eye04_2026-06-24_11-10-42.mp4, blue, 2
+    Returns {basename: {'blue': idx, 'red': idx}}.
+    """
+    out = {}
+    for name in ("led_ica_override.txt", "led_ica_override.csv"):
+        f = path / name
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                fname, color, comp = [p.strip() for p in line.split(",")]
+                color = color.lower()
+                if color not in ("blue", "red"):
+                    raise ValueError
+                out.setdefault(Path(fname).name, {})[color] = int(comp)
+            except ValueError:
+                print(f"[ica-override] Skipping malformed line: {line!r}")
+        break
+    if out:
+        print(f"[ica-override] Loaded component overrides: {out}")
+    return out
+
+
 def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True, info=True):
     path = Path(basepath).resolve()
     all_videos = list(sorted(path.glob('*eye*.mp4')))
@@ -356,7 +391,7 @@ def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True,
     return videos_filepath_list, crop_xy_dict, meta_filepath_list, dio_file_path_dict
 
 
-def process_ica_signals(demixed, mix_weights, time_meta, debug_stem=None):
+def process_ica_signals(demixed, mix_weights, time_meta, debug_stem=None, force=None):
     fps = 30.0
     eD = 0.5       # expected Duty cycle of 0.5
     ef_red = 0.5   # expected frequency of 0.5 Hz
@@ -400,6 +435,23 @@ def process_ica_signals(demixed, mix_weights, time_meta, debug_stem=None):
         signal_color = good_freq.argmax() if is_signal else None
         print(f"ICA signal number: {n}, DutyCycle:{duty_cycle}, Freq:{freq}")
         sig_col = colors[signal_color]
+
+        # Manual override: force a specific component as blue/red regardless of the
+        # duty-cycle / frequency gates (led_ica_override.txt). A forced colour is
+        # claimed ONLY by its component, so no other component can steal it.
+        if force:
+            fb, fr = force.get('blue'), force.get('red')
+            if n == fb:
+                sig_col = 'blue'
+                print(f"  [ica-override] component {n} forced as BLUE")
+            elif n == fr:
+                sig_col = 'red'
+                print(f"  [ica-override] component {n} forced as RED")
+            else:
+                if sig_col == 'blue' and fb is not None:
+                    sig_col = 'gray'
+                if sig_col == 'red' and fr is not None:
+                    sig_col = 'gray'
 
         if DEBUG.enabled:
             debug_states.append((demixed[:, n].copy(), y_km.copy()))
@@ -575,8 +627,9 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
     mix_weights = ica.mixing_.mean(axis=0)
 
     debug_stem = Path(file_path).stem if DEBUG.enabled else None
+    force = _load_ica_overrides(Path(file_path).parent).get(Path(file_path).name)
     red_ica_df, blue_ica_df = process_ica_signals(
-        demixed, mix_weights, win_ts, debug_stem=debug_stem)
+        demixed, mix_weights, win_ts, debug_stem=debug_stem, force=force)
 
     return red_ica_df, blue_ica_df, full_frame_ts
 
