@@ -325,8 +325,75 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
     _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos, inv_rows)
 
 
+def _hsize(n):
+    """Human-readable byte size."""
+    if n is None or n < 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def _write_inventory_md(root, inv_rows, file_rows):
+    """Readable per-animal / per-session / per-folder file listing. Camera folders
+    are collapsed to one line (12x eye*.mp4); recording folders list each file
+    with its size. Zero-byte and cross-rat files are flagged inline."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # index file rows by (rat, session, folder), preserving insertion order
+    per_folder = {}
+    for r in file_rows:
+        per_folder.setdefault((r["rat"], r["session"], r["folder"]), []).append(r)
+    inv_by = {(r["rat"], r["session"]): r for r in inv_rows}
+    rats = sorted({r["rat"] for r in inv_rows})
+
+    lines = [f"# Drive inventory — {root}", f"_{ts}_", ""]
+    for rat in rats:
+        sessions = sorted({s for (rr, s) in inv_by if rr == rat})
+        ne = sum(inv_by[(rat, s)]["has_ephys"] for s in sessions)
+        lines.append(f"## {rat} — {len(sessions)} session(s), {ne} with ephys")
+        for s in sessions:
+            iv = inv_by[(rat, s)]
+            head = iv["phases"] if iv["has_ephys"] else "no ephys"
+            lines.append(f"### {s} — {head}  ·  ephys {iv['ephys_gb']} GB  ·  video {iv['video_gb']} GB")
+            folders = [k[2] for k in per_folder if k[0] == rat and k[1] == s]
+            for folder in folders:
+                rows = per_folder[(rat, s, folder)]
+                vids = [x for x in rows if x["type"] == "video"]
+                metas = [x for x in rows if x["type"] == "meta"]
+                rest = [x for x in rows if x["type"] not in ("video", "meta")]
+                if vids:                                   # camera folder — collapse
+                    tot = sum(max(x["size_bytes"], 0) for x in vids)
+                    bad0 = sum(1 for x in vids if x["size_bytes"] == 0)
+                    extra = f", {len(metas)}x .meta" if metas else ""
+                    warn = f"  ⚠ {bad0} zero-byte" if bad0 else ""
+                    lines.append(f"- 📹 `{folder}` — {len(vids)}x video ({_hsize(tot)}){extra}{warn}")
+                    for x in rest:
+                        lines.append(f"    - `{x['file']}` — {_hsize(x['size_bytes'])}")
+                else:                                      # recording folder — list files
+                    ph = _classify_phase(folder)
+                    lines.append(f"- 🧠 `{folder}`" + (f"  _[{ph}]_" if ph else "  _[phase?]_"))
+                    for x in sorted(rows, key=lambda z: z["file"]):
+                        flags = ""
+                        if x["size_bytes"] == 0:
+                            flags += "  ⚠ 0 bytes"
+                        rno = _rat_of(x["file"])
+                        rrno = _rat_of(rat)
+                        if x["type"] in ("rec", "merged") and rrno and rno and rno != rrno:
+                            flags += f"  ⚠ Rat{rno} file"
+                        lines.append(f"    - `{x['file']}` — {_hsize(x['size_bytes'])}{flags}")
+            lines.append("")
+    md_path = root / "drive_scan_inventory.md"
+    try:
+        md_path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as e:
+        print(f"Could not write {md_path} ({e}).")
+    return md_path
+
+
 def _write_inventory(root, inv_rows, file_rows):
-    """Per-session inventory CSV + full per-file listing CSV."""
+    """Readable inventory MD + per-session inventory CSV + full per-file CSV."""
+    _write_inventory_md(root, inv_rows, file_rows)
     inv_path = root / "drive_scan_inventory.csv"
     try:
         with open(inv_path, "w", newline="", encoding="utf-8") as f:
@@ -404,7 +471,8 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
                          f"| {x['n_rec']}/{x['n_merged']}/{x['n_logger']} "
                          f"| {x['ephys_gb']} | {x['video_gb']} |")
         lines.append("")
-    lines.append("_Per-session detail: drive_scan_inventory.csv · every file: drive_scan_files.csv_")
+    lines.append("_Readable per-file listing: **drive_scan_inventory.md** · "
+                 "spreadsheets: drive_scan_inventory.csv (per session) / drive_scan_files.csv (every file)_")
     lines.append("")
 
     for c in order:
@@ -432,9 +500,9 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
         if by_cat[c]:
             print(f"  {c:15s}: {len(by_cat[c])}")
     print(f"Report:    {md_path}")
+    print(f"Inventory: {root / 'drive_scan_inventory.md'}  (readable file listing)")
     print(f"Issues:    {csv_path}")
-    print(f"Inventory: {root / 'drive_scan_inventory.csv'} (per session)")
-    print(f"Files:     {root / 'drive_scan_files.csv'} (every file)")
+    print(f"CSVs:      drive_scan_inventory.csv (per session) / drive_scan_files.csv (every file)")
     print("=" * 56)
 
 
