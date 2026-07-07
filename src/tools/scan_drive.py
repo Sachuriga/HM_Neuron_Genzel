@@ -182,41 +182,67 @@ def find_sessions(root):
     return out
 
 
-def scan_session(sess, issues):
-    """Check one session for ephys-phase completeness + zero-size .rec + cross-rat
-    files + junk. Appends dicts to `issues`. Returns (has_ephys, mp4_list)."""
+def _classify_file(name):
+    """File kind for the inventory: video / meta / merged / rec / logger / config / other."""
+    n = name.lower()
+    if n.endswith(".mp4"):
+        return "video"
+    if n.endswith(".meta"):
+        return "meta"
+    if n.endswith("_merged.rec"):
+        return "merged"
+    if n.endswith(".rec"):
+        return "rec"
+    if n == "logger_raw.dat":
+        return "logger"
+    if n.endswith(".trodesconf"):
+        return "config"
+    return "other"
+
+
+def scan_session(sess, issues, inv_rows, file_rows):
+    """Check one session (ephys-phase completeness + zero-size .rec + cross-rat +
+    junk) AND inventory it. Appends issues, one inventory row (per session), and
+    one file row per file. Returns (has_ephys, mp4_list)."""
     rat_dir = sess.parent.name
     rat_no = _rat_of(rat_dir)
-    tag = f"{rat_dir}/{sess.name}"
-    mp4s, rec_files, phases = [], [], set()
-    empty_dirs = []
+    mp4s, rec_files, phases, rec_folders, empty_dirs = [], [], set(), [], []
+    n = {k: 0 for k in ("video", "meta", "rec", "merged", "logger", "config", "other")}
+    bytes_video = bytes_ephys = 0
 
     for sub in sorted(p for p in sess.iterdir() if p.is_dir()):
         entries = list(sub.iterdir())
         if not entries:
             empty_dirs.append(sub)
         is_cam = _CAM_DIR_RE.match(sub.name) or any(p.suffix.lower() == ".mp4" for p in entries)
-        if is_cam:
-            mp4s += [p for p in sub.rglob("*.mp4") if p.is_file()]
-            continue
-        # recording folder: classify its phase, collect .rec / logger files
-        ph = _classify_phase(sub.name)
-        recs = [p for p in sub.rglob("*.rec") if p.is_file()]
-        dats = [p for p in sub.rglob("logger_raw.dat") if p.is_file()]
-        rec_files += recs + dats
-        if recs or dats:
-            if ph:
-                phases.add(ph)
-            for p in recs + dats:
-                rno = _rat_of(p.name)
-                if rat_no is not None and rno is not None and rno != rat_no:
-                    issues.append(dict(category="cross-rat", rat=rat_dir, session=sess.name,
-                                       path=str(p), detail=f"Rat{rno} file under {rat_dir}"))
-        # junk temp files anywhere in the recording folder
-        for p in entries:
+        ph = None if is_cam else _classify_phase(sub.name)
+        has_rec_here = False
+        for p in sub.rglob("*"):
+            if not p.is_file():
+                continue
+            cat = _classify_file(p.name)
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = -1
+            n[cat] += 1
+            file_rows.append(dict(rat=rat_dir, session=sess.name, folder=sub.name,
+                                  file=p.name, type=cat, size_bytes=size))
+            if cat == "video":
+                mp4s.append(p); bytes_video += max(size, 0)
+            elif cat in ("rec", "merged", "logger"):
+                rec_files.append(p); bytes_ephys += max(size, 0); has_rec_here = True
+                if cat in ("rec", "merged"):
+                    rno = _rat_of(p.name)
+                    if rat_no is not None and rno is not None and rno != rat_no:
+                        issues.append(dict(category="cross-rat", rat=rat_dir, session=sess.name,
+                                           path=str(p), detail=f"Rat{rno} file under {rat_dir}"))
             if _TEMP_RE.search(p.name):
                 issues.append(dict(category="leftover-temp", rat=rat_dir, session=sess.name,
                                    path=str(p), detail="copy temp / partial file"))
+        if not is_cam and has_rec_here:
+            phases.add(ph) if ph else None
+            rec_folders.append(f"{sub.name}[{ph or '?'}]")
 
     has_ephys = bool(rec_files)
 
@@ -229,11 +255,9 @@ def scan_session(sess, issues):
         except OSError as e:
             issues.append(dict(category="stat-failed", rat=rat_dir, session=sess.name,
                                path=str(p), detail=str(e)))
-
     for d in empty_dirs:
         issues.append(dict(category="empty-folder", rat=rat_dir, session=sess.name,
                            path=str(d), detail="folder has no files"))
-
     # (2) ephys phase completeness — only enforced when the session has ephys
     if has_ephys:
         missing = [p for p in PHASES if p not in phases]
@@ -241,6 +265,14 @@ def scan_session(sess, issues):
             issues.append(dict(category="missing-phase", rat=rat_dir, session=sess.name,
                                path=str(sess),
                                detail=f"missing {'+'.join(missing)} (have {'+'.join(sorted(phases)) or 'none'})"))
+
+    inv_rows.append(dict(
+        rat=rat_dir, session=sess.name, has_ephys=int(has_ephys),
+        phases="+".join(p for p in PHASES if p in phases) if has_ephys else "-",
+        n_video=n["video"], n_meta=n["meta"],
+        n_rec=n["rec"], n_merged=n["merged"], n_logger=n["logger"],
+        video_gb=round(bytes_video / 1e9, 2), ephys_gb=round(bytes_ephys / 1e9, 2),
+        rec_folders="; ".join(rec_folders)))
     return has_ephys, mp4s
 
 
@@ -254,12 +286,12 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
         return
     print(f"Found {len(sessions)} session(s) under {root}.")
 
-    issues = []
+    issues, inv_rows, file_rows = [], [], []
     all_mp4s = []
     n_ephys = 0
     for sess in sessions:
         try:
-            has_ephys, mp4s = scan_session(sess, issues)
+            has_ephys, mp4s = scan_session(sess, issues, inv_rows, file_rows)
         except OSError as e:
             issues.append(dict(category="scan-failed", rat=sess.parent.name,
                                session=sess.name, path=str(sess), detail=str(e)))
@@ -289,10 +321,36 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
                                            path=str(p), detail=reason))
         issues += bad_videos
 
-    _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos)
+    _write_inventory(root, inv_rows, file_rows)
+    _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos, inv_rows)
 
 
-def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_videos):
+def _write_inventory(root, inv_rows, file_rows):
+    """Per-session inventory CSV + full per-file listing CSV."""
+    inv_path = root / "drive_scan_inventory.csv"
+    try:
+        with open(inv_path, "w", newline="", encoding="utf-8") as f:
+            cols = ["rat", "session", "has_ephys", "phases", "n_video", "n_meta",
+                    "n_rec", "n_merged", "n_logger", "video_gb", "ephys_gb", "rec_folders"]
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in sorted(inv_rows, key=lambda x: (x["rat"], x["session"])):
+                w.writerow(r)
+    except OSError as e:
+        print(f"Could not write {inv_path} ({e}).")
+
+    files_path = root / "drive_scan_files.csv"
+    try:
+        with open(files_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["rat", "session", "folder", "file", "type", "size_bytes"])
+            w.writeheader()
+            for r in file_rows:
+                w.writerow(r)
+    except OSError as e:
+        print(f"Could not write {files_path} ({e}).")
+
+
+def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_videos, inv_rows=None):
     order = ["missing-phase", "zero-size-rec", "bad-video", "cross-rat",
              "empty-folder", "leftover-temp", "stat-failed", "scan-failed"]
     by_cat = {c: [i for i in issues if i["category"] == c] for c in order}
@@ -321,11 +379,34 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
         "stat-failed": "Files that could not be stat'd",
         "scan-failed": "Sessions that could not be scanned",
     }
+    inv_rows = inv_rows or []
+    rats = sorted({r["rat"] for r in inv_rows})
     lines = [f"# Drive scan — {root}", f"_{ts}_", "",
+             f"- Animals: **{len(rats)}** ({', '.join(rats) if rats else '-'})",
              f"- Sessions: **{len(sessions)}** (with ephys: **{n_ephys}**)",
              f"- Videos checked: **{n_videos if did_videos else 'skipped'}**"
              + (f" (bad: **{len(bad_videos)}**)" if did_videos else ""),
              f"- Total issues: **{len(issues)}**", ""]
+
+    # Inventory: which animals, which sessions, and what's in each
+    lines.append("## Inventory — animals / sessions / files")
+    by_rat = {}
+    for r in inv_rows:
+        by_rat.setdefault(r["rat"], []).append(r)
+    for rat in rats:
+        rows = sorted(by_rat[rat], key=lambda x: x["session"])
+        ne = sum(x["has_ephys"] for x in rows)
+        lines.append(f"### {rat} — {len(rows)} session(s), {ne} with ephys")
+        lines.append("| session | phases | videos | rec/merged/logger | ephys GB | video GB |")
+        lines.append("|---|---|---|---|---|---|")
+        for x in rows:
+            lines.append(f"| {x['session']} | {x['phases']} | {x['n_video']} "
+                         f"| {x['n_rec']}/{x['n_merged']}/{x['n_logger']} "
+                         f"| {x['ephys_gb']} | {x['video_gb']} |")
+        lines.append("")
+    lines.append("_Per-session detail: drive_scan_inventory.csv · every file: drive_scan_files.csv_")
+    lines.append("")
+
     for c in order:
         rows = by_cat[c]
         if not rows and c in ("stat-failed", "scan-failed"):
@@ -345,12 +426,15 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
 
     # Console summary
     print("\n" + "=" * 56)
-    print(f"DRIVE SCAN: {len(sessions)} sessions ({n_ephys} with ephys), "
-          f"{len(issues)} issue(s)")
+    print(f"DRIVE SCAN: {len(rats)} animals, {len(sessions)} sessions "
+          f"({n_ephys} with ephys), {len(issues)} issue(s)")
     for c in order:
         if by_cat[c]:
             print(f"  {c:15s}: {len(by_cat[c])}")
-    print(f"Report: {md_path}\nCSV:    {csv_path}")
+    print(f"Report:    {md_path}")
+    print(f"Issues:    {csv_path}")
+    print(f"Inventory: {root / 'drive_scan_inventory.csv'} (per session)")
+    print(f"Files:     {root / 'drive_scan_files.csv'} (every file)")
     print("=" * 56)
 
 
