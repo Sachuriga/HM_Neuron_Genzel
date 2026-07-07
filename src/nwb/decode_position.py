@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import networkx as nx
 
 import matplotlib
 matplotlib.use("Agg")
@@ -224,6 +225,18 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
                      decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
                      quality="+".join(sorted(qualities)), lead_s=float(lead_s),
                      scale_x=V.SCALE_X, scale_y=V.SCALE_Y)
+            # per-(trial, unit) place-coding + task-performance table (lead-0 only):
+            # -> CSV + PDF here; the NWB write happens after this read handle closes.
+            if not lead_s:
+                tu = build_trial_unit_metrics(units, x, y, t, dt_pos, trials, (nx, ny),
+                                              sigma, tc_mid[dec], err, V.load_nodes(),
+                                              nwb_path.parent)
+                res["trial_unit_metrics"] = tu
+                if tu is not None and len(tu):
+                    tu.to_csv(out_dir / f"trial_unit_metrics_{tag}.csv", index=False)
+                    plot_trial_unit_metrics(out_dir / f"trial_unit_metrics_{tag}.pdf", tu, tag)
+                    print(f"  trial/unit metrics: {len(tu)} rows "
+                          f"({tu['trial'].nunique()} trials x {tu['unit'].nunique()} units).")
         if plot:
             _plot(nwb_path, res, tc_mid[dec], ax_[dec], ay_[dec],
                   decoded_x[dec], decoded_y[dec], err, chance, V.load_nodes(), qualities,
@@ -231,6 +244,202 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         return res
     finally:
         io.close()
+
+
+# ------------------------------------------------------------
+#        per-(trial, unit) metrics table + performance
+# ------------------------------------------------------------
+_MAZE_G = None
+
+
+def _maze_graph():
+    """Hex-maze networkx graph (raw node coords) for shortest-path performance,
+    reusing plot_trials.build_hexmaze_graph. Cached; None if unavailable."""
+    global _MAZE_G
+    if _MAZE_G is not None:
+        return _MAZE_G or None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tracker"))
+        import plot_trials as PT
+        nd = pd.read_csv(Path(__file__).resolve().parent.parent / "tools" / "node_list_new.csv",
+                         header=None, names=["id", "x", "y"])
+        _MAZE_G = PT.build_hexmaze_graph(nd.copy())
+    except Exception as e:
+        print(f"  maze graph unavailable ({e}); performance will be NaN.")
+        _MAZE_G = False
+    return _MAZE_G or None
+
+
+def _read_trial_extra(op_folder):
+    """{trial_num(1-based): dict(paths, start, goal, trial_type, between_node_speed)}
+    from RecordingMeta.xlsx, in row order (== the coordinate Trial_Num)."""
+    meta = V._pick_file(op_folder, "RecordingMeta.xlsx") or V._pick_file(op_folder, "*RecordingMeta.xlsx")
+    if meta is None:
+        return {}
+    try:
+        df = pd.read_excel(meta, sheet_name=0)
+    except Exception:
+        return {}
+    out = {}
+    for i, r in enumerate(df.itertuples(index=False), start=1):
+        d = r._asdict()
+        out[i] = {
+            "paths": str(d["paths"]) if pd.notna(d.get("paths")) else None,
+            "start": V._first_int(d.get("Start_Nodes")) if pd.notna(d.get("Start_Nodes")) else None,
+            "goal": int(d["Goal_Node"]) if pd.notna(d.get("Goal_Node")) else None,
+            "trial_type": int(d["Trial_Type"]) if pd.notna(d.get("Trial_Type")) else -1,
+            "between_node_speed": (float(d["avg_between_node_speed"])
+                                   if pd.notna(d.get("avg_between_node_speed")) else np.nan),
+        }
+    return out
+
+
+def _performance_log10(info, G):
+    """Trial performance = log10(shortest_hops / actual_hops): 0 = optimal,
+    negative = detour. shortest = graph hops start->goal; actual = steps to the
+    first goal visit in the trial's node sequence ('paths')."""
+    if info is None or G is None:
+        return np.nan
+    start, goal, paths = info.get("start"), info.get("goal"), info.get("paths")
+    if start is None or goal is None or not paths:
+        return np.nan
+    pn = [int(v) for v in paths.split(",") if v.strip().lstrip("-").isdigit()]
+    actual = pn.index(goal) if goal in pn else (len(pn) - 1)
+    try:
+        shortest = nx.shortest_path_length(G, str(start), str(goal))
+    except Exception:
+        return np.nan
+    return float(np.log10(shortest / actual)) if (shortest > 0 and actual > 0) else np.nan
+
+
+def build_trial_unit_metrics(units, x, y, t, dt, trials, bins, sigma,
+                             tc_mid, err, nodes, op_folder):
+    """Per-(trial, unit) table. Per-unit place-coding metrics (spatial information,
+    field size, selectivity = peak/mean, firing rate, peak rate) plus per-trial
+    task metrics that repeat across the trial's units (population decoding error,
+    performance = log10(shortest/actual path), average between-node speed)."""
+    if not trials or not units:
+        return pd.DataFrame()
+    nx_, ny_ = bins
+    xmin, xmax, ymin, ymax = V.MAZE_EXTENT
+    bin_area = ((xmax - xmin) / nx_) * ((ymax - ymin) / ny_)      # m^2 per bin
+    G = _maze_graph()
+    extra = _read_trial_extra(op_folder)
+    rows = []
+    for k, (ttype, goal, start, t0, t1) in enumerate(trials, start=1):
+        info = extra.get(k, {"start": start, "goal": goal, "trial_type": ttype,
+                             "paths": None, "between_node_speed": np.nan})
+        perf = _performance_log10(info, G)
+        bspeed = info.get("between_node_speed", np.nan)
+        goal_xy = nodes.get(goal) if (nodes and goal is not None) else None
+        dm = (tc_mid >= t0) & (tc_mid <= t1)                     # population decoding error
+        dec_err = float(np.median(err[dm])) if dm.any() else np.nan
+        dur = max(float(t1 - t0), 1e-9)
+        for uid, st in units:
+            m, rate, _ = V.place_field_metrics(x, y, t, st, V.MAZE_EXTENT, (nx_, ny_),
+                                               dt, sigma, 0.05, goal_xy=goal_xy, t0=t0, t1=t1)
+            fields = V.place_fields(rate) if (rate is not None and rate.count()) else []
+            field_size = float(sum(int(f.sum()) for f in fields) * bin_area)
+            n_spk = int(np.count_nonzero((st >= t0) & (st <= t1)))
+            rows.append({
+                "trial": k, "trial_type": int(info.get("trial_type", ttype)), "unit": int(uid),
+                "spatial_info": m.get("spatial_info", np.nan),
+                "field_size_m2": field_size,
+                "selectivity": m.get("selectivity", np.nan),
+                "firing_rate_hz": n_spk / dur,
+                "peak_rate_hz": m.get("peak", np.nan),
+                "decoding_error_m": dec_err,
+                "performance": perf,
+                "between_node_speed": bspeed,
+            })
+    return pd.DataFrame(rows)
+
+
+# metrics correlated against performance (label, column)
+_PERF_MEASURES = [
+    ("spatial_info", "Spatial info (bits/spk)"),
+    ("field_size_m2", "Field size (m$^2$)"),
+    ("selectivity", "Selectivity (peak/mean)"),
+    ("firing_rate_hz", "Firing rate (Hz)"),
+    ("decoding_error_m", "Decoding error (m)"),
+    ("between_node_speed", "Between-node speed (m/s)"),
+]
+
+
+def _corr_grid(pdf, data, title, annotate_trial=False):
+    """2x3 grid of scatter(metric vs performance) with a least-squares line and
+    Pearson r/p/n in each panel."""
+    from scipy.stats import pearsonr
+    fig, axes = plt.subplots(2, 3, figsize=(11.69, 8.27))
+    for ax, (col, lab) in zip(axes.ravel(), _PERF_MEASURES):
+        cols = [col, "performance"] + (["trial"] if annotate_trial else [])
+        d = (data[cols].replace([np.inf, -np.inf], np.nan).dropna()
+             if col in data.columns else pd.DataFrame())
+        if len(d) >= 3 and d[col].std() > 0 and d["performance"].std() > 0:
+            r, p = pearsonr(d[col], d["performance"])
+            ax.scatter(d[col], d["performance"], s=18, alpha=0.5, edgecolor="none")
+            b, a = np.polyfit(d[col], d["performance"], 1)
+            xs = np.linspace(d[col].min(), d[col].max(), 50)
+            ax.plot(xs, b * xs + a, color="crimson", lw=1.2)
+            ax.set_title(f"{lab}\nr={r:.2f}, p={p:.3g}, n={len(d)}", fontsize=9)
+            if annotate_trial:
+                for _, rr in d.iterrows():
+                    ax.annotate(int(rr["trial"]), (rr[col], rr["performance"]),
+                                fontsize=6, alpha=0.6)
+        else:
+            ax.text(0.5, 0.5, f"{lab}\n(insufficient data)", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8)
+        ax.set_xlabel(lab, fontsize=8)
+        ax.set_ylabel("Performance  log10(short/actual)", fontsize=8)
+        ax.grid(alpha=0.3)
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def plot_trial_unit_metrics(pdf_path, df, tag):
+    """Per-session PDF: (1) performance vs each metric over all (trial,unit) points;
+    (2) performance vs each metric after averaging all units within a trial (one
+    point per trial)."""
+    if df is None or not len(df):
+        return
+    units_lab = tag.replace("_", "+")
+    agg = (df.groupby("trial")
+             .agg({**{c: "mean" for c, _ in _PERF_MEASURES}, "performance": "first"})
+             .reset_index())
+    with PdfPages(str(pdf_path)) as pdf:
+        _corr_grid(pdf, df,
+                   f"Performance vs metrics — per (trial, unit) — units {units_lab}")
+        _corr_grid(pdf, agg,
+                   f"Performance vs unit-averaged metrics — per trial — units {units_lab}",
+                   annotate_trial=True)
+
+
+def save_metrics_nwb(nwb_path, df, tag):
+    """Append the trial/unit metrics table to the NWB as a scratch DynamicTable
+    named 'trial_unit_metrics_<tag>'. Skips (leaving the CSV/PDF) if it already
+    exists or the write fails, so re-runs never crash the pipeline."""
+    if df is None or not len(df):
+        return
+    name = f"trial_unit_metrics_{tag}"
+    desc = ("Per-(trial,unit) place-coding metrics (spatial_info, field_size_m2, "
+            "selectivity, firing_rate_hz, peak_rate_hz) + per-trial decoding_error_m, "
+            f"performance=log10(shortest/actual), between_node_speed. Units: {tag.replace('_', '+')}.")
+    try:
+        with NWBHDF5IO(str(nwb_path), mode="a", load_namespaces=True) as io:
+            nwb = io.read()
+            if nwb.scratch is not None and name in nwb.scratch:
+                print(f"  NWB already has scratch '{name}'; leaving CSV/PDF only.")
+                return
+            try:
+                nwb.add_scratch(df, name=name, table_description=desc)
+            except TypeError:
+                nwb.add_scratch(df, name=name, description=desc)
+            io.write(nwb)
+        print(f"  wrote NWB scratch '{name}' ({len(df)} rows).")
+    except Exception as e:
+        print(f"  could not write metrics to NWB ({e}); CSV/PDF still written.")
 
 
 def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities,
@@ -341,8 +550,11 @@ def decode_leads(nwb_path, qualities, leads=(0.0, 1.0, 3.0), cv_folds=5, viz_fol
         return results
     # visualisation track for plot_trials: full-data (in-sample) lead-0 decode, saved
     # as decoded_<tag>.npz — smooth continuous trace for the per-trial overlay only.
-    decode_session(nwb_path, qualities, lead_s=0.0, folds=viz_folds,
-                   save=True, plot=False, **kw)
+    viz = decode_session(nwb_path, qualities, lead_s=0.0, folds=viz_folds,
+                         save=True, plot=False, **kw)
+    # persist the per-(trial,unit) metrics table into the NWB (CSV/PDF already saved)
+    if viz is not None and viz.get("trial_unit_metrics") is not None:
+        save_metrics_nwb(nwb_path, viz["trial_unit_metrics"], "_".join(sorted(qualities)))
     # small per-lead accuracy summary so the cross-session summary (step s) can plot
     # decoding accuracy at every lead without re-decoding (cross-validated values).
     out_dir = nwb_path.parent / "decoding"; out_dir.mkdir(exist_ok=True)
@@ -541,7 +753,9 @@ def run(output_folder, qualities, leads=None, **kw):
     if leads:
         decode_leads(nwb_path, qualities, leads=leads, **kw)
     else:
-        decode_session(nwb_path, qualities, **kw)
+        res = decode_session(nwb_path, qualities, **kw)
+        if res is not None and res.get("trial_unit_metrics") is not None:
+            save_metrics_nwb(nwb_path, res["trial_unit_metrics"], "_".join(sorted(qualities)))
 
 
 if __name__ == "__main__":

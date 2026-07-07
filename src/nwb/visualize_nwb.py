@@ -72,10 +72,12 @@ MAZE_EXTENT = (0.0, 9.0, 0.0, 5.0)
 # ------------------------------------------------------------
 def find_nwb_file(output_folder):
     op = Path(output_folder)
-    cands = [p for p in sorted(op.glob("*.nwb")) if not p.name.endswith(".tmp.nwb")]
+    # skip *.tmp.nwb and macOS AppleDouble sidecars ("._*.nwb", not valid HDF5)
+    _ok = lambda p: not p.name.endswith(".tmp.nwb") and not p.name.startswith("._")
+    cands = [p for p in sorted(op.glob("*.nwb")) if _ok(p)]
     if cands:
         return cands[0]
-    cands = [p for p in sorted(op.glob("**/*.nwb")) if not p.name.endswith(".tmp.nwb")]
+    cands = [p for p in sorted(op.glob("**/*.nwb")) if _ok(p)]
     return cands[0] if cands else None
 
 
