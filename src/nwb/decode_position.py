@@ -195,11 +195,12 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
                "median_err_m": float(np.median(err)), "mean_err_m": float(np.mean(err)),
                "median_chance_m": float(np.median(chance))}
 
-        raw = V.read_trials_raw(nwb_path.parent)
-        trials = V.align_trials(raw, nwb.session_start_time, float(t.min()), float(t.max()))
-        # offset from session-relative seconds to the UNIX clock (= session_start_unix);
-        # taken from the raw-vs-aligned trial times so it matches align_trials exactly.
-        off = (raw[0][3] - trials[0][3]) if (raw and trials) else 0.0
+        # trials on the position/spike seconds clock (same source as plot_trials /
+        # step v — see visualize_nwb.build_trials): coordinate Trial_Num blocks
+        # mapped via stitched_framewise_seconds.csv. NOT the old RecordingMeta-unix
+        # windows, which sit on the behavioural-sync clock and drift vs the video.
+        trials = V.build_trials(nwb_path.parent, nwb.session_start_time,
+                                float(t.min()), float(t.max()))
         # carry the decoded arrays on the result so callers (e.g. the multi-lead
         # comparison) can reuse them without re-reading the NWB.
         res.update({"t": tc_mid[dec], "actual_x": ax_[dec], "actual_y": ay_[dec],
@@ -213,11 +214,12 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         stem = f"decoded_{tag}" if not lead_s else f"predicted_{tag}_lead{lead_s:g}s"
         if save:
             # persist the decoded track so step 5 (plot_trials) can overlay it per
-            # trial. Save time in BOTH clocks: t (session-relative s) and t_unix
-            # (UNIX s, which plot_trials' log 'sys_time' uses). Coords = scaled metres.
+            # trial. Time is t = the stitched-seconds clock (identical to the NWB
+            # position/spike timestamps), so no unix conversion is needed anywhere.
+            # Coords = scaled metres.
             out_dir.mkdir(exist_ok=True)
             np.savez(out_dir / f"{stem}.npz",
-                     t=tc_mid[dec], t_unix=tc_mid[dec] + off,
+                     t=tc_mid[dec],
                      actual_x=ax_[dec], actual_y=ay_[dec],
                      decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
                      quality="+".join(sorted(qualities)), lead_s=float(lead_s),

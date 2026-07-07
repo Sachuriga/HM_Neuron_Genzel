@@ -308,9 +308,8 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
         # sessions with repeat > 1 (R1S1 and all S>1 stay whole-session).
         type5 = None
         if session == 1 and repeat and repeat > 1:
-            raw = V.read_trials_raw(nwb_path.parent)
-            trials = V.align_trials(raw, nwb.session_start_time,
-                                    float(t.min()), float(t.max())) if raw else []
+            trials = V.build_trials(nwb_path.parent, nwb.session_start_time,
+                                    float(t.min()), float(t.max()))
             type5 = next((tr for tr in trials if tr[0] == 5), None)
             if type5 is not None:
                 _tt, g5, _sn, t50, t51 = type5

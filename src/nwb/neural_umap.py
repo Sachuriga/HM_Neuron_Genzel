@@ -98,9 +98,9 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
         yb = np.interp(centers, t, y)
         vb = np.interp(centers, t, _speed(x, y, t))
 
-        # task variables from the trial table (session-relative)
-        raw = V.read_trials_raw(nwb_path.parent)
-        trials = V.align_trials(raw, nwb.session_start_time, t0, t1)
+        # task variables from the trial table (session-relative seconds clock,
+        # from the coordinate Trial_Num blocks — see visualize_nwb.build_trials)
+        trials = V.build_trials(nwb_path.parent, nwb.session_start_time, t0, t1)
         nodes = V.load_nodes()
         ttype = np.full(len(centers), np.nan)
         trial_id = np.full(len(centers), np.nan)

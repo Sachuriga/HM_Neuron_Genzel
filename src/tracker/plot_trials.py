@@ -30,8 +30,9 @@ def load_decoded_track(work_dir):
         return None
     try:
         d = np.load(files[-1], allow_pickle=True)      # last = good_mua > good
-        # match on the UNIX clock (== the log's 'sys_time'); fall back to relative.
-        tkey = "t_unix" if "t_unix" in d.files else "t"
+        # 't' is the stitched-seconds clock (same as the position df's sys_time),
+        # so the per-trial overlay windows match with no unix conversion.
+        tkey = "t"
         return {"t": np.asarray(d[tkey], float),
                 "dx": np.asarray(d["decoded_x"], float),
                 "dy": np.asarray(d["decoded_y"], float),
@@ -51,7 +52,7 @@ def load_all_decoded_tracks(work_dir):
     for fp in files:
         try:
             d = np.load(fp, allow_pickle=True)
-            tkey = "t_unix" if "t_unix" in d.files else "t"
+            tkey = "t"                            # stitched-seconds clock (see above)
             out.append({
                 "t": np.asarray(d[tkey], float),
                 "dx": np.asarray(d["decoded_x"], float),
@@ -73,7 +74,8 @@ def build_df_from_coords(work_dir, input_dir):
     (df, file_stem) with the same schema the log path produces, or (None, None)."""
     def _first(pat):
         for d in (work_dir, input_dir):
-            hits = sorted(Path(d).glob(pat))
+            # skip macOS AppleDouble sidecars ("._*") that glob would match first
+            hits = [p for p in sorted(Path(d).glob(pat)) if not p.name.startswith("._")]
             if hits:
                 return hits[0]
         return None
@@ -83,20 +85,29 @@ def build_df_from_coords(work_dir, input_dir):
     cf = pd.read_csv(coords)
     if not {"Rat_X", "Rat_Y"}.issubset(cf.columns):
         return None, None
-    # relative seconds (same clock as the decoder) from the framewise file (same length)
+    # Seconds on the NWB position/spike clock ('Seconds From Creation'), joined to
+    # each row by FRAME INDEX via stitched_framewise_seconds.csv — the two files
+    # are NOT the same length, so a positional merge would drop them. This is the
+    # exact clock the decoder's saved track and step v use, so per-trial windows
+    # and the decoded overlay stay aligned with no unix conversion anywhere.
     secs = pd.Series([np.nan] * len(cf))
-    fw = _first("*framewise_seconds.csv")
-    if fw is not None:
-        f = pd.read_csv(fw)
-        sc = [c for c in f.columns if "second" in c.lower()]
-        if sc and len(f) == len(cf):
-            secs = pd.to_numeric(f[sc[0]], errors="coerce").reset_index(drop=True)
+    st = _first("*stitched_framewise_seconds.csv")
+    if st is not None and "Frame_Index" in cf.columns:
+        sdf = pd.read_csv(st)
+        fcol = next((c for c in sdf.columns if "frame" in c.lower()), None)
+        scol = next((c for c in sdf.columns if "second" in c.lower()), None)
+        if fcol and scol:
+            f2s = dict(zip(pd.to_numeric(sdf[fcol], errors="coerce"),
+                           pd.to_numeric(sdf[scol], errors="coerce")))
+            secs = pd.to_numeric(cf["Frame_Index"], errors="coerce").map(f2s)
     df = pd.DataFrame({
         "x": pd.to_numeric(cf["Rat_X"], errors="coerce"),
         "y": pd.to_numeric(cf["Rat_Y"], errors="coerce"),
         "trial_id": pd.to_numeric(cf.get("Trial_Num"), errors="coerce"),
-        "video_seconds": secs.to_numpy(),
-        "sys_time": pd.to_numeric(cf.get("Timestamp"), errors="coerce"),
+        "video_seconds": np.asarray(secs, dtype=float),
+        # canonical trial-window clock = the stitched seconds (same as the decoder),
+        # NOT the raw unix 'Timestamp' — keeps step-5 windows on the spike clock.
+        "sys_time": np.asarray(secs, dtype=float),
         "event": "rat_position",
     }).dropna(subset=["x", "y", "trial_id"])
     df["trial_id"] = df["trial_id"].astype(int)
@@ -461,8 +472,9 @@ if __name__ == "__main__":
     records = []
     grouped = pos_df.groupby("trial_id", sort=False)
     
-    # Prefer UNIX 'sys_time' for the trial window — that is the clock the decoded
-    # track is matched on (t_unix). Fall back to video_seconds.
+    # Trial window on the stitched-seconds clock: for the coords path 'sys_time'
+    # now holds those seconds (== the decoder's 't'); the .log path still carries
+    # its own sys_time. Fall back to video_seconds.
     _tcol = ("sys_time" if "sys_time" in pos_df.columns
              else "video_seconds" if "video_seconds" in pos_df.columns else None)
     for tid, g in grouped:
