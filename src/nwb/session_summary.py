@@ -245,6 +245,10 @@ def collect_session(nwb_path, bin_cm=5.0, sigma=2.0, speed=0.05):
         for k in _PF_KEYS:
             out[k] = np.nan; out[k + "_post"] = np.nan
         out.update(_decode_accuracy(nwb_path.parent))   # decoding accuracy (step b)
+        # pooled per-(trial,unit) metrics table written by step b (if present)
+        out["trial_unit_metrics"] = _load_trial_unit_metrics(
+            nwb, {"animal": out["animal"], "date": out["date"],
+                  "repeat": out["repeat"], "session": out["session"]})
         if nwb.units is None or len(nwb.units.id) == 0:
             return out
         udf = nwb.units.to_dataframe()
@@ -486,6 +490,169 @@ def _stats_tables(animal_units, units_all):
     return pd.DataFrame(anova), pd.DataFrame(posthoc)
 
 
+# ------------------------------------------------------------
+#   pooled per-(trial, unit) metrics from step b (all sessions)
+# ------------------------------------------------------------
+# metrics correlated against trial performance (column, axis label)
+_TU_MEASURES = [
+    ("spatial_info", "Spatial info (bits/spk)"),
+    ("field_size_m2", "Field size (m$^2$)"),
+    ("selectivity", "Selectivity (peak/mean)"),
+    ("firing_rate_hz", "Firing rate (Hz)"),
+    ("decoding_error_m", "Decoding error (m)"),
+    ("between_node_speed", "Between-node speed (m/s)"),
+]
+
+
+def _load_trial_unit_metrics(nwb, base):
+    """Pooled per-(trial,unit) metrics tables written by step b into the NWB
+    scratch ('trial_unit_metrics_<quality>'), tagged with this session's identity
+    (base = animal/date/repeat/session). Concatenated over quality sets, or None."""
+    sc = getattr(nwb, "scratch", None)
+    if not sc:
+        return None
+    frames = []
+    for name in list(sc.keys()):
+        if not name.startswith("trial_unit_metrics_"):
+            continue
+        try:
+            df = sc[name].to_dataframe()
+        except Exception:
+            continue
+        if df is None or not len(df):
+            continue
+        df = df.reset_index(drop=True).copy()
+        df["quality"] = name.replace("trial_unit_metrics_", "")
+        for k, v in base.items():
+            df[k] = v
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def _tu_trial_agg(data):
+    """Collapse units within each (animal, date, quality, trial): mean of the
+    per-unit metrics, performance/trial_type carried through (trial-level)."""
+    keys = [k for k in ("animal", "date", "quality", "trial") if k in data.columns]
+    agg = {c: "mean" for c, _ in _TU_MEASURES if c in data.columns}
+    if "performance" in data.columns:
+        agg["performance"] = "first"
+    if "trial_type" in data.columns:
+        agg["trial_type"] = "first"
+    return data.groupby(keys).agg(agg).reset_index()
+
+
+def _tu_corr_grid(pdf, data, title, color_col="animal"):
+    """2x3 grid: performance vs each metric, with a least-squares line + Pearson
+    r/p/n. Points optionally coloured by `color_col` (e.g. animal)."""
+    from scipy.stats import pearsonr
+    cats = (list(pd.unique(data[color_col].dropna()))
+            if color_col and color_col in data.columns else None)
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(2, 3, figsize=(11.69, 8.27))
+    for ax, (col, lab) in zip(axes.ravel(), _TU_MEASURES):
+        if col not in data.columns or "performance" not in data.columns:
+            ax.axis("off"); continue
+        keep = [col, "performance"] + ([color_col] if cats else [])
+        d = data[keep].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(d) >= 3 and d[col].std() > 0 and d["performance"].std() > 0:
+            if cats:
+                for i, cval in enumerate(cats):
+                    dd = d[d[color_col] == cval]
+                    ax.scatter(dd[col], dd["performance"], s=12, alpha=0.45,
+                               edgecolor="none", color=cmap(i % 10), label=str(cval))
+            else:
+                ax.scatter(d[col], d["performance"], s=12, alpha=0.45, edgecolor="none")
+            r, p = pearsonr(d[col], d["performance"])
+            b, a = np.polyfit(d[col], d["performance"], 1)
+            xs = np.linspace(d[col].min(), d[col].max(), 50)
+            ax.plot(xs, b * xs + a, color="crimson", lw=1.3)
+            ax.set_title(f"{lab}\nr={r:.2f}, p={p:.2g}, n={len(d)}", fontsize=9)
+        else:
+            ax.text(0.5, 0.5, f"{lab}\n(insufficient data)", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8)
+        ax.set_xlabel(lab, fontsize=8)
+        ax.set_ylabel("Performance  log10(short/actual)", fontsize=8)
+        ax.grid(alpha=0.3)
+    if cats and len(cats) <= 10:
+        axes.ravel()[0].legend(fontsize=6, markerscale=1.6, loc="best")
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    pdf.savefig(fig); plt.close(fig)
+
+
+def _tu_compare_page(pdf, tu_all):
+    """Comparison page: (A) Pearson r of performance vs each metric, per quality
+    set (trial-level) — which measures track performance; (B) key metrics split by
+    trial type (goal-directed type-1 vs free-roaming type-4/5)."""
+    from scipy.stats import pearsonr
+    quals = list(pd.unique(tu_all["quality"]))
+    trial_lvl = _tu_trial_agg(tu_all)
+    fig = plt.figure(figsize=(11.69, 8.27))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.15], hspace=0.45)
+
+    # (A) correlation-r bars, one group of bars per metric, one bar per quality set
+    axA = fig.add_subplot(gs[0])
+    xpos = np.arange(len(_TU_MEASURES))
+    width = 0.8 / max(1, len(quals))
+    for qi, q in enumerate(quals):
+        dq = trial_lvl[trial_lvl["quality"] == q]
+        rs = []
+        for col, _ in _TU_MEASURES:
+            d = dq[[col, "performance"]].replace([np.inf, -np.inf], np.nan).dropna() \
+                if col in dq.columns else pd.DataFrame()
+            rs.append(pearsonr(d[col], d["performance"])[0]
+                      if len(d) >= 3 and d[col].std() > 0 and d["performance"].std() > 0 else np.nan)
+        axA.bar(xpos + qi * width, rs, width, label=q.replace("_", "+"))
+    axA.axhline(0, color="k", lw=0.6)
+    axA.set_xticks(xpos + width * (len(quals) - 1) / 2)
+    axA.set_xticklabels([l for _, l in _TU_MEASURES], rotation=18, ha="right", fontsize=7)
+    axA.set_ylabel("Pearson r vs performance\n(unit-averaged per trial)", fontsize=8)
+    axA.set_title("Which measures track trial performance", fontsize=10)
+    axA.legend(fontsize=7, title="units"); axA.grid(axis="y", alpha=0.3)
+
+    # (B) key metrics by trial-type group (richest quality set)
+    qsel = "good_mua" if "good_mua" in quals else quals[0]
+    sub = tu_all[tu_all["quality"] == qsel].copy()
+    sub["grp"] = np.where(sub["trial_type"].isin([4, 5]), "free-roam (4/5)", "goal (1)")
+    keys_b = [("spatial_info", "Spatial info"), ("firing_rate_hz", "Firing rate (Hz)"),
+              ("decoding_error_m", "Decoding err (m)"), ("performance", "Performance")]
+    gsB = gs[1].subgridspec(1, len(keys_b), wspace=0.5)
+    order = ["goal (1)", "free-roam (4/5)"]
+    for j, (col, lab) in enumerate(keys_b):
+        axb = fig.add_subplot(gsB[0, j])
+        data = [sub.loc[sub["grp"] == g, col].replace([np.inf, -np.inf], np.nan).dropna().values
+                for g in order]
+        if any(len(dd) for dd in data):
+            axb.boxplot(data, tick_labels=["goal", "free"], showfliers=False, widths=0.6)
+            for xi, dd in enumerate(data, 1):
+                if len(dd):
+                    axb.scatter(np.random.default_rng(0).normal(xi, 0.05, len(dd)), dd,
+                                s=6, alpha=0.35, color="#2166ac", edgecolor="none")
+        axb.set_title(lab, fontsize=8); axb.grid(axis="y", alpha=0.3)
+        axb.tick_params(labelsize=7)
+    fig.suptitle(f"Trial-type comparison (units: {qsel.replace('_', '+')})",
+                 fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    pdf.savefig(fig); plt.close(fig)
+
+
+def _plot_trial_unit_pool(pdf, tu_all):
+    """Pooled step-b trial/unit pages: performance-vs-metric scatter at
+    (trial,unit) granularity and unit-averaged trial granularity, plus a
+    comparison page. Uses the richest quality set (good+mua) for the scatters."""
+    quals = list(pd.unique(tu_all["quality"]))
+    qsel = "good_mua" if "good_mua" in quals else quals[0]
+    sub = tu_all[tu_all["quality"] == qsel]
+    n_sess = sub[["animal", "date"]].drop_duplicates().shape[0] if len(sub) else 0
+    _tu_corr_grid(pdf, sub,
+                  f"Performance vs metrics — every (trial, unit) pooled over "
+                  f"{n_sess} session(s) — units {qsel.replace('_', '+')}")
+    _tu_corr_grid(pdf, _tu_trial_agg(sub),
+                  f"Performance vs unit-averaged metrics — one point per trial, "
+                  f"pooled over {n_sess} session(s) — units {qsel.replace('_', '+')}")
+    _tu_compare_page(pdf, tu_all)
+
+
 def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
     root = Path(root)
     # Cross-session summary uses only the session NWBs, which sit at most a few
@@ -495,7 +662,7 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
     # this crawl for minutes on the SMB mount. ip* folders never hold NWBs anyway.
     patterns = ["*.nwb", "*/*.nwb", "*/*/*.nwb", "*/*/*/*.nwb"]
     nwbs = sorted({p for pat in patterns for p in root.glob(pat)
-                   if not p.name.endswith(".tmp.nwb")
+                   if not p.name.endswith(".tmp.nwb") and not p.name.startswith("._")
                    and not any(re.fullmatch(r"ip\d+", part, re.I) for part in p.parts)})
     if not nwbs:
         print(f"No .nwb files found under {root}.")
@@ -525,6 +692,12 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
             animal_units[animal] = u
     units_all = pd.concat(animal_units.values(), ignore_index=True) if animal_units else pd.DataFrame()
 
+    # pooled per-(trial,unit) metrics table (step b) across every session
+    tu_frames = [s["trial_unit_metrics"] for animal in by_animal for s in by_animal[animal]
+                 if isinstance(s.get("trial_unit_metrics"), pd.DataFrame)
+                 and not s["trial_unit_metrics"].empty]
+    tu_all = pd.concat(tu_frames, ignore_index=True) if tu_frames else pd.DataFrame()
+
     out = root / "session_summary.pdf"
     with PdfPages(str(out)) as pdf:
         for animal in sorted(by_animal):
@@ -534,6 +707,8 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
                 _plot_scatter(pdf, animal, pd.concat(units, ignore_index=True))
         if not units_all.empty and units_all["animal"].nunique() > 1:
             _plot_combined(pdf, units_all)       # all animals pooled
+        if not tu_all.empty:                     # step-b performance-vs-metrics pages
+            _plot_trial_unit_pool(pdf, tu_all)
     print(f"\nWrote {out} ({len(by_animal)} animal(s)).")
 
     # per-session summary table (before/after type5 columns for splits)
@@ -556,6 +731,8 @@ def run(root, bin_cm=5.0, sigma=2.0, speed=0.05):
             df.to_excel(xw, index=False, sheet_name="sessions")
             if not units_dp.empty:
                 units_dp.to_excel(xw, index=False, sheet_name="units")
+            if not tu_all.empty:
+                tu_all.to_excel(xw, index=False, sheet_name="trial_unit_metrics")
             if not anova_df.empty:
                 anova_df.to_excel(xw, index=False, sheet_name="anova")
             if not posthoc_df.empty:
