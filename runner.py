@@ -72,11 +72,12 @@ MENU = [
     ("b", "Bayesian position decoder per session (DECODE_QUALITY=good|good,mua)"),
     ("m", "Neural population UMAP per session (good and good+mua; Gardner et al. 2022)"),
     ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
+    ("t", "Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)"),
 ]
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "s"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "w", "u", "v", "b", "m", "s", "t"]
 
 
 # ------------------------------------------------------------
@@ -627,6 +628,17 @@ def main():
             print("[SUMMARY] Done." if rc == 0 else "[SUMMARY] Python exited with error.")
         else:
             print("[SUMMARY] session_summary.py NOT found.")
+
+    if has["t"]:
+        # raw-drive integrity scan over the whole root (one call, not per-op)
+        print("\n" + "=" * 56)
+        print("[MASTER] Running DRIVE SCAN (videos + ephys phases + non-zero .rec)...")
+        print("=" * 56)
+        if Path("./src/tools/scan_drive.py").exists():
+            rc = run([PYTHON, "-u", "./src/tools/scan_drive.py", "--root", str(root), "--config", config])
+            print("[DRIVE-SCAN] Done." if rc == 0 else "[DRIVE-SCAN] Python exited with error.")
+        else:
+            print("[DRIVE-SCAN] scan_drive.py NOT found.")
 
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
     print("\n" + "=" * 56)
