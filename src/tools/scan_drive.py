@@ -210,23 +210,30 @@ def scan_session(sess, issues, inv_rows, file_rows):
     n = {k: 0 for k in ("video", "meta", "rec", "merged", "logger", "config", "other")}
     bytes_video = bytes_ephys = 0
 
+    # Groups of files to inventory: (folder_label, files, is_recording). Some rats
+    # (Rat3/Rat4) drop the camera videos LOOSE in the date folder (no timestamp
+    # subfolder), so scan those direct files too — else they'd be missed entirely.
+    groups = []
+    loose = [p for p in sess.iterdir() if p.is_file()]
+    if loose:
+        groups.append(("(date folder)", loose, False))
     for sub in sorted(p for p in sess.iterdir() if p.is_dir()):
         entries = list(sub.iterdir())
         if not entries:
             empty_dirs.append(sub)
         is_cam = _CAM_DIR_RE.match(sub.name) or any(p.suffix.lower() == ".mp4" for p in entries)
-        ph = None if is_cam else _classify_phase(sub.name)
+        groups.append((sub.name, [p for p in sub.rglob("*") if p.is_file()], not is_cam))
+
+    for folder, files, is_recording in groups:
         has_rec_here = False
-        for p in sub.rglob("*"):
-            if not p.is_file():
-                continue
+        for p in files:
             cat = _classify_file(p.name)
             try:
                 size = p.stat().st_size
             except OSError:
                 size = -1
             n[cat] += 1
-            file_rows.append(dict(rat=rat_dir, session=sess.name, folder=sub.name,
+            file_rows.append(dict(rat=rat_dir, session=sess.name, folder=folder,
                                   file=p.name, type=cat, size_bytes=size))
             if cat == "video":
                 mp4s.append(p); bytes_video += max(size, 0)
@@ -240,9 +247,11 @@ def scan_session(sess, issues, inv_rows, file_rows):
             if _TEMP_RE.search(p.name):
                 issues.append(dict(category="leftover-temp", rat=rat_dir, session=sess.name,
                                    path=str(p), detail="copy temp / partial file"))
-        if not is_cam and has_rec_here:
-            phases.add(ph) if ph else None
-            rec_folders.append(f"{sub.name}[{ph or '?'}]")
+        if is_recording and has_rec_here:
+            ph = _classify_phase(folder)
+            if ph:
+                phases.add(ph)
+            rec_folders.append(f"{folder}[{ph or '?'}]")
 
     has_ephys = bool(rec_files)
 
