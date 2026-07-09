@@ -268,6 +268,7 @@ class Tracker:
 
     def load_session(self, vp, nl, n, out):
         self.start_point = self.metadata['start_point']
+        self.stop_point = self.metadata.get('stop_point')
         self.custom_trial = self.metadata['custom_trial']
         self.rat = self.metadata['rat']
         self.date = self.metadata['date']
@@ -400,8 +401,15 @@ class Tracker:
         if self.start_point is not None:
             frame_index = int(float(self.start_point) * self.vid_fps)
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        
-        pbar = tqdm(total=total_frames - frame_index, unit='frames', desc='Processing', ncols=100)
+
+        # stop at Stop_Min/Stop_Sec if given; cap the progress bar at that frame too
+        stop_frame = (int(float(self.stop_point) * self.vid_fps)
+                      if getattr(self, "stop_point", None) is not None else None)
+        if self.stop_point is not None:
+            print(f"Stop point set: processing until {self.stop_point:g}s "
+                  f"(frame {stop_frame}).")
+        pbar_total = (min(total_frames, stop_frame) if stop_frame is not None else total_frames) - frame_index
+        pbar = tqdm(total=max(pbar_total, 0), unit='frames', desc='Processing', ncols=100)
 
         while True:
             success, self.frame = self.cap.read()
@@ -413,8 +421,17 @@ class Tracker:
 
             self.frame_time = self.cap.get(cv2.CAP_PROP_POS_MSEC)
             self.converted_time = convert_milli(int(self.frame_time))
-            
-            frame_itr = frame_index 
+
+            # STOP AT: finalize + break once we pass Stop_Min/Stop_Sec — mirrors the
+            # end-of-video path so the tracked data is saved just like a normal end.
+            if self.stop_point is not None and self.frame_time >= self.stop_point * 1000.0:
+                if not self.end_session:
+                    self.calculate_velocity(self.time_points)
+                    self.save_to_file(self.save)
+                print(f"\nReached stop point ({self.stop_point:g}s); stopping.")
+                break
+
+            frame_itr = frame_index
             
             pbar.update(1)
 
@@ -1802,6 +1819,18 @@ def parse_metadata_xlsx(xlsx_path):
         if s_min > 0 or s_sec > 0:
             start_pt = (s_min * 60) + s_sec
 
+        # Optional STOP point (Stop_Min / Stop_Sec): stop processing at this video
+        # time — the mirror of Start_Min/Start_Sec. None = process to the end.
+        stop_pt = None
+        e_min = float(row0.get('Stop_Min', 0))
+        e_sec = float(row0.get('Stop_Sec', 0))
+        if e_min > 0 or e_sec > 0:
+            stop_pt = (e_min * 60) + e_sec
+            if start_pt is not None and stop_pt <= start_pt:
+                print(f"\n*** WARNING: Stop point ({stop_pt:g}s) is <= start point "
+                      f"({start_pt:g}s); no frames would be processed. Ignoring stop. ***\n")
+                stop_pt = None
+
         # 2. LISTS (Scan columns for per-trial data)
         s_nodes = []
         if 'Start_Nodes' in df.columns:
@@ -1878,6 +1907,7 @@ def parse_metadata_xlsx(xlsx_path):
 
         metadata = {
             'start_point': start_pt,
+            'stop_point': stop_pt,
             'custom_trial': (lambda v: int(float(v)) if not pd.isna(v) else 1)(row0.get('Start_At_Trial_Num', 1)),
             'rat': safe_int_str(row0['Rat_ID']),
             'date': safe_int_str(row0['Date']),
