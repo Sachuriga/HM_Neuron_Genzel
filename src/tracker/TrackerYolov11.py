@@ -288,6 +288,15 @@ class Tracker:
                 mm = int(t_secs // 60)
                 ss = t_secs - mm * 60
                 print(f"   Trial {t_num} → {mm:02d}:{ss:05.2f}")
+        # termination time-locks: {trial_num → force-end at session seconds}
+        self.special_end_seconds = self.metadata.get('special_end_seconds', {}) or {}
+        self._end_held_logged = set()      # trials we've already announced as held
+        if self.special_end_seconds:
+            print("Trial END schedule (trial_num → held until / force-end at session seconds):")
+            for t_num, t_secs in sorted(self.special_end_seconds.items()):
+                mm = int(t_secs // 60)
+                ss = t_secs - mm * 60
+                print(f"   Trial {t_num} → {mm:02d}:{ss:05.2f}")
         self.did_not_reach_list = self.metadata.get('did_not_reach_list', [])
         self.xlsx_src_path = self.metadata.get('xlsx_src_path', None)
         self.repeat = self.metadata['repeat']
@@ -579,26 +588,47 @@ class Tracker:
         print(f">> Full coordinate data saved to: {save_path}  ({len(df_tracking)} rows, {len(df_tracking.columns)} cols)")
 
     def check_special_schedule(self):
-        """If a time-locked special trial's unlock time has arrived while an
-        earlier trial is still active, force-end the earlier trial.
+        """Per-frame time-lock scheduling for the active trial:
 
-        After force-ending we arm `start_trial` directly to bypass the
-        TrigA/TrigB researcher-proximity triggers — but the inter-trial
-        lockout is preserved separately inside `find_start` so the next
-        trial still can't actually begin within the 10-minute window after
-        a type-4/5/6 trial's start."""
-        if not self.special_start_seconds or not self.record_detections:
+        (A) Special_Trials_End: force-end THIS trial once its scheduled end time
+            arrives. Until then end_trial() refuses every early end, so the trial
+            cannot finish before the lock no matter what triggers it.
+        (B) Special_Trials 'trial_num@MM:SS': when a LATER trial's start time
+            arrives while an earlier trial is still active, force-end the earlier
+            trial and arm `start_trial` directly (bypassing the TrigA/TrigB
+            researcher-proximity triggers) so the scheduled trial can begin. If
+            the active trial is still held by its own end-lock, end_trial()
+            returns False and we do NOT arm the next trial.
+
+        The inter-trial lockout is preserved separately inside `find_start` so the
+        next trial still can't actually begin within the 10-minute window after a
+        type-4/5/6 trial's start."""
+        if not (self.special_start_seconds or self.special_end_seconds) or not self.record_detections:
             return
         elapsed_s = self.frame_time / 1000.0
+
+        # (A) TERMINATION time-lock: force-end THIS trial once its scheduled end
+        # time arrives (until now end_trial has been refusing every early end).
+        end_s = self.special_end_seconds.get(self.trial_num)
+        if end_s is not None and elapsed_s >= end_s:
+            print(f"\n[SCHEDULE] Trial {self.trial_num} end time {end_s:.2f}s reached "
+                  f"at session {elapsed_s:.2f}s — force-ending it.")
+            self.end_trial(reason="forced by end schedule")
+            return
+
+        # (B) START time-lock: a LATER trial's unlock arrived while this one is
+        # active — force-end the active trial so the scheduled one can begin. If
+        # this trial is still held by its own end-lock, end_trial returns False
+        # and we do NOT arm the next trial (its end-lock wins).
         for sp_trial_num, sp_unlock_s in self.special_start_seconds.items():
             if sp_trial_num <= self.trial_num:
                 continue
             if elapsed_s >= sp_unlock_s:
                 print(f"\n[SCHEDULE] Trial {sp_trial_num} unlock time {sp_unlock_s:.2f}s "
                       f"reached at session {elapsed_s:.2f}s — force-ending active trial {self.trial_num}.")
-                self.end_trial(reason="forced by special trial schedule")
-                self.start_trial = True
-                self.check = False
+                if self.end_trial(reason="forced by special trial schedule"):
+                    self.start_trial = True
+                    self.check = False
                 return
 
     def find_start(self, center_rat):
@@ -850,9 +880,9 @@ class Tracker:
                 self.probe = False
                 self.probe_researcher_signalled = False
                 self.reached = False
-                self.end_trial(reason="unnormal interval timeout")
-                self.start_trial = True
-                self.check = False
+                if self.end_trial(reason="unnormal interval timeout"):
+                    self.start_trial = True
+                    self.check = False
                 return
 
         # --- RESEARCHER TRIGGER: start next trial (closest researcher to RAT) ---
@@ -1155,6 +1185,20 @@ class Tracker:
                     self.end_trial(reason="normal reached goal")
 
     def end_trial(self, reason="unknown"):
+        # TERMINATION TIME-LOCK: a trial with a Special_Trials_End time must NOT
+        # end before that time — no matter what asked it to (goal reached,
+        # researcher proximity, any timeout, or a later trial's start schedule).
+        # This is the single choke point every end path goes through. Returns
+        # True if the trial actually ended, False if it was held by the lock.
+        end_s = (self.special_end_seconds.get(self.trial_num)
+                 if getattr(self, "special_end_seconds", None) else None)
+        if end_s is not None and (self.frame_time / 1000.0) < end_s:
+            if self.trial_num not in self._end_held_logged:
+                print(f'[END-LOCK] Trial {self.trial_num} held until {end_s:.2f}s; '
+                      f'ignoring early end ("{reason}").')
+                self._end_held_logged.add(self.trial_num)
+            return False
+
         self._last_end_reason = reason
         self._last_end_frame_time = self.frame_time
         _delay_s = round((self.frame_time - self.last_trial_start_time_ms) / 1000, 2)
@@ -1238,6 +1282,7 @@ class Tracker:
         self.count_rat = 0
 
         print(f'[END_TRIAL] → next trial_num={self.trial_num} counter={self.counter} end_session={self.end_session}')
+        return True
 
 
     def timer(self, start):
@@ -1887,6 +1932,30 @@ def parse_metadata_xlsx(xlsx_path):
                               f"timed trial, format the cell as Text and enter "
                               f"'trial_num@MM:SS', e.g. '2@12:05'. ***\n")
 
+        # Special_Trials_End: per-trial TERMINATION time-lock, the mirror of the
+        # 'trial_num@MM:SS' start-lock in Special_Trials. Each cell is
+        # "trial_num@MM:SS" and means: this trial MUST NOT end before that session
+        # time (all normal end conditions are ignored until then), and is
+        # force-ended when it arrives. Enter as TEXT so Excel keeps the literal.
+        special_end_seconds = {}   # {trial_num (1-based): seconds_from_session_start}
+        if 'Special_Trials_End' in df.columns:
+            for raw in df['Special_Trials_End'].dropna().tolist():
+                s = str(raw).strip()
+                if not s:
+                    continue
+                if '@' not in s:
+                    print(f"\n*** WARNING: Special_Trials_End entry '{s}' is not in "
+                          f"'trial_num@MM:SS' form and was ignored. Format the cell as "
+                          f"Text and enter e.g. '3@15:30'. ***\n")
+                    continue
+                try:
+                    trial_part, time_part = s.split('@', 1)
+                    t_num = int(float(trial_part.strip()))
+                    special_end_seconds[t_num] = parse_schedule_seconds(time_part)
+                except (ValueError, IndexError) as e:
+                    print(f"\n*** WARNING: could not parse Special_Trials_End entry "
+                          f"'{s}' ({e}); this trial will NOT be time-terminated. ***\n")
+
         did_not_reach = []
         dnr_col = [c for c in df.columns if c.lower() == 'did_not_reach']
         if dnr_col:
@@ -1920,6 +1989,7 @@ def parse_metadata_xlsx(xlsx_path):
             'trial_types_list': t_types,
             'special_trials_list': sp_trials,
             'special_start_seconds': special_start_seconds,
+            'special_end_seconds': special_end_seconds,
             'did_not_reach_list': did_not_reach,
             'unnormal_intervals': un_dict
         }
