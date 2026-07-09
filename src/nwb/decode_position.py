@@ -62,14 +62,21 @@ def _smooth2d(flat, nx, ny, sigma):
 
 
 def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
-                   sigma=1.0, n_chunks=100, lead_s=0.0, save=True, plot=True):
+                   sigma=1.0, n_chunks=100, lead_s=0.0, save=True, plot=True,
+                   shuffle_seed=None, speed_thresh=0.05):
     """Cross-validated Bayesian decoding for one session NWB. Returns a dict of
     results (or None) and writes a PDF next to it.
 
     lead_s > 0 turns the decoder into a PREDICTOR of the future position: each
     spike is associated with where the animal will be `lead_s` seconds later, so
     decoding a spike-count bin yields the predicted position `lead_s` seconds
-    ahead, compared against the true future position."""
+    ahead, compared against the true future position.
+
+    shuffle_seed (int) circularly shifts each unit's spike train by an independent
+    random offset before anything else, breaking the spike<->position coupling
+    while preserving each cell's firing rate and temporal autocorrelation. This is
+    the null decode (should reflect occupancy only); used by predictive_coding.py
+    to test whether the real decode carries information beyond occupancy."""
     io = NWBHDF5IO(str(nwb_path), mode="r", load_namespaces=True)
     try:
         nwb = io.read()
@@ -83,6 +90,14 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         x = pos[0] / V.SCALE_X; y = pos[1] / V.SCALE_Y; t = pos[2]
         dt_pos = float(np.median(np.diff(t))) if t.size > 1 else 1.0 / 30
         nU = len(units)
+
+        # null decode: circularly shift each unit's spikes by an independent random
+        # offset (keeps rate + ACG, destroys spike<->position coupling).
+        if shuffle_seed is not None and t.size > 1:
+            _rng = np.random.default_rng(shuffle_seed)
+            _t0, _T = float(t[0]), float(t[-1] - t[0]) or 1.0
+            units = [(uid, _t0 + np.mod(st - _t0 + _rng.uniform(0.05 * _T, 0.95 * _T), _T))
+                     for uid, st in units]
 
         # spatial grid (metres) restricted later to visited bins
         xmin, xmax, ymin, ymax = V.MAZE_EXTENT
@@ -98,6 +113,16 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         pix = np.clip(np.digitize(x, xe) - 1, 0, nx - 1)
         piy = np.clip(np.digitize(y, ye) - 1, 0, ny - 1)
         pbid = piy * nx + pix                            # spatial bin per pos sample
+
+        # speed gate (place-cell convention): tuning curves are built from RUN epochs
+        # only — occupancy + spikes below speed_thresh (m/s) are excluded so immobility
+        # doesn't contaminate the place fields. speed in metres/s; 0 disables.
+        sp = np.zeros_like(x)
+        if x.size > 1:
+            _d = np.hypot(np.diff(x), np.diff(y)); _dts = np.diff(t)
+            sp[1:] = _d / np.where(_dts > 0, _dts, np.inf)
+        moving = (sp > speed_thresh) if (speed_thresh and speed_thresh > 0) else np.ones_like(x, bool)
+        run = good & moving                              # samples used to fit tuning curves
 
         # decode time bins (spike counts + actual position per bin)
         edges = np.arange(t[0], t[-1] + time_bin, time_bin)
@@ -125,7 +150,10 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         for uid, st in units:
             sx = np.interp(st + lead_s, t, x, left=np.nan, right=np.nan)
             sy = np.interp(st + lead_s, t, y, left=np.nan, right=np.nan)
+            sv = np.interp(st + lead_s, t, sp, left=0.0, right=0.0)   # speed at binned pos
             ok = np.isfinite(sx) & np.isfinite(sy)
+            if speed_thresh and speed_thresh > 0:
+                ok &= sv > speed_thresh                  # keep only run-epoch spikes
             sbid = (np.clip(np.digitize(sy[ok], ye) - 1, 0, ny - 1) * nx
                     + np.clip(np.digitize(sx[ok], xe) - 1, 0, nx - 1))
             spk.append((sbid, _fold_of(st[ok]), st[ok]))
@@ -147,6 +175,13 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
         else:
             ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
             ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
+
+        # decode only RUN-epoch time bins too: run-epoch tuning curves can't explain
+        # immobility bins, so evaluating them would inflate error. A bin is kept if the
+        # animal's mean speed in it exceeds speed_thresh (consistent with the tuning curves).
+        if speed_thresh and speed_thresh > 0:
+            bin_speed = np.bincount(sb[good], weights=sp[good], minlength=nb) / np.where(cnt > 0, cnt, 1)
+            occupied = occupied & (bin_speed > speed_thresh)
 
         decoded_x = np.full(nb, np.nan); decoded_y = np.full(nb, np.nan)
         min_occ = 0.3                        # only decode over well-sampled bins (s)
@@ -175,11 +210,11 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
             best = vidx[np.argmax(logpost, axis=1)]
             decoded_x[test_bins] = cx[best]; decoded_y[test_bins] = cy[best]
 
-        if folds <= 1:                       # train on ALL data, decode everything
-            _fit_and_decode(good, lambda sf: np.ones(sf.shape, bool), np.where(occupied)[0])
+        if folds <= 1:                       # train on ALL run epochs, decode everything
+            _fit_and_decode(run, lambda sf: np.ones(sf.shape, bool), np.where(occupied)[0])
         else:                                # cross-validated (train on other folds)
             for f in range(folds):
-                _fit_and_decode((samp_fold != f) & good, (lambda ff: (lambda sf: sf != ff))(f),
+                _fit_and_decode((samp_fold != f) & run, (lambda ff: (lambda sf: sf != ff))(f),
                                 np.where((bin_fold == f) & occupied)[0])
 
         dec = np.isfinite(decoded_x) & occupied
@@ -778,15 +813,19 @@ if __name__ == "__main__":
                          "the lead-0 visualisation track (decoded_<q>.npz) is full-data.")
     ap.add_argument("--cv_folds", type=int, default=5,
                     help="cross-validation folds for the multi-lead accuracy (default 5).")
+    ap.add_argument("--speed_thresh", type=float, default=0.05,
+                    help="speed gate (m/s) for the tuning curves: build place fields from "
+                         "RUN epochs only (0 = no gating; default 0.05).")
     args = ap.parse_args()
     try:
         if args.leads:
             run(args.output_folder, args.quality, leads=args.leads,
                 bin_cm=args.bin_cm, time_bin=args.time_bin,
-                cv_folds=args.cv_folds, viz_folds=args.folds)
+                cv_folds=args.cv_folds, viz_folds=args.folds, speed_thresh=args.speed_thresh)
         else:
             run(args.output_folder, args.quality, bin_cm=args.bin_cm,
-                time_bin=args.time_bin, folds=args.folds, lead_s=args.lead_s)
+                time_bin=args.time_bin, folds=args.folds, lead_s=args.lead_s,
+                speed_thresh=args.speed_thresh)
     except Exception as e:
         print(f"[decode] Failed: {e}")
         traceback.print_exc()

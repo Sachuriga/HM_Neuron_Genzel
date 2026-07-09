@@ -585,6 +585,11 @@ def main():
         # decoded-overlay leads (default 0 1 2 3).
         make_vid = os.environ.get("DECODE_VIDEO", "1") != "0"
         vid_leads = os.environ.get("DECODE_VIDEO_LEADS", "0 1 2 3").split()
+        # predictive-coding test: is the long-lead 'prediction' genuine, or behaviour/
+        # occupancy? figures -> <op>/predictive_coding/. PREDICTIVE_CODING=0 disables.
+        run_pc = os.environ.get("PREDICTIVE_CODING", "1") != "0"
+        pc_cv = os.environ.get("PC_CV_FOLDS", "5")
+        pc_shuf = os.environ.get("PC_SHUFFLE", "8")
         # always produce BOTH a good-only and a good+mua decode per session.
         qual_sets = [["good"], ["good", "mua"]]
         print("\n" + "=" * 56)
@@ -612,6 +617,15 @@ def main():
                         vrc = run(vcmd)
                         print(f"[DECODE {i}/{total}] units {'+'.join(quals)} decoded-video: "
                               f"{'Done.' if vrc == 0 else 'Python exited with error. Continuing...'}")
+                    # predictive-coding test (neural vs behaviour/kinematics/shuffle
+                    # baselines + overshoot + decode-density figures) for this quality.
+                    if run_pc and Path("./src/nwb/predictive_coding.py").exists():
+                        prc = run([PYTHON, "-u", "./src/nwb/predictive_coding.py",
+                                   "--output_folder", op, "--config", config,
+                                   "--quality", *quals, "--cv_folds", pc_cv,
+                                   "--n_shuffle", pc_shuf])
+                        print(f"[DECODE {i}/{total}] units {'+'.join(quals)} predictive-coding: "
+                              f"{'Done.' if prc == 0 else 'Python exited with error. Continuing...'}")
                 # spikes-on-video (top-N good pyramidal cells by spatial info),
                 # once per op — the goal-trial spike-path overlay on the real video.
                 if make_vid and Path("./src/nwb/make_videos.py").exists():
