@@ -275,7 +275,8 @@ def _spike_pixels(spike_times, sec, x, y):
 # ------------------------------------------------------------
 def make_spike_path_videos(output_folder, n_units=20, quality="good",
                            exclude_types=(4, 5), hold_s=0.6, stride=1,
-                           trials_sel=None, trail=True):
+                           trials_sel=None, trail=True, jitter=True,
+                           fr_offset_px=30.0, jitter_px=6.0):
     """One mp4 per goal trial: the real behaviour video with the top-`n_units`
     spatial-information pyramidal cells' spikes overlaid (one colour per unit,
     accumulating), reset per trial."""
@@ -314,10 +315,32 @@ def make_spike_path_videos(output_folder, n_units=20, quality="good",
         cap.release(); print("  no goal trials to render."); return []
 
     colors = _unit_colors(len(top))
+    # firing-rate-ranked perpendicular OFFSET so the 20 colour-coded units don't all
+    # pile onto the 1-D path: highest-FR unit hugs the line (offset 0), lowest-FR unit
+    # sits farthest out; a small random jitter spreads a unit's own spikes too.
+    dur = float(t.max() - t.min()) or 1.0
+    fr = np.array([st.size / dur for (_c, st, _s) in top], float)
+    rank = np.argsort(np.argsort(fr))                    # 0=lowest FR .. n-1=highest
+    base_off = fr_offset_px * (1.0 - rank / max(len(top) - 1, 1))
+    # path direction (px/s) for the perpendicular, from the tracked trajectory
+    vok = np.isfinite(sec) & np.isfinite(x) & np.isfinite(y)
+    svu, uidx = np.unique(sec[vok], return_index=True)
+    xu, yu = x[vok][uidx], y[vok][uidx]
+    vx, vy = np.gradient(xu, svu), np.gradient(yu, svu)
+    rng = np.random.default_rng(0)
+
     # per-unit spike (time, pixel) once for the whole session
     units = []
     for k, (cid, st, si) in enumerate(top):
         ts, sx, sy = _spike_pixels(st, sec, x, y)
+        if jitter and ts.size:
+            vxk = np.interp(ts, svu, vx); vyk = np.interp(ts, svu, vy)
+            nrm = np.hypot(vxk, vyk); nrm[nrm == 0] = 1.0
+            perpx, perpy = -vyk / nrm, vxk / nrm         # unit normal to the path
+            sign = rng.choice([-1.0, 1.0], size=ts.size)
+            r = base_off[k] + rng.uniform(0.0, jitter_px, size=ts.size)
+            sx = sx + perpx * sign * r
+            sy = sy + perpy * sign * r
         units.append({"cid": cid, "si": si, "ts": ts, "sx": sx, "sy": sy,
                       "bgr": colors[k]})
     legend = [(f"u{u['cid']}", u["bgr"]) for u in units]
@@ -535,13 +558,15 @@ def make_decoded_leads_videos(output_folder, leads=(0.0, 1.0, 2.0, 3.0),
 # ------------------------------------------------------------
 def make_videos(output_folder, which="both", n_units=20, leads=(0.0, 1.0, 2.0, 3.0),
                 quality=("good",), exclude_types=(4, 5), hold_s=0.6, stride=1,
-                bin_cm=10.0, time_bin=0.5, trials_sel=None):
+                bin_cm=10.0, time_bin=0.5, trials_sel=None, jitter=True,
+                fr_offset_px=30.0):
     q0 = list(quality)[0] if quality else "good"
     made = []
     if which in ("spikes", "both"):
         made += make_spike_path_videos(
             output_folder, n_units=n_units, quality=q0, exclude_types=exclude_types,
-            hold_s=hold_s, stride=stride, trials_sel=trials_sel)
+            hold_s=hold_s, stride=stride, trials_sel=trials_sel, jitter=jitter,
+            fr_offset_px=fr_offset_px)
     if which in ("decoded", "both"):
         made += make_decoded_leads_videos(
             output_folder, leads=leads, quality=quality, exclude_types=exclude_types,
