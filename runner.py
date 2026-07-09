@@ -69,7 +69,7 @@ MENU = [
     ("w", "nwblfp (NWB / LFP package)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
-    ("b", "Bayesian position decoder + decoded-on-video overlay per session (good and good+mua)"),
+    ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
     ("m", "Neural population UMAP per session (good and good+mua; Gardner et al. 2022)"),
     ("s", "Session summary (cross-session per-animal plots by date/repeat/session)"),
     ("t", "Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)"),
@@ -578,9 +578,11 @@ def main():
         # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
         # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
         leads = os.environ.get("DECODE_LEADS", "0 1 3").split()
-        # after each decode, overlay the decoded position onto the real behaviour
-        # video (make_videos.py, one mp4 per goal trial). DECODE_VIDEO=0 disables it;
-        # DECODE_VIDEO_LEADS picks the leads shown in the overlay (default 0 1 2 3).
+        # after decoding, overlay analysis onto the real behaviour video via
+        # make_videos.py (one mp4 per goal trial): the decoded position per quality
+        # set, plus a spikes-on-path video (top-20 good pyramidal by spatial info,
+        # once per op). DECODE_VIDEO=0 disables both; DECODE_VIDEO_LEADS picks the
+        # decoded-overlay leads (default 0 1 2 3).
         make_vid = os.environ.get("DECODE_VIDEO", "1") != "0"
         vid_leads = os.environ.get("DECODE_VIDEO_LEADS", "0 1 2 3").split()
         # always produce BOTH a good-only and a good+mua decode per session.
@@ -610,6 +612,13 @@ def main():
                         vrc = run(vcmd)
                         print(f"[DECODE {i}/{total}] units {'+'.join(quals)} decoded-video: "
                               f"{'Done.' if vrc == 0 else 'Python exited with error. Continuing...'}")
+                # spikes-on-video (top-N good pyramidal cells by spatial info),
+                # once per op — the goal-trial spike-path overlay on the real video.
+                if make_vid and Path("./src/nwb/make_videos.py").exists():
+                    src = run([PYTHON, "-u", "./src/nwb/make_videos.py", "--output_folder", op,
+                               "--config", config, "--which", "spikes", "--quality", "good"])
+                    print(f"[DECODE {i}/{total}] spikes-on-video: "
+                          f"{'Done.' if src == 0 else 'Python exited with error. Continuing...'}")
             else:
                 print("[DECODE] decode_position.py NOT found.")
         print(f"\n[MASTER] Position-decoder complete for all {total} folder(s).")
