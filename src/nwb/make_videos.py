@@ -276,7 +276,7 @@ def _spike_pixels(spike_times, sec, x, y):
 def make_spike_path_videos(output_folder, n_units=20, quality="good",
                            exclude_types=(4, 5), hold_s=0.6, stride=1,
                            trials_sel=None, trail=True, jitter=True,
-                           fr_offset_px=30.0, jitter_px=6.0):
+                           fr_offset_px=15.0, jitter_px=6.0, speed_thresh=0.05):
     """One mp4 per goal trial: the real behaviour video with the top-`n_units`
     spatial-information pyramidal cells' spikes overlaid (one colour per unit,
     accumulating), reset per trial."""
@@ -327,12 +327,18 @@ def make_spike_path_videos(output_folder, n_units=20, quality="good",
     svu, uidx = np.unique(sec[vok], return_index=True)
     xu, yu = x[vok][uidx], y[vok][uidx]
     vx, vy = np.gradient(xu, svu), np.gradient(yu, svu)
+    # running speed (m/s) per sample, to speed-gate spikes to RUN epochs (place-cell
+    # convention, same 0.05 m/s used by the rate maps / spatial info / decoder).
+    speed_m = np.hypot(np.gradient(xu / V.SCALE_X, svu), np.gradient(yu / V.SCALE_Y, svu))
     rng = np.random.default_rng(0)
 
     # per-unit spike (time, pixel) once for the whole session
     units = []
     for k, (cid, st, si) in enumerate(top):
         ts, sx, sy = _spike_pixels(st, sec, x, y)
+        if speed_thresh and speed_thresh > 0 and ts.size:
+            keep = np.interp(ts, svu, speed_m) > speed_thresh    # keep run-epoch spikes
+            ts, sx, sy = ts[keep], sx[keep], sy[keep]
         if jitter and ts.size:
             vxk = np.interp(ts, svu, vx); vyk = np.interp(ts, svu, vy)
             nrm = np.hypot(vxk, vyk); nrm[nrm == 0] = 1.0
@@ -559,14 +565,14 @@ def make_decoded_leads_videos(output_folder, leads=(0.0, 1.0, 2.0, 3.0),
 def make_videos(output_folder, which="both", n_units=20, leads=(0.0, 1.0, 2.0, 3.0),
                 quality=("good",), exclude_types=(4, 5), hold_s=0.6, stride=1,
                 bin_cm=10.0, time_bin=0.5, trials_sel=None, jitter=True,
-                fr_offset_px=30.0):
+                fr_offset_px=15.0, speed_thresh=0.05):
     q0 = list(quality)[0] if quality else "good"
     made = []
     if which in ("spikes", "both"):
         made += make_spike_path_videos(
             output_folder, n_units=n_units, quality=q0, exclude_types=exclude_types,
             hold_s=hold_s, stride=stride, trials_sel=trials_sel, jitter=jitter,
-            fr_offset_px=fr_offset_px)
+            fr_offset_px=fr_offset_px, speed_thresh=speed_thresh)
     if which in ("decoded", "both"):
         made += make_decoded_leads_videos(
             output_folder, leads=leads, quality=quality, exclude_types=exclude_types,
@@ -603,8 +609,11 @@ if __name__ == "__main__":
                     help="only render these (1-based Trial_Num) trials.")
     ap.add_argument("--no_jitter", action="store_true",
                     help="disable the firing-rate perpendicular jitter on spikes-on-video.")
-    ap.add_argument("--fr_offset_px", type=float, default=30.0,
-                    help="max perpendicular offset (px) for the lowest-FR unit's spikes (default 30).")
+    ap.add_argument("--fr_offset_px", type=float, default=15.0,
+                    help="max perpendicular offset (px) for the lowest-FR unit's spikes (default 15).")
+    ap.add_argument("--speed_thresh", type=float, default=0.05,
+                    help="speed gate (m/s) for spikes-on-video: show only run-epoch spikes "
+                         "(0 = no gating; default 0.05).")
     args = ap.parse_args()
 
     try:
@@ -614,7 +623,8 @@ if __name__ == "__main__":
             exclude_types=tuple(args.exclude_types), hold_s=args.hold_s,
             stride=max(1, args.stride), bin_cm=args.bin_cm, time_bin=args.time_bin,
             trials_sel=set(args.trials) if args.trials else None,
-            jitter=not args.no_jitter, fr_offset_px=args.fr_offset_px)
+            jitter=not args.no_jitter, fr_offset_px=args.fr_offset_px,
+            speed_thresh=args.speed_thresh)
         if not made:
             print("[videos] Nothing written."); sys.exit(1)
         print(f"[videos] wrote {len(made)} file(s).")
