@@ -318,7 +318,7 @@ def make_spike_path_videos(output_folder, n_units=20, quality="good",
     # firing-rate-ranked perpendicular OFFSET so the 20 colour-coded units don't all
     # pile onto the 1-D path: highest-FR unit hugs the line (offset 0), lowest-FR unit
     # sits farthest out; a small random jitter spreads a unit's own spikes too.
-    dur = float(t.max() - t.min()) or 1.0
+    dur = float(pos[2].max() - pos[2].min()) or 1.0
     fr = np.array([st.size / dur for (_c, st, _s) in top], float)
     rank = np.argsort(np.argsort(fr))                    # 0=lowest FR .. n-1=highest
     base_off = fr_offset_px * (1.0 - rank / max(len(top) - 1, 1))
@@ -601,6 +601,10 @@ if __name__ == "__main__":
     ap.add_argument("--time_bin", type=float, default=0.5, help="decoder time bin (s).")
     ap.add_argument("--trials", type=int, nargs="+", default=None,
                     help="only render these (1-based Trial_Num) trials.")
+    ap.add_argument("--no_jitter", action="store_true",
+                    help="disable the firing-rate perpendicular jitter on spikes-on-video.")
+    ap.add_argument("--fr_offset_px", type=float, default=30.0,
+                    help="max perpendicular offset (px) for the lowest-FR unit's spikes (default 30).")
     args = ap.parse_args()
 
     try:
@@ -609,7 +613,8 @@ if __name__ == "__main__":
             leads=tuple(args.leads), quality=tuple(args.quality),
             exclude_types=tuple(args.exclude_types), hold_s=args.hold_s,
             stride=max(1, args.stride), bin_cm=args.bin_cm, time_bin=args.time_bin,
-            trials_sel=set(args.trials) if args.trials else None)
+            trials_sel=set(args.trials) if args.trials else None,
+            jitter=not args.no_jitter, fr_offset_px=args.fr_offset_px)
         if not made:
             print("[videos] Nothing written."); sys.exit(1)
         print(f"[videos] wrote {len(made)} file(s).")
