@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from fractions import Fraction
-from scipy.signal import resample_poly
+from scipy.signal import resample_poly, firwin
 
 # Target rate so motion lines up with the 1000 Hz LFP export.
 TARGET_FS = 1000
@@ -116,6 +116,55 @@ def downsample(values, src_fs, target_fs):
     return resample_poly(values, up, down).astype('float32')
 
 
+def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
+    """Derive a 1-D movement signal from multi-axis accelerometer data.
+
+    Faithful port of the ``'Channels (accelerometer)'`` motion branch of the
+    sleep scorer's ``TheStateEditor.m`` (the algorithm ``sleep_scorer_andres.m``
+    invokes on its AUX accelerometer channels):
+
+        1. z-score each axis across time, take ``|.|``
+        2. sum across axes -> one signal
+        3. 0.1-1 Hz linear-phase FIR band-pass (``fir1(500)`` == a 501-tap
+           Hamming-window ``firwin``; symmetric taps make MATLAB's ``filter2``
+           correlation identical to convolution, so ``mode='same'`` matches)
+        4. average into 1-second bins
+
+    Parameters
+    ----------
+    accel : (n_samples, n_axes) array at ``fs`` Hz
+    fs    : sample rate of ``accel`` (Hz)
+
+    Returns
+    -------
+    (n_seconds,) float32 movement, one value per second, ready to hand to the
+    sleep scorer as a precomputed motion signal (``MotionType='File'``).
+    """
+    x = np.asarray(accel, dtype=np.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+
+    # 1-2. |z-score| per axis, summed across axes
+    mu = x.mean(axis=0, keepdims=True)
+    sd = x.std(axis=0, keepdims=True)
+    sd[sd == 0] = 1.0
+    m = np.abs((x - mu) / sd).sum(axis=1)
+
+    # 3. 0.1-1 Hz band-pass. fir1(forder) has forder+1 taps; forder is forced
+    #    even (as in the MATLAB) so the tap count is odd and the filter is
+    #    exactly zero-phase.
+    forder = int(np.ceil(forder / 2) * 2)
+    taps = firwin(forder + 1, [lowband, highband], fs=fs, pass_zero=False)
+    m = np.convolve(m, taps, mode="same")
+
+    # 4. average into 1-second bins (drop the ragged tail, as the MATLAB does)
+    fs_i = int(round(fs))
+    n_bins = m.size // fs_i
+    if n_bins == 0:
+        return np.zeros(0, dtype="float32")
+    return m[:n_bins * fs_i].reshape(n_bins, fs_i).mean(axis=1).astype("float32")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
@@ -206,6 +255,17 @@ def run(input_folder, output_folder):
     np.save(output_dir / "motion_timestamps.npy", ts_seconds)
     print(f"  ✓ motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
 
+    # Derived movement signal (accelerometer -> single motion trace), using the
+    # same algorithm the sleep scorer applies to accelerometer channels. Saved
+    # at 1 Hz (one value per second) so the scorer can load it directly as a
+    # precomputed motion signal (MotionType='File').
+    movement = accel_to_movement(motion, TARGET_FS)
+    np.save(output_dir / "motion_accel.npy", movement)
+    mv_ts = np.arange(movement.size, dtype="float64")   # bin start times (s)
+    np.save(output_dir / "motion_accel_timestamps.npy", mv_ts)
+    print(f"  ✓ motion_accel.npy  ({movement.size}) @ 1 Hz  "
+          f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass, 1 s bins)")
+
     np.save(output_dir / "motion_session_boundaries.npy", boundaries)
     if len(boundaries) > 1:
         for b in boundaries:
@@ -219,7 +279,9 @@ def run(input_folder, output_folder):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Extract headstage IMU Accel channels from Trodes "
-                    "-analogio export into motion.npy (n_samples, 3)."
+                    "-analogio export into motion.npy (n_samples, 3), plus a "
+                    "derived 1 Hz movement signal motion_accel.npy using the "
+                    "sleep scorer's accelerometer algorithm."
     )
     parser.add_argument('--input_folder', required=True,
                         help="Folder containing Trodes analogio export "
