@@ -62,7 +62,7 @@ MENU = [
     ("7", "Sorting"),
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
-    ("8", "LFP + Motion (IMU Accel)"),
+    ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP"),
     ("d", "deeplabcut"),
     ("9", "Cleaning"),
     ("n", "Node Analysis"),
@@ -284,8 +284,8 @@ def run_worker(ip, op, steps, out):
         for f in recs:
             log(out, f"    --- {f.name} ---")
             if lfp:
-                log(out, "    Exporting LFP (1000Hz, LP 500Hz)...")
-                run([lfp, "-rec", f, "-outputrate", "1000", "-lfplowpass", "500"], out=out)
+                log(out, "    Exporting LFP (1500Hz, LP 700Hz)...")
+                run([lfp, "-rec", f, "-outputrate", "1500", "-lfplowpass", "700"], out=out)
             else:
                 log(out, f"[WARNING] exportLFP not found at: {os.environ.get('TRODES_EXPORT_LFP','')}")
             if trodes:
@@ -348,6 +348,12 @@ def run_worker(ip, op, steps, out):
         if Path("./src/sorter/export_lfp.py").exists():
             log(out, "[STEP 8] Running LFP Extraction...")
             run([PYTHON, "-u", "./src/sorter/export_lfp.py",
+                 "--input_folder", ip, "--output_folder", op], out=out)
+        # EMG-from-LFP needs the raw wideband (300-600 Hz); runs after the LFP
+        # export so it can upsample onto lfp_timestamps.npy. Needs step 1 (-raw).
+        if Path("./src/sorter/export_emg_from_lfp.py").exists():
+            log(out, "[STEP 8] Running EMG-from-LFP (raw wideband, Buzsáki)...")
+            run([PYTHON, "-u", "./src/sorter/export_emg_from_lfp.py",
                  "--input_folder", ip, "--output_folder", op], out=out)
         if Path("./src/sorter/export_motion.py").exists():
             log(out, "[STEP 8] Running Motion (IMU Accel) Extraction...")

@@ -5,8 +5,8 @@ from pathlib import Path
 from fractions import Fraction
 from scipy.signal import resample_poly, firwin
 
-# Target rate so motion lines up with the 1000 Hz LFP export.
-TARGET_FS = 1000
+# Target rate so motion lines up with the LFP export (unified to 1500 Hz).
+TARGET_FS = 1500
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,8 +119,8 @@ def downsample(values, src_fs, target_fs):
 def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
     """Derive a 1-D movement signal from multi-axis accelerometer data.
 
-    Faithful port of the ``'Channels (accelerometer)'`` motion branch of the
-    sleep scorer's ``TheStateEditor.m`` (the algorithm ``sleep_scorer_andres.m``
+    Port of the ``'Channels (accelerometer)'`` motion branch of the sleep
+    scorer's ``TheStateEditor.m`` (the algorithm ``sleep_scorer_andres.m``
     invokes on its AUX accelerometer channels):
 
         1. z-score each axis across time, take ``|.|``
@@ -128,7 +128,13 @@ def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
         3. 0.1-1 Hz linear-phase FIR band-pass (``fir1(500)`` == a 501-tap
            Hamming-window ``firwin``; symmetric taps make MATLAB's ``filter2``
            correlation identical to convolution, so ``mode='same'`` matches)
-        4. average into 1-second bins
+
+    The result stays at the input rate ``fs`` (no 1-second binning), so it is the
+    same length and rate as ``motion.npy`` / ``emg_rms.npy`` and the rest of the
+    step-8 output. The sleep scorer averages it into 1-second spectrogram bins at
+    load time (``MotionType='File'``), which reproduces ``TheStateEditor``'s
+    final per-second motion exactly — and is identical to feeding it the raw
+    ``motion.npy`` in accelerometer mode.
 
     Parameters
     ----------
@@ -137,8 +143,7 @@ def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
 
     Returns
     -------
-    (n_seconds,) float32 movement, one value per second, ready to hand to the
-    sleep scorer as a precomputed motion signal (``MotionType='File'``).
+    (n_samples,) float32 movement envelope at ``fs`` Hz.
     """
     x = np.asarray(accel, dtype=np.float64)
     if x.ndim == 1:
@@ -155,14 +160,7 @@ def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
     #    exactly zero-phase.
     forder = int(np.ceil(forder / 2) * 2)
     taps = firwin(forder + 1, [lowband, highband], fs=fs, pass_zero=False)
-    m = np.convolve(m, taps, mode="same")
-
-    # 4. average into 1-second bins (drop the ragged tail, as the MATLAB does)
-    fs_i = int(round(fs))
-    n_bins = m.size // fs_i
-    if n_bins == 0:
-        return np.zeros(0, dtype="float32")
-    return m[:n_bins * fs_i].reshape(n_bins, fs_i).mean(axis=1).astype("float32")
+    return np.convolve(m, taps, mode="same").astype("float32")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -256,15 +254,14 @@ def run(input_folder, output_folder):
     print(f"  ✓ motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
 
     # Derived movement signal (accelerometer -> single motion trace), using the
-    # same algorithm the sleep scorer applies to accelerometer channels. Saved
-    # at 1 Hz (one value per second) so the scorer can load it directly as a
-    # precomputed motion signal (MotionType='File').
-    movement = accel_to_movement(motion, TARGET_FS)
+    # same algorithm the sleep scorer applies to accelerometer channels. Kept at
+    # TARGET_FS so every step-8 signal shares one rate and time axis
+    # (motion_timestamps.npy); the scorer averages it into 1 s bins at load time
+    # (MotionType='File'), reproducing the original per-second motion.
+    movement = accel_to_movement(motion, TARGET_FS)      # (n_down,) @ TARGET_FS
     np.save(output_dir / "motion_accel.npy", movement)
-    mv_ts = np.arange(movement.size, dtype="float64")   # bin start times (s)
-    np.save(output_dir / "motion_accel_timestamps.npy", mv_ts)
-    print(f"  ✓ motion_accel.npy  ({movement.size}) @ 1 Hz  "
-          f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass, 1 s bins)")
+    print(f"  ✓ motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
+          f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass)")
 
     np.save(output_dir / "motion_session_boundaries.npy", boundaries)
     if len(boundaries) > 1:
