@@ -121,6 +121,20 @@ def load_config():
         key = "".join(key.split())
         if key:
             os.environ[key] = val
+
+    # Auto-use the system ffmpeg (on PATH) when FFMPEG_CMD is unset or points to a
+    # path that doesn't exist here — e.g. a Windows path in the config on Linux/Mac,
+    # where ffmpeg is normally installed system-wide. Exported so all steps inherit it.
+    ff = os.environ.get("FFMPEG_CMD", "").strip()
+    if not (ff and (Path(ff).is_file() or shutil.which(ff))):
+        system_ff = shutil.which("ffmpeg")
+        if system_ff:
+            if ff:
+                print(f"[INFO] FFMPEG_CMD '{ff}' not found here — using system "
+                      f"ffmpeg on PATH: {system_ff}")
+            os.environ["FFMPEG_CMD"] = system_ff
+        elif ff:
+            print(f"[WARN] FFMPEG_CMD '{ff}' not found and no ffmpeg on PATH.")
     return cfg
 
 

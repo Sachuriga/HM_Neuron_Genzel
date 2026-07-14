@@ -3,9 +3,13 @@
 # Then update the paths below to match your machine.
 # Lines starting with # are ignored.
 
+# FFMPEG_CMD: full path to ffmpeg. On Linux/Mac ffmpeg is normally installed
+# system-wide, so you can leave this blank (or keep a Windows path) — if the path
+# doesn't exist here, the pipeline auto-uses the system ffmpeg on PATH.
 FFMPEG_CMD=C:\Users\YOUR_NAME\Desktop\ffmpeg-...\bin\ffmpeg.exe
 ONNX_WEIGHTS_PATH=C:\Users\YOUR_NAME\Desktop\data\yolov\bests_1280_mosiac_close.pt
 TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport.exe
+TRODES_EXPORT_LFP=C:\Users\gl_pc\Desktop\Trodes_2-8-0_Windows11\exportLFP.exe
 
 # -------------------------------------------------------------------
 # Video/LED sync (menu [2]).
@@ -118,7 +122,7 @@ SLEEP_CHANNELS_RAT5 = cortex:NT24 sr:NT16 pyr:NT30
 BAD_CHANNELS_RAT6 = 75 79
 REF_CHANNEL_RAT6 = 22
 EEG_TETRODES_RAT6 = NT12
-SLEEP_CHANNELS_RAT6 =
+SLEEP_CHANNELS_RAT6 = cortex:NT6 sr:NT13 pyr:NT31
 
 
 # Example for a second rat, using tetrode (NT) notation:
