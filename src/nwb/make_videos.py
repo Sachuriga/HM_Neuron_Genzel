@@ -38,6 +38,8 @@ import argparse
 import traceback
 from pathlib import Path
 
+from session_prefix import file_prefix
+
 import numpy as np
 import pandas as pd
 import cv2
@@ -365,7 +367,7 @@ def make_spike_path_videos(output_folder, n_units=20, quality="good",
 
     made = []
     for (k, tt, goal, start, f0, f1, t0, t1) in render:
-        out_path = out_dir / f"spikes_on_video_{quality}_trial{k:02d}_type{tt}.mp4"
+        out_path = out_dir / f"{file_prefix(output_folder)}spikes_on_video_{quality}_trial{k:02d}_type{tt}.mp4"
         vw = _writer(out_path, W, H, out_fps)
         overlay = np.zeros((H, W, 3), np.uint8)
         drawn = np.zeros((H, W), np.uint8)
@@ -491,7 +493,7 @@ def make_decoded_leads_videos(output_folder, leads=(0.0, 1.0, 2.0, 3.0),
 
     made = []
     for (k, tt, goal, start, f0, f1, t0, t1) in render:
-        out_path = out_dir / f"decoded_on_video_{tag}_trial{k:02d}_type{tt}.mp4"
+        out_path = out_dir / f"{file_prefix(output_folder)}decoded_on_video_{tag}_trial{k:02d}_type{tt}.mp4"
         vw = _writer(out_path, W, H, out_fps)
         overlay = np.zeros((H, W, 3), np.uint8)         # accumulated decoded trails
         drawn = np.zeros((H, W), np.uint8)

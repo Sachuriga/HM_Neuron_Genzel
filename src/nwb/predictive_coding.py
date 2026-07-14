@@ -37,6 +37,8 @@ import argparse
 import traceback
 from pathlib import Path
 
+from session_prefix import file_prefix
+
 import numpy as np
 
 import matplotlib
@@ -356,7 +358,8 @@ def run(output_folder, quality=("good",), leads=(0.0, 1.0, 2.0, 3.0),
     out_dir = Path(out_dir) if out_dir else Path(output_folder) / "predictive_coding"
     out_dir.mkdir(parents=True, exist_ok=True)
     tagf = "_".join(sorted(quals))
-    pdf_path = out_dir / f"predictive_coding_{tagf}.pdf"
+    pfx = file_prefix(output_folder)                     # rat_sessiondate_ prefix
+    pdf_path = out_dir / f"{pfx}predictive_coding_{tagf}.pdf"
     with PdfPages(str(pdf_path)) as pdf:
         _fig_error_vs_lead(pdf, per_lead, tag)
         _fig_overshoot(pdf, per_lead, goal_xy, tag)

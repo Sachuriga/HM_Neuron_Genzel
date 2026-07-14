@@ -5,6 +5,8 @@ from pathlib import Path
 from fractions import Fraction
 from scipy.signal import resample_poly, firwin
 
+from session_prefix import session_prefix
+
 # Target rate so motion lines up with the LFP export (unified to 1500 Hz).
 TARGET_FS = 1500
 
@@ -244,14 +246,16 @@ def run(input_folder, output_folder):
         boundaries.append({'name': sd['name'], 'start': start, 'n': sd['nd']})
         start += sd['nd']
 
-    out_file = output_dir / "motion.npy"
+    pfx = session_prefix(sessions_data[0]['name'])   # rat_sessiondate_ prefix
+
+    out_file = output_dir / f"{pfx}motion.npy"
     np.save(out_file, motion)
-    print(f"  ✓ motion.npy  {motion.shape}  columns={found_axes} @ {TARGET_FS} Hz")
+    print(f"  ✓ {pfx}motion.npy  {motion.shape}  columns={found_axes} @ {TARGET_FS} Hz")
 
     # Time axis at the downsampled rate, zero-referenced (seconds).
     ts_seconds = (np.arange(n_down) / TARGET_FS).astype('float64')
-    np.save(output_dir / "motion_timestamps.npy", ts_seconds)
-    print(f"  ✓ motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
+    np.save(output_dir / f"{pfx}motion_timestamps.npy", ts_seconds)
+    print(f"  ✓ {pfx}motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
 
     # Derived movement signal (accelerometer -> single motion trace), using the
     # same algorithm the sleep scorer applies to accelerometer channels. Kept at
@@ -259,11 +263,11 @@ def run(input_folder, output_folder):
     # (motion_timestamps.npy); the scorer averages it into 1 s bins at load time
     # (MotionType='File'), reproducing the original per-second motion.
     movement = accel_to_movement(motion, TARGET_FS)      # (n_down,) @ TARGET_FS
-    np.save(output_dir / "motion_accel.npy", movement)
-    print(f"  ✓ motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
+    np.save(output_dir / f"{pfx}motion_accel.npy", movement)
+    print(f"  ✓ {pfx}motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
           f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass)")
 
-    np.save(output_dir / "motion_session_boundaries.npy", boundaries)
+    np.save(output_dir / f"{pfx}motion_session_boundaries.npy", boundaries)
     if len(boundaries) > 1:
         for b in boundaries:
             print(f"    {b['name']}: samples {b['start']}.."

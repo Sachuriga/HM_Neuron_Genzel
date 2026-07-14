@@ -243,6 +243,19 @@ def log(out, msg):
     print(msg, file=out, flush=True)
 
 
+_SESSION_RE = __import__("re").compile(r"(?P<rat>[A-Za-z]+\d+).*?(?P<dt>\d{8}_\d{6})")
+
+
+def session_pfx(folder):
+    """rat_sessiondate_ prefix from a .rec (or the folder name) in `folder`, else ''."""
+    cands = sorted(Path(folder).glob("*.rec")) or [Path(folder)]
+    for c in cands:
+        m = _SESSION_RE.search(c.stem)
+        if m:
+            return f"{m.group('rat')}_{m.group('dt')}_"
+    return ""
+
+
 # ------------------------------------------------------------
 #                 THE WORKER (parallel, per ip/op pair)
 # ------------------------------------------------------------
@@ -348,7 +361,8 @@ def run_worker(ip, op, steps, out):
         if Path("./src/sorter/export_lfp.py").exists():
             log(out, "[STEP 8] Running LFP Extraction...")
             run([PYTHON, "-u", "./src/sorter/export_lfp.py",
-                 "--input_folder", ip, "--output_folder", op], out=out)
+                 "--input_folder", ip, "--output_folder", op,
+                 "--output_rate", "1500"], out=out)
         # EMG-from-LFP needs the raw wideband (300-600 Hz); runs after the LFP
         # export so it can upsample onto lfp_timestamps.npy. Needs step 1 (-raw).
         if Path("./src/sorter/export_emg_from_lfp.py").exists():
@@ -499,7 +513,7 @@ def main():
             print(f"\n[QUEUE] Preparing: {ip_path.name}")
             wait_for_resources()
             count += 1
-            name = ip_path.name
+            name = f"{session_pfx(ip_path)}{ip_path.name}"   # rat_sessiondate_ log/marker
             marker = tmp / f"hm_worker_{name}.done"
             try:
                 marker.unlink()

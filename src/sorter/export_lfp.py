@@ -7,6 +7,8 @@ from scipy.signal import welch
 from scipy.stats import zscore
 from tqdm import tqdm
 
+from session_prefix import session_prefix
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TRODES OFFICIAL READER (from readTrodesExtractedDataFile3.py)
@@ -341,7 +343,7 @@ STEPS = [
 ]
 
 
-def run_pipeline(input_folder, output_folder):
+def run_pipeline(input_folder, output_folder, output_rate=None):
     base_path  = Path(input_folder)
     output_dir = Path(output_folder) / "LFP_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -377,10 +379,24 @@ def run_pipeline(input_folder, output_folder):
 
         channels, fs, boundaries = load_and_concat_sessions(sessions)
         tqdm.write(f"  Sampling rate from header: {fs} Hz")
+        # The LFP header sometimes reports the raw acquisition rate (e.g. 30 kHz)
+        # rather than the decimated exportLFP output rate. That would make every
+        # downstream timestamp (and the sleep scorer's fs) 20× off. Trust the
+        # known output rate when given, and warn on any mismatch.
+        if output_rate is not None and abs(fs - output_rate) > 1:
+            tqdm.write(f"  ⚠ Overriding header rate {fs} Hz with --output_rate "
+                       f"{output_rate} Hz (the exportLFP -outputrate).")
+            fs = float(output_rate)
+        elif fs >= 20000:
+            tqdm.write(f"  ⚠ Header rate {fs} Hz looks like the RAW rate, not LFP. "
+                       f"Pass --output_rate <lfp Hz> so timestamps are correct.")
         advance(1)
 
         # ── 2. SAVE PER-CHANNEL .npy + COMBINED ARRAY ───────────────────────
         tqdm.write("Step 2/5 — Converting to .npy files")
+
+        # rat_sessiondate_ prefix for every generated file (from the recording).
+        pfx = session_prefix(sessions[0]['name'])
 
         npy_dir = output_dir / "channels_npy"
         npy_dir.mkdir(exist_ok=True)
@@ -392,26 +408,26 @@ def run_pipeline(input_folder, output_folder):
             nt = ch_info['ntrode']
             ch = ch_info['channel']
             if nt is not None:
-                fname = f"lfp_nt{nt:02d}_ch{ch:02d}.npy"
+                fname = f"{pfx}lfp_nt{nt:02d}_ch{ch:02d}.npy"
             else:
-                fname = f"lfp_ch{i:03d}.npy"
+                fname = f"{pfx}lfp_ch{i:03d}.npy"
             np.save(npy_dir / fname, ch_info['data'])
 
         tqdm.write(f"  ✓ Saved {num_channels} individual .npy files → {npy_dir}")
 
         # Build combined (n_samples, n_channels) array
         lfp_array = np.column_stack([ch['data'] for ch in channels])
-        np.save(output_dir / "lfp_data.npy", lfp_array)
+        np.save(output_dir / f"{pfx}lfp_data.npy", lfp_array)
 
         # Timestamps: build a continuous, gapless time axis across the
         # concatenated sessions. Per-session Trodes timestamps reset at each
         # recording start, so a raw concatenation would be non-monotonic; we
         # instead derive seconds from the sample index at the export rate.
         ts_seconds = (np.arange(n_samples) / fs).astype('float64')
-        np.save(output_dir / "lfp_timestamps.npy", ts_seconds)
+        np.save(output_dir / f"{pfx}lfp_timestamps.npy", ts_seconds)
 
         # Record where each session begins/ends within the concatenated data.
-        np.save(output_dir / "session_boundaries.npy", boundaries)
+        np.save(output_dir / f"{pfx}session_boundaries.npy", boundaries)
         if len(boundaries) > 1:
             for b in boundaries:
                 tqdm.write(f"    {b['name']}: samples {b['start']}.."
@@ -426,9 +442,9 @@ def run_pipeline(input_folder, output_folder):
                 'channel': ch['channel'],
                 'source_file': str(ch['file'].name),
             })
-        np.save(output_dir / "channel_map.npy", ch_info_list)
+        np.save(output_dir / f"{pfx}channel_map.npy", ch_info_list)
 
-        tqdm.write(f"  ✓ lfp_data.npy  ({n_samples}, {num_channels}) @ {fs} Hz")
+        tqdm.write(f"  ✓ {pfx}lfp_data.npy  ({n_samples}, {num_channels}) @ {fs} Hz")
 
         del channels
         gc.collect()
@@ -439,16 +455,16 @@ def run_pipeline(input_folder, output_folder):
         emg_ch = select_emg_channel(lfp_array, fs)
         emg_1d = lfp_array[:, emg_ch].copy()
 
-        np.save(output_dir / "emg_data.npy", emg_1d[:, np.newaxis])
-        np.save(output_dir / "emg_channel_index.npy", np.array([emg_ch]))
-        tqdm.write(f"  ✓ emg_data.npy  ({emg_1d.shape[0]}, 1)")
+        np.save(output_dir / f"{pfx}emg_data.npy", emg_1d[:, np.newaxis])
+        np.save(output_dir / f"{pfx}emg_channel_index.npy", np.array([emg_ch]))
+        tqdm.write(f"  ✓ {pfx}emg_data.npy  ({emg_1d.shape[0]}, 1)")
         advance(3)
 
         # ── 4. SELECT CLEANEST EEG CHANNELS ─────────────────────────────────
         tqdm.write("Step 4/5 — Selecting cleanest EEG channels")
         best_ch_idx, scores = select_cleanest_channels(lfp_array, fs, n_best=3)
-        np.save(output_dir / "cleanest_channel_indices.npy", best_ch_idx)
-        np.save(output_dir / "channel_snr_scores.npy", scores)
+        np.save(output_dir / f"{pfx}cleanest_channel_indices.npy", best_ch_idx)
+        np.save(output_dir / f"{pfx}channel_snr_scores.npy", scores)
         advance(4)
 
         # ── 5. COMPUTE AWAKENESS ────────────────────────────────────────────
@@ -456,9 +472,9 @@ def run_pipeline(input_folder, output_folder):
         awakeness, emg_rms, theta_delta = compute_awakeness(
             lfp_array, emg_1d, fs, best_ch_idx,
         )
-        np.save(output_dir / "awakeness.npy",        awakeness)
-        np.save(output_dir / "emg_rms.npy",          emg_rms)
-        np.save(output_dir / "theta_delta_ratio.npy", theta_delta)
+        np.save(output_dir / f"{pfx}awakeness.npy",        awakeness)
+        np.save(output_dir / f"{pfx}emg_rms.npy",          emg_rms)
+        np.save(output_dir / f"{pfx}theta_delta_ratio.npy", theta_delta)
         advance(5)
 
         del lfp_array, emg_1d
@@ -489,5 +505,8 @@ if __name__ == "__main__":
                         help="Folder containing Trodes LFP export (*.LFP/*.dat)")
     parser.add_argument('--output_folder', required=True,
                         help="Destination for all output files.")
+    parser.add_argument('--output_rate', type=float, default=None,
+                        help="LFP output rate in Hz (exportLFP -outputrate). "
+                             "Overrides the header rate so timestamps are correct.")
     args = parser.parse_args()
-    run_pipeline(args.input_folder, args.output_folder)
+    run_pipeline(args.input_folder, args.output_folder, output_rate=args.output_rate)

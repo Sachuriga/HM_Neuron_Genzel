@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - fallback when run as a module
 
 from emg_from_lfp import (emg_from_lfp, emg_correlation, _highfreq_passband,
                           _moving_average)
+from session_prefix import session_prefix, find_output
 
 RAW_FS = 30000.0        # raw acquisition rate (Hz)
 GAIN = 0.195            # µV/bit (as in sorting.py); irrelevant to Pearson corr
@@ -83,8 +84,8 @@ def spread_channels(n_channels, n_pick=N_PICK, ch_per_tetrode=CH_PER_TETRODE):
 
 def _lfp_sampling_rate(lfp_dir):
     """LFP sampling rate (Hz) from lfp_timestamps.npy, else None."""
-    ts_file = Path(lfp_dir) / "lfp_timestamps.npy"
-    if not ts_file.is_file():
+    ts_file = find_output(lfp_dir, "lfp_timestamps.npy")   # prefixed or not
+    if ts_file is None:
         return None
     ts = np.asarray(np.load(ts_file, mmap_mode="r")).ravel()
     if ts.size < 2:
@@ -99,8 +100,8 @@ def _hw_to_lfp_columns(lfp_dir, hw_channels):
     channel_map.npy holds per-column {index, ntrode, channel, ...}; the hardware
     id of a column is (ntrode-1)*4 + (channel-1). Returns the columns present.
     """
-    cmap_file = Path(lfp_dir) / "channel_map.npy"
-    if not cmap_file.is_file():
+    cmap_file = find_output(lfp_dir, "channel_map.npy")   # prefixed or not
+    if cmap_file is None:
         return None
     cmap = np.load(cmap_file, allow_pickle=True)
     hw_of_col = {}
@@ -131,8 +132,8 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None):
             f"LFP fs={fs:.0f} Hz (Nyquist {fs/2:.0f}) is below the 300–600 Hz EMG "
             f"band. Re-export LFP at 1500 Hz / -lfplowpass 700.")
 
-    data_file = lfp_dir / "lfp_data.npy"
-    if not data_file.is_file():
+    data_file = find_output(lfp_dir, "lfp_data.npy")       # prefixed or not
+    if data_file is None:
         raise FileNotFoundError("no lfp_data.npy in LFP_Output")
     data = np.load(data_file, mmap_mode="r")               # (n_samples, n_channels)
 
@@ -311,24 +312,25 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     rng = emg_5hz.max() - emg_5hz.min()
     emg_5hz_norm = ((emg_5hz - emg_5hz.min()) / (rng + 1e-12)).astype("float32")
 
-    np.save(output_dir / "emg_from_lfp_5hz.npy", emg_5hz_norm)
-    np.save(output_dir / "emg_from_lfp_timestamps.npy", ts_5hz)
-    print(f"  ✓ emg_from_lfp_5hz.npy  ({emg_5hz_norm.size}) @ {emg_fs} Hz")
+    pfx = session_prefix(_session_stem(input_folder))    # rat_sessiondate_ prefix
+    np.save(output_dir / f"{pfx}emg_from_lfp_5hz.npy", emg_5hz_norm)
+    np.save(output_dir / f"{pfx}emg_from_lfp_timestamps.npy", ts_5hz)
+    print(f"  ✓ {pfx}emg_from_lfp_5hz.npy  ({emg_5hz_norm.size}) @ {emg_fs} Hz")
 
     # Upsample to the LFP rate (1500 Hz) so it matches emg_rms.npy / lfp_data.npy
     # per-sample. Prefer the real LFP time axis when present.
-    lfp_ts_file = output_dir / "lfp_timestamps.npy"
-    if lfp_ts_file.is_file():
+    lfp_ts_file = find_output(output_dir, "lfp_timestamps.npy")
+    if lfp_ts_file is not None:
         lfp_ts = np.load(lfp_ts_file).astype("float64")
         emg_up = np.interp(lfp_ts, ts_5hz, emg_5hz_norm).astype("float32")
-        np.save(output_dir / "emg_from_lfp.npy", emg_up)
-        print(f"  ✓ emg_from_lfp.npy  ({emg_up.size}) upsampled to LFP time axis")
+        np.save(output_dir / f"{pfx}emg_from_lfp.npy", emg_up)
+        print(f"  ✓ {pfx}emg_from_lfp.npy  ({emg_up.size}) upsampled to LFP time axis")
     else:
         print("  ⚠  lfp_timestamps.npy not found — saved only the 5 Hz EMG. "
               "Run step-8 LFP export first to also get the pipeline-rate emg_from_lfp.npy.")
 
     if len(boundaries) > 1:
-        np.save(output_dir / "emg_from_lfp_boundaries.npy", boundaries)
+        np.save(output_dir / f"{pfx}emg_from_lfp_boundaries.npy", boundaries)
         for b in boundaries:
             print(f"    {b['name']}: t0={b['start_s']:.1f}s  dur={b['duration_s']:.1f}s")
 

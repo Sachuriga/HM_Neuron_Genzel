@@ -23,6 +23,8 @@ import sys
 import argparse
 from pathlib import Path
 
+from session_prefix import file_prefix
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -141,8 +143,9 @@ def embed_session(nwb_path, qualities, dt=0.1, sigma_s=0.3, speed_thresh=0.05,
         out_dir = nwb_path.parent / "umap"
         out_dir.mkdir(exist_ok=True)
         tag = "_".join(sorted(qualities))
-        np.savez(out_dir / f"umap_{tag}.npz", **res)
-        _plot(out_dir / f"umap_{tag}.pdf", res, nwb_path.name)
+        pfx = file_prefix(nwb_path.parent)               # rat_sessiondate_ prefix
+        np.savez(out_dir / f"{pfx}umap_{tag}.npz", **res)
+        _plot(out_dir / f"{pfx}umap_{tag}.pdf", res, nwb_path.name)
         return res
 
 

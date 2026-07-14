@@ -28,6 +28,8 @@ import argparse
 import traceback
 from pathlib import Path
 
+from session_prefix import file_prefix
+
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -254,6 +256,10 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
             # position/spike timestamps), so no unix conversion is needed anywhere.
             # Coords = scaled metres.
             out_dir.mkdir(exist_ok=True)
+            # NB: decoded_*.npz / predicted_*.npz are NOT prefixed — step 5
+            # (plot_trials) finds them via a `decoded_*.npz` glob. Only terminal
+            # plots below get the rat_sessiondate_ prefix.
+            pfx = file_prefix(nwb_path.parent)
             np.savez(out_dir / f"{stem}.npz",
                      t=tc_mid[dec],
                      actual_x=ax_[dec], actual_y=ay_[dec],
@@ -268,8 +274,8 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
                                               nwb_path.parent)
                 res["trial_unit_metrics"] = tu
                 if tu is not None and len(tu):
-                    tu.to_csv(out_dir / f"trial_unit_metrics_{tag}.csv", index=False)
-                    plot_trial_unit_metrics(out_dir / f"trial_unit_metrics_{tag}.pdf", tu, tag)
+                    tu.to_csv(out_dir / f"{pfx}trial_unit_metrics_{tag}.csv", index=False)
+                    plot_trial_unit_metrics(out_dir / f"{pfx}trial_unit_metrics_{tag}.pdf", tu, tag)
                     print(f"  trial/unit metrics: {len(tu)} rows "
                           f"({tu['trial'].nunique()} trials x {tu['unit'].nunique()} units).")
         if plot:
@@ -482,8 +488,9 @@ def _plot(nwb_path, res, tt, axr, ayr, dxr, dyr, err, chance, nodes, qualities,
     out_dir = nwb_path.parent / "decoding"
     out_dir.mkdir(exist_ok=True)
     stem = stem or f"decoded_{'_'.join(sorted(qualities))}"
+    pfx = file_prefix(nwb_path.parent)                   # rat_sessiondate_ prefix
     # decoded_x -> decode_x.pdf ; predicted_..._lead1s -> predict_..._lead1s.pdf
-    out = out_dir / (stem.replace("decoded_", "decode_", 1)
+    out = out_dir / (pfx + stem.replace("decoded_", "decode_", 1)
                      .replace("predicted_", "predict_", 1) + ".pdf")
     with PdfPages(str(out)) as pdf:
         fig = plt.figure(figsize=(11, 8))

@@ -38,6 +38,8 @@ import traceback
 from datetime import timezone
 from pathlib import Path
 
+from session_prefix import file_prefix
+
 import numpy as np
 import pandas as pd
 
@@ -776,8 +778,10 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             trials = []
         nodes = load_nodes()   # maze-node coords (metres) to mark the goal node
 
+        pfx = file_prefix(output_folder)               # rat_sessiondate_ prefix
+
         # ---- summary.pdf ----
-        _write_summary(out_dir / "summary.pdf", udf, good, pos, extent, bins, dt, sigma, speed, nwb, nodes)
+        _write_summary(out_dir / f"{pfx}summary.pdf", udf, good, pos, extent, bins, dt, sigma, speed, nwb, nodes)
 
         # ---- one PDF per good unit ----
         for uid, row in good.iterrows():
@@ -785,9 +789,9 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05):
             spike_times = np.asarray(row["spike_times"], dtype=float)
             wf = np.asarray(row["waveform_mean"]) if has_wf else None
             amp_t, amp_v = load_amplitudes(phy, cid) if phy is not None else (None, None)
-            _write_unit_pdf(out_dir / f"Unit_{cid}.pdf", row, cid, spike_times, wf,
+            _write_unit_pdf(out_dir / f"{pfx}Unit_{cid}.pdf", row, cid, spike_times, wf,
                             amp_t, amp_v, pos, extent, bins, dt, sigma, speed, trials, nodes)
-        print(f"  Wrote summary.pdf + {len(good)} unit PDF(s) to {out_dir}")
+        print(f"  Wrote {pfx}summary.pdf + {len(good)} unit PDF(s) to {out_dir}")
     finally:
         io.close()
 
