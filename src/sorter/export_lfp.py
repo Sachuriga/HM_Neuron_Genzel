@@ -1,4 +1,5 @@
 import gc
+import os
 import re
 import argparse
 import numpy as np
@@ -343,7 +344,7 @@ STEPS = [
 ]
 
 
-def run_pipeline(input_folder, output_folder, output_rate=None):
+def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None):
     base_path  = Path(input_folder)
     output_dir = Path(output_folder) / "LFP_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -444,6 +445,18 @@ def run_pipeline(input_folder, output_folder, output_rate=None):
             })
         np.save(output_dir / f"{pfx}channel_map.npy", ch_info_list)
 
+        # Per-rat sleep-scoring channels (cortex/sr/pyr tetrodes) from the config,
+        # saved alongside the data so the sleep scorer uses the right layers.
+        try:
+            from sorting import load_sorting_config, resolve_sleep_channels
+            sc = resolve_sleep_channels(sessions[0]['name'],
+                                        load_sorting_config(config_path))
+            if sc:
+                np.save(output_dir / f"{pfx}sleep_channels.npy", sc)
+                tqdm.write(f"  ✓ {pfx}sleep_channels.npy  {sc}")
+        except Exception as exc:
+            tqdm.write(f"  (sleep_channels not resolved: {exc})")
+
         tqdm.write(f"  ✓ {pfx}lfp_data.npy  ({n_samples}, {num_channels}) @ {fs} Hz")
 
         del channels
@@ -508,5 +521,13 @@ if __name__ == "__main__":
     parser.add_argument('--output_rate', type=float, default=None,
                         help="LFP output rate in Hz (exportLFP -outputrate). "
                              "Overrides the header rate so timestamps are correct.")
+    parser.add_argument('--config', default=None,
+                        help="hm_tracker_paths.txt for per-rat SLEEP_CHANNELS_<rat> "
+                             "(cortex/sr/pyr tetrodes). Default ~/Desktop/hm_tracker_paths.txt.")
     args = parser.parse_args()
-    run_pipeline(args.input_folder, args.output_folder, output_rate=args.output_rate)
+    cfg = args.config or os.environ.get("HM_CONFIG_FILE")
+    if not cfg:
+        default_cfg = Path(os.path.expanduser("~")) / "Desktop" / "hm_tracker_paths.txt"
+        cfg = str(default_cfg) if default_cfg.exists() else None
+    run_pipeline(args.input_folder, args.output_folder, output_rate=args.output_rate,
+                 config_path=cfg)

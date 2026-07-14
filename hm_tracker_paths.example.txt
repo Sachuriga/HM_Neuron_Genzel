@@ -94,20 +94,35 @@ DETECT_SIGN = -1
 #                      NT5 removes channels 16 17 18 19). Leave empty / omit
 #                      to keep every tetrode in the sort.
 # -------------------------------------------------------------------
+# Auto sleep scoring (Buzsáki WAKE/NREM/REM): per-rat LFP channels by LAYER.
+# Sleep scoring quality depends on measuring each rhythm where it is strongest,
+# so pick ONE tetrode per layer (written "role:NT<t>" or "role:<t>", 1..32):
+#   cortex : drives the slow-wave / delta metric  -> NREM detection
+#   sr     : stratum radiatum, where theta peaks   -> REM detection
+#   pyr    : pyramidal layer (ripples); optional, reserved for EMG/future use
+# Example:  SLEEP_CHANNELS_RAT1 = cortex:NT28 sr:NT10 pyr:NT5
+# The tracker resolves these at step 8 and writes <prefix>sleep_channels.npy into
+# LFP_Output; the sleep scorer then uses cortex for slow-wave and sr for theta
+# automatically. Omit / leave empty to fall back to a single cleanest channel.
+# -------------------------------------------------------------------
 BAD_CHANNELS_RAT1 = 0 1 2 3 4 5 6 7 28 29 30 31 36 37 38 39 41 42 43 44 45 46 47 51 56 59 68 69 70 71 80 92 93 94 95 96 97 98 99 100 101 102 103 108 109 110 111 124 125 126 127
 REF_CHANNEL_RAT1 =
-EEG_TETRODES_RAT1 = 
+EEG_TETRODES_RAT1 =
+SLEEP_CHANNELS_RAT1 = cortex:NT28 sr:NT10 pyr:NT5
 
 BAD_CHANNELS_RAT5 = 14 80 82 83 106 107 124
 REF_CHANNEL_RAT5 = 98
 EEG_TETRODES_RAT5 = NT12
+SLEEP_CHANNELS_RAT5 = cortex:NT24 sr:NT16 pyr:NT30
 
 BAD_CHANNELS_RAT6 = 75 79
 REF_CHANNEL_RAT6 = 22
 EEG_TETRODES_RAT6 = NT12
+SLEEP_CHANNELS_RAT6 =
 
 
 # Example for a second rat, using tetrode (NT) notation:
 # BAD_CHANNELS_RAT2=NT4ch1 NT4ch2 NT16ch1 NT16ch2
 # REF_CHANNEL_RAT2=NT17ch1
 # EEG_TETRODES_RAT2=NT1 NT2
+# SLEEP_CHANNELS_RAT2=cortex:NT6 sr:NT14 pyr:NT31

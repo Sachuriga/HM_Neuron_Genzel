@@ -144,6 +144,43 @@ def _parse_tetrode_list(raw_value):
     return channels
 
 
+# Sleep-scoring channels: one tetrode per role.
+#   cortex -> NREM slow-wave/delta ; sr (stratum radiatum) -> REM theta ;
+#   pyr (pyramidal) -> optional (ripples / EMG spread).
+SLEEP_ROLES = ("cortex", "sr", "pyr")
+
+
+def _parse_sleep_channels(raw_value):
+    """Parse ``cortex:NT28 sr:NT10 pyr:NT5`` (or plain tetrode numbers) into
+    ``{'cortex': 28, 'sr': 10, 'pyr': 5}`` — 1-based tetrode numbers per role."""
+    out = {}
+    if not raw_value:
+        return out
+    for tok in raw_value.replace(",", " ").split():
+        if ":" not in tok:
+            print(f"Warning: ignoring sleep-channel token '{tok}' (want role:tetrode).")
+            continue
+        role, ch = tok.split(":", 1)
+        role = role.strip().lower()
+        m = _NT_TETRODE_RE.match(ch.strip())
+        if role not in SLEEP_ROLES:
+            print(f"Warning: unknown sleep-channel role '{role}' (use {SLEEP_ROLES}).")
+        elif not m or not (1 <= int(m.group(1)) <= N_TETRODES):
+            print(f"Warning: invalid tetrode '{ch}' for sleep role '{role}'.")
+        else:
+            out[role] = int(m.group(1))
+    return out
+
+
+def resolve_sleep_channels(file_stem, config):
+    """Return the ``{cortex, sr, pyr}`` sleep tetrodes for a recording (by rat), or {}."""
+    stem = file_stem.lower()
+    for rat in sorted(config, key=len, reverse=True):
+        if isinstance(config[rat], dict) and stem.startswith(rat):
+            return dict(config[rat].get("sleep_channels", {}))
+    return {}
+
+
 def load_sorting_config(config_path):
     """
     Read per-rat sorting settings from an hm_tracker_paths.txt style file.
@@ -178,7 +215,8 @@ def load_sorting_config(config_path):
 
     def _entry(rat):
         return config.setdefault(
-            rat, {"bad_channels": [], "ref_channels": [], "eeg_channels": []}
+            rat, {"bad_channels": [], "ref_channels": [], "eeg_channels": [],
+                  "sleep_channels": {}}
         )
 
     with open(config_path, "r", encoding="utf-8-sig") as fh:
@@ -209,6 +247,9 @@ def load_sorting_config(config_path):
             elif key.startswith("EEG_TETRODES_"):
                 rat = key[len("EEG_TETRODES_"):].lower()
                 _entry(rat)["eeg_channels"] = _parse_tetrode_list(value)
+            elif key.startswith("SLEEP_CHANNELS_"):
+                rat = key[len("SLEEP_CHANNELS_"):].lower()
+                _entry(rat)["sleep_channels"] = _parse_sleep_channels(value)
 
     rats = [k for k in config if not k.startswith("__")]
     if rats:
