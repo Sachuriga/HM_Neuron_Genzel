@@ -74,11 +74,19 @@ HM_Tracker_2025/
 │   │   └── README.md                # Column-by-column calculation reference
 │   └── dlc/
 │       └── tracking_eyes.py         # DeepLabCut eye-tracking export
-├── runner_windows.bat               # Main Windows orchestrator
-├── hm_tracker_paths.example.txt    # Config template
-├── RecordingMeta.xlsx               # Per-session metadata
-├── reproduce.yml                    # Conda environment spec
-└── requirements.txt                 # pip dependencies
+├── runner.py                        # cross-platform pipeline runner (single source of truth)
+├── tracker_gui.py                   # genzeltracker GUI (Qt launcher)
+├── pyproject.toml                   # deps ([gpu]/[mac] extras) + genzeltracker command
+├── scripts/
+│   ├── runner_unix.sh               # macOS/Linux launcher (wraps runner.py)
+│   └── runner_windows.bat           # Windows launcher (wraps runner.py)
+├── examples/
+│   ├── hm_tracker_paths.example.txt # Config template
+│   └── RecordingMeta.xlsx           # Per-session metadata template
+└── requirements/
+    ├── requirements.txt             # exact-version lock (optional)
+    ├── constraints.txt              # pip constraints
+    └── reproduce.yml                # conda environment spec
 ```
 
 ---
@@ -91,12 +99,21 @@ HM_Tracker_2025/
 ** manual:**
 
 ```bat
-conda env create -f reproduce.yml
+conda env create -f requirements/reproduce.yml
 conda activate HM_neuron
-pip install -r requirements_core.txt
+
+:: Linux / Windows (full GPU pipeline, CUDA 12.8):
+pip install -e ".[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
+
+:: macOS (CPU: sync / plotting / node analysis / GUI):
+pip install -e ".[mac]"
 ```
 
-> Requires a CUDA-capable GPU and **CUDA 12.8** drivers. PyTorch (`torch==2.10.0+cu128`) is fetched automatically from `download.pytorch.org` — no manual download needed.
+Dependencies now live in `pyproject.toml` (extras `[gpu]` / `[mac]`); this also
+installs the **`genzeltracker`** GUI launcher command. `requirements/requirements.txt` is kept
+only as an optional exact-version lockfile for reproduction.
+
+> `[gpu]` requires a CUDA-capable GPU and **CUDA 12.8** drivers. PyTorch (`torch==2.10.0+cu128`) is fetched from `download.pytorch.org` via the `--extra-index-url` above — no manual download needed.
 >
 > If `conda env create` freezes, make sure no older `HM_neuron` environment already exists (`conda env remove -n HM_neuron`).
 
@@ -113,7 +130,7 @@ pip install -r requirements_core.txt
 Copy the template and fill in your local paths:
 
 ```bash
-cp hm_tracker_paths.example.txt %USERPROFILE%\Desktop\hm_tracker_paths.txt
+cp examples/hm_tracker_paths.example.txt %USERPROFILE%\Desktop\hm_tracker_paths.txt
 ```
 
 Edit `hm_tracker_paths.txt`:
@@ -149,7 +166,7 @@ Each `ipN` folder is processed by one worker. The matching `opN` folder is creat
 ## Running the Pipeline
 
 ```bat
-runner_windows.bat "C:\path\to\data_root"
+scripts\runner_windows.bat "C:\path\to\data_root"
 ```
 
 On launch you are prompted to select which steps to run:
@@ -186,7 +203,7 @@ Before launching each worker, the master checks system load using PowerShell and
 | GPU | 90% | `nvidia-smi --query-gpu=utilization.gpu` |
 | RAM | 65% | `(TotalVisibleMemorySize - FreePhysicalMemory) / TotalVisibleMemorySize` |
 
-Thresholds and the wait duration are configurable at the top of `runner_windows.bat`:
+Thresholds and the wait duration are configurable at the top of `scripts/runner_windows.bat`:
 
 ```bat
 set MAX_CPU=90
@@ -318,7 +335,7 @@ Generates a PDF report with trial-level visualizations from the tracker output:
 ### Step 6 — GPU Video Compression
 
 **Key:** `6`  
-**Script:** inline in `runner_windows.bat`  
+**Script:** inline in `scripts/runner_windows.bat`  
 **Command:**
 ```
 ffmpeg -i <video.mp4> -c:v h264_nvenc -preset p6 -cq 28 -c:a copy __temp_compressed.mp4
@@ -476,7 +493,7 @@ Extracts eye-camera frames aligned to the rat's tracked position for DeepLabCut 
 ### Step 9 — Cleanup
 
 **Key:** `9`  
-**Script:** inline in `runner_windows.bat`
+**Script:** inline in `scripts/runner_windows.bat`
 
 Deletes intermediate folders from the input directory to recover disk space after processing is complete:
 

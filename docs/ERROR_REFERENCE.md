@@ -4,9 +4,9 @@ Look up the exact error or warning message you see to find the likely cause and 
 
 | Message | Script | Likely Cause | Fix |
 |---|---|---|---|
-| `Config file not found` | `runner_windows.bat` | `hm_tracker_paths.txt` not on Desktop | Copy example from repo, rename, fill in paths |
-| `trodesexport not found at: ...` | `runner_windows.bat` | `TRODES_EXPORT_CMD` path is wrong | Fix path in `hm_tracker_paths.txt` |
-| `exportLFP not found at: ...` | `runner_windows.bat` | `TRODES_EXPORT_LFP` path is wrong | Fix path in `hm_tracker_paths.txt` |
+| `Config file not found` | `scripts/runner_windows.bat` | `hm_tracker_paths.txt` not on Desktop | Copy example from repo, rename, fill in paths |
+| `trodesexport not found at: ...` | `scripts/runner_windows.bat` | `TRODES_EXPORT_CMD` path is wrong | Fix path in `hm_tracker_paths.txt` |
+| `exportLFP not found at: ...` | `scripts/runner_windows.bat` | `TRODES_EXPORT_LFP` path is wrong | Fix path in `hm_tracker_paths.txt` |
 | `No videos found at location [...]` | `join_views.py` | Camera videos missing or named incorrectly | Rename to `eye??_*.mp4`, verify 12 files present |
 | `Found unexpected number of videos` | `join_views.py` | Video count doesn't match expected | Use `-n` flag or remove extra `.mp4` files |
 | `Can't find requested path` | `join_views.py` | Input folder doesn't exist | Verify input folder path |
@@ -17,8 +17,8 @@ Look up the exact error or warning message you see to find the likely cause and 
 | `WARNING: No GPU detected. Running on CPU.` | `TrackerYolov11.py` | CUDA unavailable | Install driver, run `nvidia-smi` to verify |
 | `Warning: No timestamp CSV found` | `TrackerYolov11.py` | Step 2 not run or output missing | Run Step 2 first |
 | `No log files found in output folder` | `plot_trials.py` | Step 4 not run | Run Step 4 first |
-| `FFmpeg compression failed` | `runner_windows.bat` | NVENC session limit or GPU out of memory | Reduce parallel jobs; check `nvidia-smi` |
-| `No valid .mp4 file found to compress` | `runner_windows.bat` | Step 4 did not produce output | Run Step 4 first |
+| `FFmpeg compression failed` | `scripts/runner_windows.bat` | NVENC session limit or GPU out of memory | Reduce parallel jobs; check `nvidia-smi` |
+| `No valid .mp4 file found to compress` | `scripts/runner_windows.bat` | Step 4 did not produce output | Run Step 4 first |
 | `No LFP .dat files found` | `sorting.py`, `export_lfp.py` | Step e (LFP export) not run | Run `exportLFP` with `-rec` flag |
 | `Warning: 'readTrodesExtractedDataFile3.py' not found` | `sorting.py` | Helper script missing from `src/sorter/` | Obtain file from supervisor, place in `src/sorter/` |
 | `Settings format not supported` | `readTrodesExtractedDataFile3.py` | `.dat` file header malformed or wrong Trodes version | Re-export from Trodes; check file header |

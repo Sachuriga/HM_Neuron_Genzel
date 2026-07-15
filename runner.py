@@ -5,12 +5,12 @@
 #   Usage:  python runner.py /path/to/data_root
 #
 #   This ONE file drives the whole pipeline on macOS, Linux and
-#   Windows. The old runner_unix.sh / runner_windows.bat are now
+#   Windows. The old scripts/runner_unix.sh / scripts/runner_windows.bat are now
 #   thin launchers that just call this. Edit the menu / steps here
 #   ONCE and both platforms stay in sync.
 #
 #   Behaviour (ported from both old runners):
-#     - Parallel steps (1 e 2 3 4 5 6 8 d n) run one background
+#     - Parallel steps (1 e 2 3 4 5 8 d n) run one background
 #       worker per ip*/op* pair, gated by a CPU/GPU/MEM monitor.
 #     - Sequential master steps (7 c r 9 w u) run afterwards, one
 #       folder at a time, in that order.
@@ -58,7 +58,7 @@ MENU = [
     ("3", "Stitching"),
     ("4", "Tracker"),
     ("5", "Plotting"),
-    ("6", "Compression"),
+    ("6", "Compression (always runs LAST, over all op folders)"),
     ("7", "Sorting"),
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
@@ -110,7 +110,7 @@ def load_config():
         print("  TRODES_EXPORT_CMD=/path/to/trodesexport")
         print("  TRODES_EXPORT_LFP=/path/to/exportLFP")
         print("  LFP_CHANNELS=1 2 3 4 5 6 7 8\n")
-        print("See hm_tracker_paths.example.txt in the repo for a template.")
+        print("See examples/hm_tracker_paths.example.txt in the repo for a template.")
         sys.exit(1)
 
     for raw in Path(cfg).read_text(errors="replace").splitlines():
@@ -347,28 +347,9 @@ def run_worker(ip, op, steps, out):
              "--input_folder", ip, "--output_folder", op], out=out)
 
     # --- STEP 6: GPU compression ---
-    if "6" in steps:
-        log(out, f"[STEP 6] Running Compression (codec: {vcodec})...")
-        ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
-        temp_file = op / "__temp_compressed.mp4"
-        if temp_file.exists():
-            temp_file.unlink()
-        video = next((f for f in sorted(op.glob("*.mp4"))
-                      if f.name != "__temp_compressed.mp4"), None)
-        if video is not None:
-            rc = run([ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                      "-stats", "-i", video, "-c:v", vcodec, "-preset", "p6", "-cq", "28",
-                      "-c:a", "copy", temp_file], out=out)
-            if rc == 0:
-                shutil.move(str(temp_file), str(video))
-                log(out, f"[SUCCESS] Video compressed: {video}")
-            else:
-                log(out, f"[ERROR] FFmpeg compression failed for {video}")
-                log(out, f"        Check codec '{vcodec}' (Mac: try h264_videotoolbox).")
-                if temp_file.exists():
-                    temp_file.unlink()
-        else:
-            log(out, f"[WARNING] No valid .mp4 file found in '{op}' to compress.")
+    #  Compression is NOT run here anymore. It always runs LAST, at master level,
+    #  over ALL op folders (so it can't be interrupted by other steps and never
+    #  compresses a video that a later step still needs). See compress_all_op_videos().
 
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
@@ -467,6 +448,42 @@ def sequential_targets(root, ops):
     return [(op, op) for op in seen.values()]
 
 
+def compress_all_op_videos(op_dirs):
+    """STEP 6 (final phase): GPU-compress EVERY top-level .mp4 in each op folder,
+    in-place. Runs last so it never re-encodes a video another step still reads."""
+    vcodec = os.environ.get("FFMPEG_VCODEC", "h264_nvenc")
+    ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
+    print("\n" + "=" * 56)
+    print(f"[MASTER] STEP 6 — Compression (codec: {vcodec}) over {len(op_dirs)} "
+          f"op folder(s), all videos, running LAST...")
+    print("=" * 56)
+    n_ok = n_fail = 0
+    for op in op_dirs:
+        videos = [f for f in sorted(op.glob("*.mp4")) if f.name != "__temp_compressed.mp4"]
+        if not videos:
+            print(f"[COMPRESS] {op.name}: no .mp4 to compress.")
+            continue
+        for video in videos:
+            temp_file = op / "__temp_compressed.mp4"
+            if temp_file.exists():
+                temp_file.unlink()
+            print(f"\n[COMPRESS] {op.name}/{video.name} ...")
+            rc = run([ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+                      "-stats", "-i", video, "-c:v", vcodec, "-preset", "p6", "-cq", "28",
+                      "-c:a", "copy", temp_file])
+            if rc == 0:
+                shutil.move(str(temp_file), str(video))
+                print(f"[SUCCESS] Compressed: {video}")
+                n_ok += 1
+            else:
+                print(f"[ERROR] FFmpeg failed for {video} (codec '{vcodec}'; "
+                      f"Mac: try FFMPEG_VCODEC=h264_videotoolbox).")
+                if temp_file.exists():
+                    temp_file.unlink()
+                n_fail += 1
+    print(f"\n[MASTER] Compression done: {n_ok} ok, {n_fail} failed.")
+
+
 # ------------------------------------------------------------
 #                 MASTER
 # ------------------------------------------------------------
@@ -488,15 +505,25 @@ def main():
     config = load_config()
     print(f"[DEBUG] Target Root Directory: [{root}]\n")
 
-    print("Select steps to run (e.g., 123 for steps 1, 2, and 3):")
-    for key, label in MENU:
-        print(f"[{key}] {label}")
-    print()
-    selection = input("Enter steps: ")
+    # Steps may come non-interactively via HM_STEPS (used by the genzeltracker GUI);
+    # otherwise prompt for them interactively.
+    selection = os.environ.get("HM_STEPS")
+    if selection is None:
+        print("Select steps to run (e.g., 123 for steps 1, 2, and 3):")
+        for key, label in MENU:
+            print(f"[{key}] {label}")
+        print()
+        selection = input("Enter steps: ")
+    else:
+        print(f"[STEPS] (from HM_STEPS) {selection}")
 
     # Split the selection into sequential master steps and parallel worker steps.
+    # Step 6 (compression) is special: it always runs LAST at master level over all
+    # op folders, so pull it out of the parallel worker steps here.
     has = {k: (k in selection) for k in SEQUENTIAL_STEPS}
-    parallel_steps = "".join(c for c in selection if c not in SEQUENTIAL_STEPS)
+    do_compress = "6" in selection
+    parallel_steps = "".join(c for c in selection
+                             if c not in SEQUENTIAL_STEPS and c != "6")
     parallel_trim = "".join(parallel_steps.split())
 
     # Scan ip* folders. Each ipN -> opN.
@@ -711,9 +738,14 @@ def main():
         else:
             print("[DRIVE-SCAN] scan_drive.py NOT found.")
 
+    # --- STEP 6: compression, always LAST, over every op folder ---
+    if do_compress:
+        op_dirs = sorted(d for d in root.glob("op*") if d.is_dir())
+        compress_all_op_videos(op_dirs)
+
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
     print("\n" + "=" * 56)
-    print(f"[MASTER] Done. Parallel jobs: {count} | {flags}")
+    print(f"[MASTER] Done. Parallel jobs: {count} | 6:{int(do_compress)} | {flags}")
     print("=" * 56)
 
 

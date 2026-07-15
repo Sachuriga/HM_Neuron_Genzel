@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genzeltracker"
+version = "0.1.0"
+description = "HM Tracker pipeline + Qt GUI launcher (runner.py / genzeltracker)"
+requires-python = ">=3.9"
+
+# Base = just the launcher/GUI. The heavy scientific stack lives in the
+# platform extras below (install one of them):
+#   pip install -e ".[mac]"    # macOS / CPU  (sync, plotting, node analysis, GUI)
+#   pip install -e ".[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
+#                            # Linux / Windows + CUDA 12.8 (full pipeline)
+dependencies = ["PyQt6", "pyqtgraph", "psutil"]
+
+[project.optional-dependencies]
+# macOS / CPU subset — no torch/CUDA/kilosort (those have no macOS wheels).
+mac = [
+    "numpy<2", "scipy", "pandas", "matplotlib", "scikit-learn",
+    "opencv-python", "networkx", "openpyxl", "tqdm",
+    "spikeinterface", "pynwb", "colorama", "python-dateutil",
+]
+# Full GPU pipeline (Linux/Windows, CUDA 12.8). torch==*+cu128 needs the
+# PyTorch index — pass it on the pip command line:
+#   --extra-index-url https://download.pytorch.org/whl/cu128
+gpu = [
+    "torch==2.10.0+cu128", "torchvision==0.25.0+cu128", "torchaudio==2.10.0+cu128",
+    "ultralytics", "opencv-python", "sahi", "pillow",
+    "spikeinterface[full]", "kilosort", "neuroconv", "ephyviewer",
+    "probeinterface", "pynwb", "neo", "numba", "mountainsort4",
+    "numpy<2", "scipy", "pandas", "matplotlib", "networkx", "shapely", "polars",
+    "h5py", "zarr<3", "numcodecs<0.13", "faiss-cpu", "scikit-learn", "openpyxl",
+    "huggingface_hub", "tqdm", "requests", "PyYAML", "rich",
+]
+
+[project.scripts]
+genzeltracker = "tracker_gui:main"
+
+# This repo is a script collection, not a package. Expose just the two top-level
+# modules the launcher needs; install editable (`pip install -e .`) so the GUI
+# still finds runner.py and the ./src pipeline scripts in place.
+[tool.setuptools]
+py-modules = ["tracker_gui", "runner"]

@@ -6,7 +6,7 @@
 #   cross-platform source of truth, shared with runner_windows.bat).
 #   Edit the menu / steps THERE, not here.
 #
-#   Usage:  ./runner_unix.sh /path/to/data_root
+#   Usage:  ./scripts/runner_unix.sh /path/to/data_root
 # ============================================================
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,4 +20,4 @@ else
     exit 1
 fi
 
-exec "$PY" "$SCRIPT_DIR/runner.py" "$@"
+exec "$PY" "$SCRIPT_DIR/../runner.py" "$@"

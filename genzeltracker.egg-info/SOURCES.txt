@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+runner.py
+tracker_gui.py
+genzeltracker.egg-info/PKG-INFO
+genzeltracker.egg-info/SOURCES.txt
+genzeltracker.egg-info/dependency_links.txt
+genzeltracker.egg-info/entry_points.txt
+genzeltracker.egg-info/requires.txt
+genzeltracker.egg-info/top_level.txt

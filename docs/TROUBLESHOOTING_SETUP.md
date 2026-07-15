@@ -6,7 +6,7 @@
 
 The batch script requires a config file on your Desktop. It will not run without it.
 
-1. Copy `hm_tracker_paths.example.txt` from the repo root to your Desktop.
+1. Copy `examples/hm_tracker_paths.example.txt` from the repo root to your Desktop.
 2. Rename it to `hm_tracker_paths.txt`.
 3. Open it and fill in all paths:
    - `FFMPEG_CMD` — full path to `ffmpeg.exe`
@@ -36,30 +36,32 @@ The paths in `hm_tracker_paths.txt` are incorrect or Trodes is not installed.
 
 The most common cause is a contradictory numpy constraint that the solver cannot resolve, or an existing environment with the same name.
 
-1. Remove any existing environment and re-create from the current `reproduce.yml` (Python 3.13):
+1. Remove any existing environment and re-create from the current `requirements/reproduce.yml` (Python 3.13):
    ```
    conda env remove -n HM_neuron
-   conda env create -f reproduce.yml
+   conda env create -f requirements/reproduce.yml
    conda activate HM_neuron
-   pip install -r requirements.txt
+   pip install -e ".[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
    ```
+   (macOS/CPU: `pip install -e ".[mac]"`. Dependencies live in `pyproject.toml`
+   extras; `requirements/requirements.txt` remains only as an optional exact-version lock.)
 
 2. If it still hangs, use the faster `libmamba` solver:
    ```
    conda install -n base conda-libmamba-solver
    conda config --set solver libmamba
-   conda env create -f reproduce.yml
+   conda env create -f requirements/reproduce.yml
    ```
 
 **Error: Package not found, version conflict, or import error after pip install**
 
-1. Verify the PyTorch index URL is present at the top of `requirements.txt`:
+1. Verify the PyTorch index URL is present at the top of `requirements/requirements.txt`:
    ```
    --extra-index-url https://download.pytorch.org/whl/cu128
    ```
    Without this line, `torch==2.10.0+cu128` cannot be found and pip will fail.
 
-2. If Qt-related errors appear, only one Qt binding is allowed. `PySide6` has been removed from `requirements.txt` — if it was previously installed, uninstall it:
+2. If Qt-related errors appear, only one Qt binding is allowed. `PySide6` has been removed from `requirements/requirements.txt` — if it was previously installed, uninstall it:
    ```
    pip uninstall PySide6 shiboken6
    ```
@@ -97,7 +99,7 @@ YOLO tracking will be extremely slow on CPU. Fix GPU detection before running.
 
 The batch runner checks CPU, GPU, and RAM before launching each step. If thresholds are exceeded it will wait.
 
-Default thresholds (top of `runner_windows.bat`):
+Default thresholds (top of `scripts/runner_windows.bat`):
 - `MAX_CPU` = 90%
 - `MAX_GPU` = 90%
 - `MAX_MEM` = 65%

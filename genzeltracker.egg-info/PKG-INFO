@@ -1,0 +1,59 @@
+Metadata-Version: 2.4
+Name: genzeltracker
+Version: 0.1.0
+Summary: HM Tracker pipeline + Qt GUI launcher (runner.py / genzeltracker)
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: PyQt6
+Requires-Dist: pyqtgraph
+Requires-Dist: psutil
+Provides-Extra: mac
+Requires-Dist: numpy<2; extra == "mac"
+Requires-Dist: scipy; extra == "mac"
+Requires-Dist: pandas; extra == "mac"
+Requires-Dist: matplotlib; extra == "mac"
+Requires-Dist: scikit-learn; extra == "mac"
+Requires-Dist: opencv-python; extra == "mac"
+Requires-Dist: networkx; extra == "mac"
+Requires-Dist: openpyxl; extra == "mac"
+Requires-Dist: tqdm; extra == "mac"
+Requires-Dist: spikeinterface; extra == "mac"
+Requires-Dist: pynwb; extra == "mac"
+Requires-Dist: colorama; extra == "mac"
+Requires-Dist: python-dateutil; extra == "mac"
+Provides-Extra: gpu
+Requires-Dist: torch==2.10.0+cu128; extra == "gpu"
+Requires-Dist: torchvision==0.25.0+cu128; extra == "gpu"
+Requires-Dist: torchaudio==2.10.0+cu128; extra == "gpu"
+Requires-Dist: ultralytics; extra == "gpu"
+Requires-Dist: opencv-python; extra == "gpu"
+Requires-Dist: sahi; extra == "gpu"
+Requires-Dist: pillow; extra == "gpu"
+Requires-Dist: spikeinterface[full]; extra == "gpu"
+Requires-Dist: kilosort; extra == "gpu"
+Requires-Dist: neuroconv; extra == "gpu"
+Requires-Dist: ephyviewer; extra == "gpu"
+Requires-Dist: probeinterface; extra == "gpu"
+Requires-Dist: pynwb; extra == "gpu"
+Requires-Dist: neo; extra == "gpu"
+Requires-Dist: numba; extra == "gpu"
+Requires-Dist: mountainsort4; extra == "gpu"
+Requires-Dist: numpy<2; extra == "gpu"
+Requires-Dist: scipy; extra == "gpu"
+Requires-Dist: pandas; extra == "gpu"
+Requires-Dist: matplotlib; extra == "gpu"
+Requires-Dist: networkx; extra == "gpu"
+Requires-Dist: shapely; extra == "gpu"
+Requires-Dist: polars; extra == "gpu"
+Requires-Dist: h5py; extra == "gpu"
+Requires-Dist: zarr<3; extra == "gpu"
+Requires-Dist: numcodecs<0.13; extra == "gpu"
+Requires-Dist: faiss-cpu; extra == "gpu"
+Requires-Dist: scikit-learn; extra == "gpu"
+Requires-Dist: openpyxl; extra == "gpu"
+Requires-Dist: huggingface_hub; extra == "gpu"
+Requires-Dist: tqdm; extra == "gpu"
+Requires-Dist: requests; extra == "gpu"
+Requires-Dist: PyYAML; extra == "gpu"
+Requires-Dist: rich; extra == "gpu"
+Dynamic: license-file
