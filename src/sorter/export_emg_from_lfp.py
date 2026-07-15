@@ -112,7 +112,62 @@ def _hw_to_lfp_columns(lfp_dir, hw_channels):
     return [hw_of_col[c] for c in hw_channels if c in hw_of_col]
 
 
-def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None):
+SNR_FRAC = 0.3          # exclude LFP cols with SNR < SNR_FRAC * median SNR
+MIN_KEEP = 8            # never drop the EMG correlation below this many channels
+
+
+def _bad_lfp_columns(lfp_dir, n_cols, snr_frac=SNR_FRAC, config=None, stem=None,
+                     extra_exclude_hw=None, min_keep=MIN_KEEP):
+    """LFP columns to drop from the EMG correlation.
+
+    Union of (1) SNR outliers — ``channel_snr_scores.npy`` columns below
+    ``snr_frac * median`` — and (2) the config ``BAD_CHANNELS_<rat>`` /
+    ``EEG_TETRODES_<rat>`` (plus any ``extra_exclude_hw``) hardware ids mapped to
+    LFP columns. Guards so at least ``min_keep`` channels survive (re-admitting the
+    highest-SNR excluded columns first). Returns a set of column indices.
+    """
+    bad, reasons = set(), {}
+    scores = None
+    snr_file = find_output(lfp_dir, "channel_snr_scores.npy")   # prefixed or not
+    if snr_file is not None:
+        scores = np.asarray(np.load(snr_file)).ravel()
+        finite = np.isfinite(scores)
+        if scores.size == n_cols and finite.any():
+            thr = snr_frac * float(np.median(scores[finite]))
+            for c in np.where(scores < thr)[0]:
+                bad.add(int(c)); reasons[int(c)] = f"SNR {scores[c]:.0f}<{thr:.0f}"
+
+    hw = set()
+    if config is not None and stem is not None:
+        try:
+            from sorting import resolve_rat_settings
+            bad_hw, _ref, eeg_hw = resolve_rat_settings(stem, config)
+            hw |= {int(c) for c in bad_hw} | {int(c) for c in eeg_hw}
+        except Exception as exc:
+            print(f"   (bad-channel config not resolved: {exc})")
+    if extra_exclude_hw:
+        hw |= {int(c) for c in extra_exclude_hw}
+    for c in (_hw_to_lfp_columns(lfp_dir, sorted(hw)) or []):
+        bad.add(int(c)); reasons.setdefault(int(c), "config bad/EEG")
+
+    keep_floor = min(min_keep, n_cols)
+    if n_cols - len(bad) < keep_floor:
+        # re-admit the least-bad (highest-SNR) excluded columns until at the floor
+        def _snr(c):
+            return scores[c] if scores is not None and c < scores.size else 0.0
+        for c in sorted(bad, key=_snr, reverse=True):
+            if n_cols - len(bad) >= keep_floor:
+                break
+            bad.discard(c); reasons.pop(c, None)
+    if bad:
+        print("   EMG: excluding LFP cols " +
+              ", ".join(f"{c}({reasons[c]})" for c in sorted(bad)))
+    return bad
+
+
+def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False,
+                        snr_frac=SNR_FRAC, config=None, stem=None,
+                        extra_exclude_hw=None):
     """EMG-from-LFP computed directly from the 1500 Hz LFP export (numpy/scipy).
 
     The LFP already carries the 300–600 Hz band (exportLFP -lfplowpass 700), so no
@@ -122,6 +177,9 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None):
       * ``channels`` (hardware ids) given and mappable -> use those LFP columns.
       * otherwise -> all LFP columns (the export is one-per-tetrode, i.e. already
         spread across the probe — ideal for the cross-channel correlation).
+    With ``exclude_bad`` (default), SNR-outlier and config bad/EEG columns are
+    then dropped (see :func:`_bad_lfp_columns`), since a noisy or reference
+    channel dilutes every pairwise correlation.
     """
     lfp_dir = Path(lfp_dir)
     fs = _lfp_sampling_rate(lfp_dir)
@@ -147,7 +205,16 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None):
                   "using all LFP channels instead)")
     if cols is None:
         cols = list(range(data.shape[1]))
-        origin = f"all {len(cols)} LFP channels (one per tetrode)"
+        origin = f"all {data.shape[1]} LFP channels (one per tetrode)"
+
+    if exclude_bad:
+        bad = _bad_lfp_columns(lfp_dir, data.shape[1], snr_frac=snr_frac,
+                               config=config, stem=stem,
+                               extra_exclude_hw=extra_exclude_hw)
+        kept = [c for c in cols if c not in bad]
+        dropped = sorted(c for c in cols if c in bad)
+        if dropped and len(kept) >= 2:
+            cols, origin = kept, origin + f" minus {dropped} (bad/EEG)"
 
     sel = np.asarray(data[:, cols], dtype=np.float64)
     res = emg_from_lfp(sel, fs, emg_fs=emg_fs, smooth_window_s=SMOOTH_S)
@@ -276,7 +343,7 @@ def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
 
 
 def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-        config=None, eeg_channels=None):
+        config=None, eeg_channels=None, exclude_bad=False, snr_frac=SNR_FRAC):
     output_dir = Path(output_folder) / "LFP_Output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -285,12 +352,17 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     print(f"   Input:  {input_folder}")
     print(f"   Output: {output_dir}")
 
-    chans = _resolve_eeg_channels(_session_stem(input_folder), config, eeg_channels)
+    stem = _session_stem(input_folder)
+    chans = _resolve_eeg_channels(stem, config, eeg_channels)
 
     smoothed, timestamps, boundaries = [], [], []
-    # PRIMARY: straight from the 1500 Hz LFP export (fast, numpy only).
+    # PRIMARY: straight from the 1500 Hz LFP export (fast, numpy only). Use ALL
+    # tetrodes minus bad/EEG ones — EEG tetrodes (``chans``) are *excluded* from
+    # the correlation here, not used as its source.
     try:
-        res = emg_from_lfp_output(output_dir, emg_fs=emg_fs, channels=chans)
+        res = emg_from_lfp_output(output_dir, emg_fs=emg_fs, exclude_bad=exclude_bad,
+                                  snr_frac=snr_frac, config=config, stem=stem,
+                                  extra_exclude_hw=chans)
         print(f"   From 1500 Hz LFP export @ {res['fs']:.0f} Hz: {res['origin']}, "
               f"band {res['passband'][0]:.0f}-{res['passband'][1]:.0f} Hz, "
               f"{res['data'].size} EMG bins @ {emg_fs} Hz")
@@ -384,8 +456,19 @@ if __name__ == "__main__":
                         help="hm_tracker_paths.txt for per-rat EEG channels "
                              "(default ~/Desktop/hm_tracker_paths.txt).")
     parser.add_argument("--eeg_channels", default=None,
-                        help="Explicit EEG channels to use (all of them), e.g. "
-                             "'NT5' or '16 17 18 19'. Overrides the config.")
+                        help="Explicit EEG channels to EXCLUDE from the EMG "
+                             "correlation, e.g. 'NT5' or '16 17 18 19'. Adds to the "
+                             "config EEG/bad channels.")
+    parser.add_argument("--exclude_bad", action="store_true",
+                        help="Drop SNR-outlier + config bad/EEG channels from the EMG "
+                             "correlation. Off by default: for a healthy probe the "
+                             "cross-channel mean is insensitive to channel choice "
+                             "(~identical correlation); useful only when several "
+                             "channels are bad.")
+    parser.add_argument("--snr_frac", type=float, default=SNR_FRAC,
+                        help=f"With --exclude_bad, drop channels with SNR < "
+                             f"snr_frac*median (default {SNR_FRAC}).")
     args = parser.parse_args()
     run(args.input_folder, args.output_folder, work_fs=args.work_fs, n_pick=args.n_pick,
-        config=_load_config(args.config), eeg_channels=_parse_eeg_arg(args.eeg_channels))
+        config=_load_config(args.config), eeg_channels=_parse_eeg_arg(args.eeg_channels),
+        exclude_bad=args.exclude_bad, snr_frac=args.snr_frac)

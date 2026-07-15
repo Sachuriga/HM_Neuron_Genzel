@@ -1,23 +1,4 @@
 **/.DS_Store
 **/.claude
-**/.pyc
-src/tools/__pycache__/mask.cpython-310.pyc
-src/tools/__pycache__/mask.cpython-313.pyc
-<<<<<<< HEAD
-=======
-src/sorter/__pycache__/readTrodesExtractedDataFile3.cpython-313.pyc
->>>>>>> 5b2a6c71efe126998cf426eae86821133a9a31fd
-src/tools/__pycache__/mask.cpython-313.pyc
-src/tools/__pycache__/mask.cpython-313.pyc
-src/sorter/__pycache__/readTrodesExtractedDataFile3.cpython-312.pyc
-src/__pycache__/TrackerYolov11.cpython-39.pyc
-<<<<<<< HEAD
 __pycache__/
 *.pyc
-=======
-src/sorter/__pycache__/sorting.cpython-39.pyc
-src/sorter/__pycache__/sorting.cpython-39.pyc
-src/sorter/__pycache__/readTrodesExtractedDataFile3.cpython-39.pyc
-src/sorter/__pycache__/sorting.cpython-39.pyc
-src/sorter/__pycache__/sorting.cpython-39.pyc
->>>>>>> 0d9ab5dcaa07d4cf053d46a0eb3af56f124e4f19
