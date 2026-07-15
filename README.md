@@ -58,7 +58,7 @@ The pipeline takes raw Trodes recordings (`.rec`) and multi-camera video, then r
 
 ## Directory Layout
 
-```
+```text
 HM_Tracker_2025/
 ├── src/
 │   ├── tracker/                     # Video pipeline (Steps 2–5)
@@ -95,8 +95,7 @@ HM_Tracker_2025/
 
 ### 1. Environment
 
-
-** manual:**
+**Manual:**
 
 ```bat
 conda env create -f requirements/reproduce.yml
@@ -135,7 +134,7 @@ cp examples/hm_tracker_paths.example.txt %USERPROFILE%\Desktop\hm_tracker_paths.
 
 Edit `hm_tracker_paths.txt`:
 
-```
+```text
 FFMPEG_CMD=C:\path\to\ffmpeg.exe
 ONNX_WEIGHTS_PATH=C:\path\to\weights.pt
 TRODES_EXPORT_CMD=C:\path\to\trodesexport.exe
@@ -151,7 +150,7 @@ This file must exist on the Desktop before running. Lines starting with `#` are 
 
 The runner expects input/output folder pairs named `ipN` / `opN` inside the target directory:
 
-```
+```text
 data_root/
 ├── ip1/    ← raw input (contains .rec + eye camera videos)
 ├── op1/    ← processed output
@@ -171,7 +170,7 @@ scripts\runner_windows.bat "C:\path\to\data_root"
 
 On launch you are prompted to select which steps to run:
 
-```
+```text
 Select steps to run (e.g., 123 for steps 1, 2, and 3):
 [1] Trodes Export (DIO/Raw)
 [e] Trodes Export LFP (per channel)
@@ -221,11 +220,13 @@ set WAIT_SECONDS=30
 **Key:** `1`  
 **Script:** `trodesexport` (external binary)  
 **Command:**
-```
+
+```bash
 trodesexport -dio -raw -rec <file.rec>
 ```
 
 Iterates over every `.rec` file found in the input folder and exports:
+
 - **DIO** (digital I/O) — TTL pulse events, typically used to record LED sync signals and task events.
 - **Raw** — raw neural voltage traces at the recording sample rate (default 30 000 Hz), written as `.dat` files per channel group.
 
@@ -238,11 +239,13 @@ Output lands alongside the `.rec` file in the input folder. Required before Step
 **Key:** `e`  
 **Script:** `exportLFP` (external binary)  
 **Command:**
-```
+
+```bash
 exportLFP -rec <file.rec> -outputrate 1000 -lfplowpass 500
 ```
 
 Exports Local Field Potential data from each `.rec` file:
+
 - **Sample rate:** 1 000 Hz (downsampled from the raw recording rate)
 - **Low-pass filter:** 500 Hz (applied during export by Trodes)
 - **Output format:** per-channel `.dat` files inside a `<recording>.LFP/` subfolder
@@ -256,7 +259,8 @@ These files are read by Step 8 (LFP extraction).
 **Key:** `2`  
 **Script:** `src/tracker/Video_LED_Sync_using_ICA.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
-```
+
+```bash
 python src/tracker/Video_LED_Sync_using_ICA.py -i <ip> -o <op> -f 30000
 ```
 
@@ -276,7 +280,8 @@ Aligns the video timeline to the neural recording timeline using an LED synchron
 **Key:** `3`  
 **Script:** `src/tracker/join_views.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Command:**
-```
+
+```bash
 python src/tracker/join_views.py <ip>
 ```
 
@@ -296,7 +301,8 @@ Stitches multiple individual camera video files (named `eye??_*.mp4`) into a sin
 **Script:** `src/tracker/TrackerYolov11.py` *(based on [genzellab/HM_RAT](https://github.com/genzellab/HM_RAT))*  
 **Requires:** `stitched.mp4` in the input folder  
 **Command:**
-```
+
+```bash
 python src/tracker/TrackerYolov11.py --input_folder <ip> --output_folder <op> --onnx_weight <weights.pt>
 ```
 
@@ -318,7 +324,8 @@ Runs the full tracking pipeline on the stitched video. See [Tracker — How It W
 **Key:** `5`  
 **Script:** `src/tracker/plot_trials.py`  
 **Command:**
-```
+
+```bash
 python src/tracker/plot_trials.py --input_folder <ip> --output_folder <op>
 ```
 
@@ -337,7 +344,8 @@ Generates a PDF report with trial-level visualizations from the tracker output:
 **Key:** `6`  
 **Script:** inline in `scripts/runner_windows.bat`  
 **Command:**
-```
+
+```bash
 ffmpeg -i <video.mp4> -c:v h264_nvenc -preset p6 -cq 28 -c:a copy __temp_compressed.mp4
 ```
 
@@ -359,7 +367,8 @@ Compresses the annotated tracker output video using NVIDIA hardware encoding:
 **Key:** `7`  
 **Script:** `src/sorter/sorting.py`  
 **Command:**
-```
+
+```bash
 python sorting.py --input_folder <ip> --output_folder <op> [--config <hm_tracker_paths.txt>]
 ```
 
@@ -380,7 +389,7 @@ Runs the full spike-sorting pipeline on raw Trodes-exported `.dat` files via Spi
 
 Bad channels and reference channels are read from `hm_tracker_paths.txt` (the same Desktop config file used by the runner; pass it with `--config`, or it falls back to `~/Desktop/hm_tracker_paths.txt`). The rat is matched against the start of each recording's file name (e.g. `rat1_..._group0.dat` → the `RAT1` keys).
 
-```
+```text
 # sorter selection + numeric settings (apply to all rats)
 SORTER=mountainsort5
 FREQ_MIN=600
@@ -408,7 +417,7 @@ EEG_TETRODES_RAT1=NT1 NT32
 
 The 128 channels are wired as 32 tetrodes of 4. Channels may be written as plain 0-based ids (`0`–`127`) or as `NT<t>ch<c>` (`t` = 1–32, `c` = 1–4), which map by:
 
-```
+```text
 channel = (NT − 1) × 4 + (ch − 1)
 ```
 
@@ -454,7 +463,8 @@ channel = (NT − 1) × 4 + (ch − 1)
 **Key:** `8`  
 **Script:** `src/sorter/export_lfp.py`  
 **Command:**
-```
+
+```bash
 python export_lfp.py --input_folder <ip> --output_folder <op>
 ```
 
@@ -476,7 +486,8 @@ Reads the Trodes-exported LFP `.dat` files (produced by Step e) and compiles the
 **Key:** `d`  
 **Script:** `src/dlc/tracking_eyes.py`  
 **Command:**
-```
+
+```bash
 python tracking_eyes.py --input_folder <ip> --output_folder <op>
 ```
 
@@ -512,7 +523,8 @@ Deletes intermediate folders from the input directory to recover disk space afte
 **Key:** `n`  
 **Script:** `src/node_analysis/hex_maze_analysis.py`  
 **Command:**
-```
+
+```bash
 python hex_maze_analysis.py --input_folder <ip> --output_folder <op>
 ```
 
@@ -523,7 +535,8 @@ Reads all `.xlsx` files in the input folder and computes behavioral metrics from
 **Key:** `w` (labelled `nwblfp` in the menu)
 **Script:** `src/nwb/create_nwb.py`
 **Command** (run once at the master level, after every parallel/sequential step has completed):
-```
+
+```bash
 python create_nwb.py --rat_nr %NWB_RAT_NR% --noroot --ip <ROOT_DIR> --op <ROOT_DIR>
 ```
 
@@ -567,7 +580,7 @@ Every frame is passed through YOLOv11 at confidence threshold 0.7 and input size
 
 ### Trial State Machine
 
-```
+```text
 WAITING  (start_trial=True, record_detections=False)
     │  rat centroid within 60 px of start node
     ▼
@@ -590,6 +603,7 @@ INTER-TRIAL  (start_trial=False, record_detections=False)
 **Researcher proximity end** — For types 1 and 2, if the closest researcher comes within 150 px of the rat after at least 5 seconds have elapsed, the trial ends immediately.
 
 **Force-end fallbacks:**
+
 - Closest researcher to the **goal** within 50 px for 10 continuous seconds → trial ends.
 - Closest researcher to the **goal** within 160 px for 30 continuous seconds → trial ends (probe immunity and unnormal-interval rules apply).
 
@@ -613,7 +627,7 @@ Multiple time-locked trials can be defined in the same session. A plain trial nu
 
 Console output at session start lists the loaded schedule:
 
-```
+```text
 Special trial schedule (trial_num → session seconds):
    Trial 3 → 05:30.00
    Trial 7 → 12:00.00
@@ -621,7 +635,7 @@ Special trial schedule (trial_num → session seconds):
 
 Each force-end logs:
 
-```
+```text
 [SCHEDULE] Trial 3 unlock time 330.00s reached at session 330.13s — force-ending active trial 2.
 ```
 
@@ -637,7 +651,7 @@ On every active frame, the tracker checks if the rat centroid falls within 20 px
 
 After each trial ends, segment velocities are computed from the (timestamp, node) sequence:
 
-```
+```text
 speed = segment_length / time_difference   [m/s]
 ```
 
