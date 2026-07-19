@@ -46,6 +46,30 @@ _TEMP_RE = re.compile(r"(^\.goutputstream-|\.tmp$|\.partial$|\.crdownload$)", re
 
 PHASES = ("pre", "task", "post")
 
+# Folders never worth descending into when hunting for scattered session data.
+_SKIP_DIRS = {
+    "$recycle.bin", "system volume information", "windows", "winnt",
+    "program files", "program files (x86)", "programdata", "appdata",
+    "$windows.~bt", "$windows.~ws", "msocache", "recovery", "perflogs",
+    "node_modules", "__pycache__", ".git", ".svn", ".trash", ".trashes",
+    "library", "applications", "system",
+}
+
+# Folder-name fragments that mean "derived output, not raw acquisition" — the
+# preprocessing tree (HM_neuron_preprocess) holds DLC coordinates, LFP exports
+# and labelled videos for sessions whose raw copies live elsewhere. Scanning it
+# only turns up look-alikes of data we already have, so it is skipped whole.
+_SKIP_SUBSTRINGS = ("preprocess",)
+
+
+def skip_dir(name: str) -> bool:
+    """True if a directory should never be descended into during a scan — a known
+    junk/system folder, a dotfile, or anything in the preprocessing tree."""
+    n = name.lower()
+    if n in _SKIP_DIRS or name.startswith("."):
+        return True
+    return any(s in n for s in _SKIP_SUBSTRINGS)
+
 
 def _classify_phase(name):
     """Map a recording folder / .rec name to pre | task | post | None."""
@@ -62,6 +86,61 @@ def _classify_phase(name):
 def _rat_of(name):
     m = _RAT_RE.search(name)
     return int(m.group(1)) if m else None
+
+
+# A recording name embeds an acquisition timestamp: Rat5_HM_neurons_20260619_160501_post
+_REC_TS_RE = re.compile(r"\d{8}_(\d{6})")
+# Explicit "resumed after a crash" markers the acquisition software appends when
+# a recording is split: ..._post_part2, ..._awake_part2, ..._pre_2, ..._post2.
+_SPLIT_SUFFIX_RE = re.compile(r"(_part_?\d+|part_?\d+|_\d+)$", re.I)
+
+
+def _stem(name):
+    """A recording entry's name without a trailing .rec, for phase/split tests."""
+    n = name
+    for suf in (".rec",):
+        if n.lower().endswith(suf):
+            n = n[: -len(suf)]
+    return n
+
+
+def detect_session_splits(sess):
+    """Which phases of one session were recorded in more than one part.
+
+    When the acquisition PC crashes and the recording is restarted, that phase
+    ends up as two files/folders at different clock times — ``..._post`` plus
+    ``..._post_part2`` — or simply two recordings the same phase classifies to.
+    They are one session's data, not two, and certainly not separate sessions.
+
+    Returns ``{phase: count}`` for phases that have more than one part (so an
+    empty dict means "not split"). Looks only at the top-level recording entries,
+    which is where each phase's recording lives; reads names only, no contents."""
+    # phase -> set of distinct acquisition timestamps seen for it
+    times = {}
+    forced = set()                       # phases with an explicit _part2 marker
+    try:
+        entries = list(sess.iterdir())
+    except OSError:
+        return {}
+    for c in entries:
+        stem = _stem(c.name)
+        ph = _classify_phase(stem)
+        if ph is None:
+            continue
+        # Ignore camera folders (2026-06-22_11-11-46) and merged rollups, which
+        # are not themselves a recording of a phase.
+        if _CAM_DIR_RE.match(c.name) or c.name.lower().endswith("_merged.rec"):
+            continue
+        m = _REC_TS_RE.search(c.name)
+        ts = m.group(1) if m else stem            # fall back to the whole name
+        times.setdefault(ph, set()).add(ts)
+        if _SPLIT_SUFFIX_RE.search(stem):
+            forced.add(ph)
+    out = {}
+    for ph, tss in times.items():
+        if len(tss) > 1 or ph in forced:
+            out[ph] = max(len(tss), 2)            # at least 2 parts if forced
+    return out
 
 
 # ------------------------------------------------------------
@@ -182,6 +261,90 @@ def find_sessions(root):
     return out
 
 
+def list_drive_roots(include_system=False, include_network=False):
+    """Every mounted volume worth searching, as a list of Path.
+
+    Windows: real drive letters, filtered by GetDriveTypeW so CD/DVD and (by
+    default) network and system drives are left out. POSIX: the usual removable
+    mount points. The system drive is excluded unless asked for — scattered raw
+    data lives on the externals, and walking C:\\ is slow for nothing."""
+    roots = []
+    if sys.platform.startswith("win"):
+        import string
+        import ctypes
+        DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_REMOTE = 2, 3, 4
+        want = {DRIVE_REMOVABLE, DRIVE_FIXED}
+        if include_network:
+            want.add(DRIVE_REMOTE)
+        try:
+            k32 = ctypes.windll.kernel32
+            mask = k32.GetLogicalDrives()
+        except Exception:
+            k32, mask = None, None
+        sysdrive = os.environ.get("SystemDrive", "C:")[0].upper()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if mask is not None and not (mask >> i) & 1:
+                continue
+            p = Path(f"{letter}:\\")
+            if mask is None and not p.exists():
+                continue
+            if k32 is not None and k32.GetDriveTypeW(str(p)) not in want:
+                continue
+            if not include_system and letter == sysdrive:
+                continue
+            roots.append(p)
+    else:
+        for base in ("/Volumes", "/media", "/mnt", "/run/media"):
+            b = Path(base)
+            if not b.is_dir():
+                continue
+            try:
+                for child in sorted(b.iterdir()):
+                    if child.is_dir():
+                        # /media/<user>/<label> on many Linux setups
+                        subs = [g for g in child.iterdir() if g.is_dir()] \
+                            if base in ("/media", "/run/media") else []
+                        roots += subs or [child]
+            except OSError:
+                continue
+    return roots
+
+
+def find_sessions_deep(root, max_depth=6, on_dir=None, should_stop=None):
+    """Find every ``<Rat folder>/<YYYYMMDD>`` session under `root`, at any depth
+    up to `max_depth` — unlike find_sessions(), which only looks one or two
+    levels down from a known drive root.
+
+    Use this to locate data that was filed somewhere unexpected (a backup
+    subfolder, a per-experimenter folder, a nested copy). `on_dir` is called with
+    each directory visited (progress); `should_stop` is polled to allow cancel."""
+    root = Path(root)
+    out = []
+    stack = [(root, 0)]
+    while stack:
+        if should_stop is not None and should_stop():
+            break
+        d, depth = stack.pop()
+        if on_dir is not None:
+            on_dir(d)
+        try:
+            children = [c for c in d.iterdir() if c.is_dir()]
+        except OSError:
+            continue                       # unreadable / permission denied
+        for c in children:
+            if skip_dir(c.name):
+                continue
+            if _DATE_RE.match(c.name):
+                # a session folder — only counts if its parent names a rat, and
+                # never worth descending into either way
+                if _rat_of(d.name) is not None:
+                    out.append(c)
+                continue
+            if depth < max_depth:
+                stack.append((c, depth + 1))
+    return out
+
+
 def _classify_file(name):
     """File kind for the inventory: video / meta / merged / rec / logger / config / other."""
     n = name.lower()
@@ -209,6 +372,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
     mp4s, rec_files, phases, rec_folders, empty_dirs = [], [], set(), [], []
     n = {k: 0 for k in ("video", "meta", "rec", "merged", "logger", "config", "other")}
     bytes_video = bytes_ephys = 0
+    phase_bytes = {p: 0 for p in PHASES}   # ephys bytes per pre/task/post
 
     # Groups of files to inventory: (folder_label, files, is_recording). Some rats
     # (Rat3/Rat4) drop the camera videos LOOSE in the date folder (no timestamp
@@ -226,6 +390,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
 
     for folder, files, is_recording in groups:
         has_rec_here = False
+        here_ephys = 0                       # ephys bytes in this recording folder
         for p in files:
             cat = _classify_file(p.name)
             try:
@@ -239,6 +404,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
                 mp4s.append(p); bytes_video += max(size, 0)
             elif cat in ("rec", "merged", "logger"):
                 rec_files.append(p); bytes_ephys += max(size, 0); has_rec_here = True
+                here_ephys += max(size, 0)
                 if cat in ("rec", "merged"):
                     rno = _rat_of(p.name)
                     if rat_no is not None and rno is not None and rno != rat_no:
@@ -251,6 +417,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
             ph = _classify_phase(folder)
             if ph:
                 phases.add(ph)
+                phase_bytes[ph] += here_ephys
             rec_folders.append(f"{folder}[{ph or '?'}]")
 
     has_ephys = bool(rec_files)
@@ -281,6 +448,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
         n_video=n["video"], n_meta=n["meta"],
         n_rec=n["rec"], n_merged=n["merged"], n_logger=n["logger"],
         video_gb=round(bytes_video / 1e9, 2), ephys_gb=round(bytes_ephys / 1e9, 2),
+        phase_bytes=dict(phase_bytes),
         rec_folders="; ".join(rec_folders)))
     return has_ephys, mp4s
 
