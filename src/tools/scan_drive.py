@@ -626,6 +626,28 @@ def _add_sheet(wb, title, cols, rows, taken):
     return ws
 
 
+def write_xlsx(path, sheets):
+    """Write tables to an .xlsx. `sheets` is [(title, cols, rows-as-dicts), ...].
+
+    Shared with scan_drive_gui so its export buttons produce the same workbook
+    styling as the scan itself. Returns (ok, message).
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return False, "openpyxl is not installed (pip install openpyxl)."
+    wb = Workbook()
+    wb.remove(wb.active)
+    taken = set()
+    for title, cols, rows in sheets:
+        _add_sheet(wb, title, cols, rows, taken)
+    try:
+        wb.save(path)
+    except OSError as e:
+        return False, str(e)
+    return True, str(path)
+
+
 def _write_workbook(root, inv_rows, file_rows, issues, per_rat=False):
     """Every table of the scan in one .xlsx, so the results can be opened and
     copied straight into a spreadsheet without an import step. The CSV/TSV files

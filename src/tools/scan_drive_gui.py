@@ -35,7 +35,6 @@ Launch with:  python scan_drive_gui.py
 from __future__ import annotations
 
 import sys
-import csv
 import datetime
 import subprocess
 from pathlib import Path
@@ -89,6 +88,17 @@ def _paint(item, bg):
     """Give a table cell a light background and a dark, legible foreground."""
     item.setBackground(QBrush(bg))
     item.setForeground(QBrush(_INK))
+
+
+def _xlsx(path: str) -> Path:
+    """Force an .xlsx suffix on whatever the save dialog returned.
+
+    The dialog only suggests a name — a user who types "coverage" or leaves an
+    old ".csv" on it would otherwise get a workbook Excel refuses to open by
+    double-click.
+    """
+    p = Path(path)
+    return p if p.suffix.lower() == ".xlsx" else p.with_suffix(".xlsx")
 
 
 def _rep(v) -> str:
@@ -820,32 +830,31 @@ class ScatterDialog(QDialog):
         _reveal(self.rows[r].get("path"))
 
     def _export(self):
-        f, _ = QFileDialog.getSaveFileName(self, "Export scattered-data CSV",
-                                           str(Path.home() / "drive_scatter.csv"), "CSV (*.csv)")
+        f, _ = QFileDialog.getSaveFileName(self, "Export scattered data",
+                                           str(Path.home() / "drive_scatter.xlsx"),
+                                           "Excel (*.xlsx)")
         if not f:
             return
         cols = ["kind", "rat", "date8", "day", "session", "repeat", "pre_gb",
                 "task_gb", "post_gb", "video", "missing", "split", "split_text",
                 "volume", "path", "detail"]
-        try:
-            with open(f, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=cols)
-                w.writeheader()
-                for r in self.rows:
-                    row = {c: r.get(c, "") for c in cols}
-                    pg = r.get("phase_gb") or {}
-                    row["pre_gb"] = pg.get("pre", "")
-                    row["task_gb"] = pg.get("task", "")
-                    row["post_gb"] = pg.get("post", "")
-                    row["video"] = r.get("video", "")
-                    row["missing"] = "+".join(r.get("missing", []))
-                    row["split"] = int(bool(r.get("split")))
-                    # every volume the (possibly split) session lives on
-                    row["volume"] = "; ".join(r.get("volumes", [])) or r.get("volume", "")
-                    row["path"] = "; ".join(r.get("paths", [])) or r.get("path", "")
-                    w.writerow(row)
-        except OSError as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+        out = []
+        for r in self.rows:
+            row = {c: r.get(c, "") for c in cols}
+            pg = r.get("phase_gb") or {}
+            row["pre_gb"] = pg.get("pre", "")
+            row["task_gb"] = pg.get("task", "")
+            row["post_gb"] = pg.get("post", "")
+            row["video"] = r.get("video", "")
+            row["missing"] = "+".join(r.get("missing", []))
+            row["split"] = int(bool(r.get("split")))
+            # every volume the (possibly split) session lives on
+            row["volume"] = "; ".join(r.get("volumes", [])) or r.get("volume", "")
+            row["path"] = "; ".join(r.get("paths", [])) or r.get("path", "")
+            out.append(row)
+        ok, msg = sd.write_xlsx(_xlsx(f), [("scattered", cols, out)])
+        if not ok:
+            QMessageBox.critical(self, "Export failed", msg)
 
 
 # ------------------------------------------------------------------
@@ -997,20 +1006,18 @@ class OrganizeDialog(QDialog):
 
     def _export(self):
         f, _ = QFileDialog.getSaveFileName(self, "Export organize plan",
-                                           str(Path.home() / "organize_plan.csv"), "CSV (*.csv)")
+                                           str(Path.home() / "organize_plan.xlsx"),
+                                           "Excel (*.xlsx)")
         if not f:
             return
         cols = ["action", "rat", "date8", "day", "session", "repeat", "entry",
                 "n_files", "bytes", "src", "dst", "reason"]
-        try:
-            with open(f, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=cols)
-                w.writeheader()
-                for p in self.plan:
-                    w.writerow({c: p.get(c, "") for c in cols})
-            self.run_lbl.setText(f"Plan exported → {f}")
-        except OSError as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+        rows = [{c: p.get(c, "") for c in cols} for p in self.plan]
+        ok, msg = sd.write_xlsx(_xlsx(f), [("plan", cols, rows)])
+        if ok:
+            self.run_lbl.setText(f"Plan exported → {msg}")
+        else:
+            QMessageBox.critical(self, "Export failed", msg)
 
     def _run(self):
         ok, msg = od.space_check(self.plan, self.dest)
@@ -1255,27 +1262,25 @@ class PreprocessDialog(QDialog):
 
     def _export(self):
         f, _ = QFileDialog.getSaveFileName(self, "Export preprocessing progress",
-                                           str(Path.home() / "preprocess_progress.csv"),
-                                           "CSV (*.csv)")
+                                           str(Path.home() / "preprocess_progress.xlsx"),
+                                           "Excel (*.xlsx)")
         if not f:
             return
         cols = ["rat", "date8", "day", "session", "repeat", "implanted"] + \
             [f"step_{s}" for s in _PP_STEPS] + ["n_done", "n_expected", "summary", "folder"]
-        try:
-            with open(f, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=cols)
-                w.writeheader()
-                for r in self.rows:
-                    row = dict(rat=r["rat"], date8=r["date8"], day=r["day"],
-                               session=r["session"], repeat=_rep(r["repeat"]),
-                               implanted=int(r["implanted"]), n_done=r["n_done"],
-                               n_expected=r["n_expected"], summary=r["summary"],
-                               folder="; ".join(r["folders"]))
-                    for s in _PP_STEPS:
-                        row[f"step_{s}"] = r["status"].get(s, "") if s in r["expected"] else ""
-                    w.writerow(row)
-        except OSError as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+        out = []
+        for r in self.rows:
+            row = dict(rat=r["rat"], date8=r["date8"], day=r["day"],
+                       session=r["session"], repeat=_rep(r["repeat"]),
+                       implanted=int(r["implanted"]), n_done=r["n_done"],
+                       n_expected=r["n_expected"], summary=r["summary"],
+                       folder="; ".join(r["folders"]))
+            for s in _PP_STEPS:
+                row[f"step_{s}"] = r["status"].get(s, "") if s in r["expected"] else ""
+            out.append(row)
+        ok, msg = sd.write_xlsx(_xlsx(f), [("progress", cols, out)])
+        if not ok:
+            QMessageBox.critical(self, "Export failed", msg)
 
 
 class SummaryDialog(QDialog):
@@ -1903,39 +1908,39 @@ class ScanDriveGUI(QMainWindow):
     def _export(self):
         if not any(self.results):
             return
-        f, _ = QFileDialog.getSaveFileName(self, "Export coverage CSV",
-                                           str(Path.home() / "drive_coverage.csv"), "CSV (*.csv)")
+        f, _ = QFileDialog.getSaveFileName(self, "Export coverage",
+                                           str(Path.home() / "drive_coverage.xlsx"),
+                                           "Excel (*.xlsx)")
         if not f:
             return
         cols = ["rat", "date8", "day", "session", "repeat", "expected", "implanted",
                 "n_video", "pre_gb", "task_gb", "post_gb", "short_phases", "split",
                 "n_rec", "n_merged", "n_logger", "found_in", "status"]
-        try:
-            with open(f, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=cols)
-                w.writeheader()
-                for r in self.results:
-                    if not r:
-                        continue
-                    pg = r.get("phase_gb", {})
-                    imp = r["implanted"]
-                    w.writerow(dict(
-                        rat=r["rat"], date8=r["date8"], day=r["day"], session=r["session"],
-                        repeat=_rep(r["repeat"]),
-                        expected=r["expected"], implanted=int(imp),
-                        n_video=r["n_video"],
-                        pre_gb=pg.get("pre", 0) if imp else "",
-                        task_gb=pg.get("task", 0) if imp else "",
-                        post_gb=pg.get("post", 0) if imp else "",
-                        short_phases="+".join(r.get("short_phases", [])),
-                        split=r.get("split_text", ""),
-                        n_rec=r.get("n_rec", 0), n_merged=r.get("n_merged", 0),
-                        n_logger=r.get("n_logger", 0),
-                        found_in="; ".join(r.get("paths", [])) or r["found_in"],
-                        status=r["status"]))
-            self.status_lbl.setText(f"Exported → {f}")
-        except OSError as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+        out = []
+        for r in self.results:
+            if not r:
+                continue
+            pg = r.get("phase_gb", {})
+            imp = r["implanted"]
+            out.append(dict(
+                rat=r["rat"], date8=r["date8"], day=r["day"], session=r["session"],
+                repeat=_rep(r["repeat"]),
+                expected=r["expected"], implanted=int(imp),
+                n_video=r["n_video"],
+                pre_gb=pg.get("pre", 0) if imp else "",
+                task_gb=pg.get("task", 0) if imp else "",
+                post_gb=pg.get("post", 0) if imp else "",
+                short_phases="+".join(r.get("short_phases", [])),
+                split=r.get("split_text", ""),
+                n_rec=r.get("n_rec", 0), n_merged=r.get("n_merged", 0),
+                n_logger=r.get("n_logger", 0),
+                found_in="; ".join(r.get("paths", [])) or r["found_in"],
+                status=r["status"]))
+        ok, msg = sd.write_xlsx(_xlsx(f), [("coverage", cols, out)])
+        if ok:
+            self.status_lbl.setText(f"Exported → {msg}")
+        else:
+            QMessageBox.critical(self, "Export failed", msg)
 
 
 def main():
