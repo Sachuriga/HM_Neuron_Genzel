@@ -211,6 +211,49 @@ def compute_speed_from_xy(x: np.ndarray, y: np.ndarray, fs: float, t=None) -> np
     return spd
 
 
+def maze_edge_segments(maze_graph, x_den, y_den):
+    """The maze's corridors as plot segments in the scaled metre frame.
+
+    Built once from the connectivity graph (which already drops 501/502 and adds
+    the manual bridges), then reused on every axis — the node rings alone don't
+    show which nodes are actually connected, so a trajectory can't be read against
+    the maze it was walked in.
+    """
+    if maze_graph is None:
+        return []
+    pos = nx.get_node_attributes(maze_graph, "pos")
+    segs = []
+    for u, v in maze_graph.edges():
+        if u in pos and v in pos:
+            (ux, uy), (vx, vy) = pos[u], pos[v]
+            segs.append([(ux / x_den, uy / y_den), (vx / x_den, vy / y_den)])
+    return segs
+
+
+def draw_maze(ax, segments, nodes_data, node_color="grey", node_size=100,
+              node_alpha=0.3, node_zorder=5, edge_alpha=0.35, edge_width=1.0,
+              labels=False, label_size=4, label_color="grey", label_zorder=6):
+    """Draw the hex maze (corridors + node rings) as the backdrop of a spatial plot.
+
+    Corridors go at zorder 0 so every trajectory, heatmap and marker stays on top.
+    """
+    if segments:
+        ax.add_collection(LineCollection(segments, colors=node_color,
+                                         linewidths=edge_width, alpha=edge_alpha,
+                                         zorder=0))
+    if nodes_data is None:
+        return
+    ax.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=node_size,
+               facecolors="none", edgecolors=node_color, linewidths=2 if node_size >= 90 else 1,
+               alpha=node_alpha, zorder=node_zorder)
+    if labels:
+        for _, nrow in nodes_data.iterrows():
+            ax.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], str(int(nrow["id"])),
+                    color=label_color, fontsize=label_size, va="center",
+                    zorder=label_zorder,
+                    **({"fontweight": "bold"} if label_size >= 8 else {}))
+
+
 def crosses_seam(x, y):
     """Per-step mask: does the segment from sample i to i+1 cross a stitch seam?"""
     out = np.zeros(max(x.size - 1, 0), bool)
@@ -305,6 +348,63 @@ def repair_stitch_jumps(x, y, t=None, fs: float = FS, max_speed: float = MAX_SPE
         x[bad] = np.interp(t[bad], t[good], x0[good])
         y[bad] = np.interp(t[bad], t[good], y0[good])
     return x, y, int(bad.sum())
+
+
+def find_teleports(x, y, t=None, fs: float = FS, max_speed: float = MAX_SPEED,
+                   jump_ratio: float = JUMP_RATIO):
+    """Per-step mask of jumps that are not movement and not a seam artefact.
+
+    A rat cannot cross the maze between two frames. What can is a trial whose
+    Trial_Num spans two disjoint blocks, a detection landing on the wrong object,
+    or the tracker's own end-of-trial snap to the goal. These are discontinuities,
+    not slow or fast running, so the step across them is not a distance the animal
+    travelled and not a speed it reached — the caller treats them as gaps.
+
+    Same two-part test as the seam repair (impossible AND out of scale with the
+    local motion), minus the seam-crossing requirement, so genuine fast running is
+    left alone. Run AFTER repair_stitch_jumps so seam artefacts are already gone.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = x.size
+    if n < 3:
+        return np.zeros(max(n - 1, 0), bool)
+    t = (np.arange(n) / fs) if t is None else np.asarray(t, float)
+    if t.size != n or not np.all(np.isfinite(t)):
+        t = np.arange(n) / fs
+    gap = np.diff(t)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = np.where(gap > 0, np.hypot(np.diff(x), np.diff(y)) / gap, np.inf)
+    local = _local_speed(np.where(np.isfinite(v), v, 0.0))
+    return (v > max_speed) & (v > jump_ratio * local)
+
+
+def speed_with_gaps(x, y, t, fs: float, teleport):
+    """Speed with the track cut at every teleport, so no gradient spans a gap.
+
+    Each contiguous run between gaps is differentiated on its own; a run of one
+    sample has no motion to measure and contributes 0.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = x.size
+    if teleport is None or not np.any(teleport):
+        return compute_speed_from_xy(x, y, fs, t=t)
+    cuts = np.flatnonzero(teleport) + 1              # gap sits before this sample
+    out = np.zeros(n)
+    for a, b in zip(np.r_[0, cuts], np.r_[cuts, n]):
+        if b - a >= 2:
+            out[a:b] = compute_speed_from_xy(
+                x[a:b], y[a:b], fs, t=(None if t is None else np.asarray(t)[a:b]))
+    return out
+
+
+def path_length_gapped(x, y, teleport):
+    """Path length with teleport steps left out, instead of counted as distance."""
+    if len(x) < 2:
+        return 0.0
+    step = np.hypot(np.diff(np.asarray(x, float)), np.diff(np.asarray(y, float)))
+    return float(step[~teleport].sum()) if teleport is not None else float(step.sum())
 
 
 def sample_durations(t, fs: float, n: int) -> np.ndarray:
@@ -743,6 +843,19 @@ if __name__ == "__main__":
     else:
         print(f"Warning: {node_file_path} not found. Nodes and Paths will not be plotted.")
 
+    # Maze corridors, scaled once and reused as the backdrop of every spatial plot.
+    maze_segs = maze_edge_segments(maze_graph, X_SCALE_DEN, Y_SCALE_DEN)
+    # Draw only the nodes the graph actually keeps: build_hexmaze_graph drops 501
+    # and 502, so leaving them in the backdrop would show two rings with no
+    # corridors attached, in a maze the scoring never routes through. nodes_data
+    # itself stays intact — the goal lookup still needs every id.
+    maze_nodes = nodes_data
+    if nodes_data is not None and maze_graph is not None:
+        maze_nodes = nodes_data[nodes_data["id_str"].isin(set(maze_graph.nodes))]
+    if maze_segs:
+        print(f"Maze backdrop: {len(maze_segs)} corridors, "
+              f"{len(maze_nodes) if maze_nodes is not None else 0} nodes.")
+
     pdf_path = work_dir / f"{session_stem(log_file_stem)}_analysis_final.pdf"
     # Runs before the session-based naming produced <source>_analysis_final.pdf.
     # Those are not overwritten, and preprocess_check globs *_analysis_final.pdf,
@@ -763,6 +876,10 @@ if __name__ == "__main__":
     global_y_scaled = []
     global_speed_vals = []
     global_dt_vals = []          # seconds each position sample stands for
+    global_tel_vals = []         # per-step teleport mask, to break aggregate lines
+    global_tids = []             # trial id per entry, parallel to the lists above
+    teleport_total = 0
+    teleport_trials = []
 
     summary_metrics = []
     print(f"Total Trials Processed: {len(per_trial_df)}")
@@ -822,7 +939,16 @@ if __name__ == "__main__":
                     # keep the pixel-frame copies (path length, goal arrival) in sync
                     x_raw = x_calc * X_SCALE_DEN
                     y_raw = y_calc * Y_SCALE_DEN
-            speed = compute_speed_from_xy(x_calc, y_calc, FS, t=t_trial)
+            # Teleports left after the seam repair are discontinuities, not motion.
+            # Treated as gaps: the step is excluded from speed, from path length and
+            # from every line plot, rather than being smoothed into the data.
+            teleport = find_teleports(x_calc, y_calc, t=t_trial, fs=FS,
+                                      max_speed=args.max_speed,
+                                      jump_ratio=args.jump_ratio)
+            if teleport.any():
+                teleport_total += int(teleport.sum())
+                teleport_trials.append(trial_id)
+            speed = speed_with_gaps(x_calc, y_calc, t_trial, FS, teleport)
             dt_samples = sample_durations(t_trial, FS, len(x_calc))
 
             # 2. PLOTTING PATH (Always use FULL path)
@@ -869,6 +995,8 @@ if __name__ == "__main__":
             global_y_scaled.append(y_calc)
             global_speed_vals.append(speed)
             global_dt_vals.append(dt_samples)
+            global_tel_vals.append(teleport)
+            global_tids.append(trial_id)
 
             speed_raw_smooth = moving_average(speed, SMOOTH_SAMPLES_RAW) 
             speed_05 = moving_average(speed, SMOOTH_SAMPLES_05)
@@ -910,11 +1038,16 @@ if __name__ == "__main__":
             # If not reached, score is based on total path + distance to goal (if appended).
             
             # 1. Physical Dist Calculation for SCORING
+            # Teleport steps are excluded: a discontinuity is not distance the rat
+            # ran, and counting it inflates the actual path, which deflates
+            # ln(optimal/actual) into a worse-looking score than the animal earned.
             if goal_reached_naturally and first_goal_visit_idx > 0:
-                actual_dist_score_basis = compute_path_length(x_raw[:first_goal_visit_idx+1], y_raw[:first_goal_visit_idx+1])
+                _end = first_goal_visit_idx + 1
+                actual_dist_score_basis = path_length_gapped(
+                    x_raw[:_end], y_raw[:_end], teleport[:_end - 1])
                 score_note = "(Start->FirstGoal)"
             else:
-                actual_dist_score_basis = compute_path_length(x_raw, y_raw)
+                actual_dist_score_basis = path_length_gapped(x_raw, y_raw, teleport)
                 score_note = "(Full Path — Failed)"
 
             # 2. Hops Calculation for SCORING
@@ -1040,14 +1173,12 @@ if __name__ == "__main__":
                 pts = np.column_stack([x_plot, y_plot])
                 segments = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_arr = np.linspace(0.0, 1.0, len(pts) - 1)
-                # Skip segments where consecutive points jump too far apart
-                # (tracking dropouts leave gaps that would otherwise draw a straight
-                # line across the maze, often start→goal).
-                seg_lengths = np.hypot(np.diff(x_plot), np.diff(y_plot))
-                JUMP_THRESHOLD = 0.5  # scaled units (~65 raw px, ~one node spacing)
-                valid_mask = seg_lengths < JUMP_THRESHOLD
-                segments = segments[valid_mask]
-                t_arr = t_arr[valid_mask]
+                # Break the line at the same gaps the scoring uses, instead of the
+                # old standalone distance threshold - one definition of "not real
+                # movement" for the picture and the numbers alike.
+                keep = ~teleport
+                segments = segments[keep]
+                t_arr = t_arr[keep]
                 if len(segments) > 0:
                     lc = LineCollection(segments, cmap="cool", norm=mpl.colors.Normalize(0, 1), linewidths=1.5, rasterized=True)
                     lc.set_array(t_arr)
@@ -1104,17 +1235,8 @@ if __name__ == "__main__":
             fig.colorbar(im4, ax=ax3, fraction=0.025, pad=0.02, label="Seconds")
             ax3.set_title(f"Trial {trial_id}: Absolute Occupancy")
 
-            if nodes_data is not None:
-                spatial_axes = [ax0, ax1, ax_path_dist, ax_path_hops, ax2, ax3]
-                for sax in spatial_axes:
-                    sax.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                s=100, facecolors='none', edgecolors='grey', 
-                                linewidths=2, alpha=0.3, zorder=5)
-                    for _, nrow in nodes_data.iterrows():
-                        sax.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                 str(int(nrow["id"])), 
-                                 color='grey', fontsize=4, 
-                                 va='center', zorder=6)
+            for sax in (ax0, ax1, ax_path_dist, ax_path_hops, ax2, ax3):
+                draw_maze(sax, maze_segs, maze_nodes, labels=True)
 
             ax4.plot(time_vec, speed_raw_smooth, color='gray', alpha=0.3, label='Raw (0.4s)', linewidth=1)
             ax4.plot(time_vec, speed_05, color='#1f77b4', linewidth=1.5, label='0.5s')
@@ -1149,10 +1271,8 @@ if __name__ == "__main__":
             # decoded position for THIS trial, one panel per unit set (good, good+mua):
             # grey = actual path, colored = decoded, 'cool' colormap by within-trial time.
             for axd, trk in zip(dec_axes, decoded_all):
-                if nodes_data is not None:
-                    axd.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=22,
-                                facecolors='none', edgecolors='grey', linewidths=1,
-                                alpha=0.25, zorder=1)
+                draw_maze(axd, maze_segs, maze_nodes, node_size=22,
+                          node_alpha=0.25, edge_alpha=0.25, node_zorder=1)
                 t0, t1 = row.get("t0"), row.get("t1")
                 if t0 is not None and t1 is not None:
                     m = (trk["t"] >= t0) & (trk["t"] <= t1)
@@ -1279,13 +1399,14 @@ if __name__ == "__main__":
             all_segments = []
             all_times = []
             
-            for x_i, y_i in zip(global_x_scaled, global_y_scaled):
+            for x_i, y_i, tel_i in zip(global_x_scaled, global_y_scaled, global_tel_vals):
                 if len(x_i) < 2: continue
                 pts = np.column_stack([x_i, y_i])
                 segs = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_i = np.linspace(0.0, 1.0, len(pts) - 1)
-                all_segments.append(segs)
-                all_times.append(t_i)
+                keep = ~tel_i                      # never draw across a gap
+                all_segments.append(segs[keep])
+                all_times.append(t_i[keep])
                 
             if all_segments:
                 combined_segments = np.concatenate(all_segments, axis=0)
@@ -1304,15 +1425,10 @@ if __name__ == "__main__":
                 ax_traj.set_aspect('equal')
                 ax_traj.set_title(f"Aggregate Trajectories (All Trials)", fontsize=16)
                 
-                if nodes_data is not None:
-                    ax_traj.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                      s=100, facecolors='none', edgecolors='black', 
-                                      linewidths=2, alpha=0.7, zorder=20)
-                    for _, nrow in nodes_data.iterrows():
-                        ax_traj.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                      str(int(nrow["id"])), 
-                                      color='black', fontsize=8, fontweight='bold',
-                                      va='center', zorder=21)
+                draw_maze(ax_traj, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25,
+                          labels=True, label_size=8, label_color='black',
+                          label_zorder=21)
 
             pdf.savefig(fig_traj)
             plt.close(fig_traj)
@@ -1344,7 +1460,7 @@ if __name__ == "__main__":
             seg_list_spd = []
             val_list_spd = []
 
-            for x_i, y_i in zip(global_x_scaled, global_y_scaled):
+            for x_i, y_i, tel_i in zip(global_x_scaled, global_y_scaled, global_tel_vals):
                 if len(x_i) < 2: continue
                 pts = np.column_stack([x_i, y_i])
                 segs = np.stack([pts[:-1], pts[1:]], axis=1)
@@ -1352,8 +1468,10 @@ if __name__ == "__main__":
                 iy = np.searchsorted(y_edges, y_i[:-1]) - 1
                 ix = np.clip(ix, 0, bins_x - 1)
                 iy = np.clip(iy, 0, bins_y - 1)
-                vals_occ = H_occupancy_avg[ix, iy]
-                vals_spd = H_speed_avg[ix, iy]
+                keep = ~tel_i
+                vals_occ = H_occupancy_avg[ix, iy][keep]
+                vals_spd = H_speed_avg[ix, iy][keep]
+                segs = segs[keep]
                 seg_list_occ.append(segs)
                 val_list_occ.append(vals_occ)
                 seg_list_spd.append(segs)
@@ -1378,10 +1496,8 @@ if __name__ == "__main__":
                 ax_ov_occ.set_xlim(0, 9)
                 ax_ov_occ.set_ylim(5, 0)
                 ax_ov_occ.set_aspect('equal')
-                if nodes_data is not None:
-                    ax_ov_occ.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_ov_occ, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_ov_occ)
                 plt.close(fig_ov_occ)
 
@@ -1398,10 +1514,8 @@ if __name__ == "__main__":
                 ax_ov_spd.set_xlim(0, 9)
                 ax_ov_spd.set_ylim(5, 0)
                 ax_ov_spd.set_aspect('equal')
-                if nodes_data is not None:
-                    ax_ov_spd.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_ov_spd, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_ov_spd)
                 plt.close(fig_ov_spd)
 
@@ -1424,15 +1538,9 @@ if __name__ == "__main__":
             cbar_cum = fig_cum.colorbar(im_cum, ax=ax_cum, fraction=0.046, pad=0.04)
             cbar_cum.set_label("Cumulative Time (Total Seconds)", rotation=270, labelpad=20)
             ax_cum.set_title("Cumulative Occupancy Map (All Trials)", fontsize=16)
-            if nodes_data is not None:
-                ax_cum.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                  s=100, facecolors='none', edgecolors='black', 
-                                  linewidths=2, alpha=0.7, zorder=20)
-                for _, nrow in nodes_data.iterrows():
-                    ax_cum.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                  str(int(nrow["id"])), 
-                                  color='black', fontsize=8, fontweight='bold',
-                                  va='center', zorder=21)
+            draw_maze(ax_cum, maze_segs, maze_nodes, node_color='black',
+                      node_alpha=0.7, node_zorder=20, edge_alpha=0.25,
+                      labels=True, label_size=8, label_color='black', label_zorder=21)
             pdf.savefig(fig_cum)
             plt.close(fig_cum)
 
@@ -1440,17 +1548,18 @@ if __name__ == "__main__":
         if len(global_x_scaled) > 0:
             seg_list_trials = []
             val_list_trials = []
-            for i, row in per_trial_df.iterrows():
-                tid = row.get("trial_id")
-                xy_arr = row["xy"]
-                if xy_arr.size < 2: continue
-                x = xy_arr[:, 0] / X_SCALE_DEN
-                y = (xy_arr[:, 1] / Y_SCALE_DEN) + i*0.005 
+            # Walk the global lists, not per_trial_df: they hold the seam-repaired
+            # coordinates the rest of the report uses, and their order is what the
+            # teleport masks are aligned to (a df index would skip past empty trials).
+            for i, (x_i, y_i, tel_i, tid) in enumerate(
+                    zip(global_x_scaled, global_y_scaled, global_tel_vals, global_tids)):
+                if len(x_i) < 2: continue
+                x = x_i
+                y = y_i + i * 0.005          # fan the trials apart so they stay legible
                 pts = np.column_stack([x, y])
-                segs = np.stack([pts[:-1], pts[1:]], axis=1)
-                t_vals = np.full(len(segs), tid)
+                segs = np.stack([pts[:-1], pts[1:]], axis=1)[~tel_i]
                 seg_list_trials.append(segs)
-                val_list_trials.append(t_vals)
+                val_list_trials.append(np.full(len(segs), tid))
                 
             if seg_list_trials:
                 combined_segs_trial = np.concatenate(seg_list_trials, axis=0)
@@ -1469,10 +1578,8 @@ if __name__ == "__main__":
                 ax_idx.set_xlim(0, 9)
                 ax_idx.set_ylim(5, 0)
                 ax_idx.set_aspect('equal')
-                if nodes_data is not None:
-                     ax_idx.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_idx, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_idx)
                 plt.close(fig_idx)
 
@@ -1583,10 +1690,8 @@ if __name__ == "__main__":
                                         (axD, (trk["dx"], trk["dy"], "Decoded path"))):
                 sc = pane.scatter(xx, yy, c=ct, cmap="cool", s=12,
                                   vmin=0, vmax=1, rasterized=True, zorder=4)
-                if nodes_data is not None:
-                    pane.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=90,
-                                 facecolors='none', edgecolors='grey',
-                                 linewidths=1.5, alpha=0.3, zorder=2)
+                draw_maze(pane, maze_segs, maze_nodes, node_size=90,
+                          node_alpha=0.3, node_zorder=2, edge_alpha=0.3)
                 pane.set_title(ttl, fontsize=14)
                 pane.set_aspect("equal", adjustable="box")
                 pane.set_xlim(0, 9); pane.set_ylim(5, 0)
@@ -1603,6 +1708,10 @@ if __name__ == "__main__":
             print(f"Added {len(decoded_all)} decoded-track page(s): "
                   f"{', '.join(t['quality'] for t in decoded_all)}.")
 
+    if teleport_total:
+        print(f"Teleports treated as gaps: {teleport_total} step(s) across "
+              f"{len(set(teleport_trials))} trial(s) - excluded from speed, path "
+              f"length and every line plot.")
     if repair_seams:
         print(f"Stitch-seam repair: interpolated {seam_fix_total} position sample(s) "
               f"at seams x={SEAM_X}, y={SEAM_Y} (> {args.max_speed} m/s).")
