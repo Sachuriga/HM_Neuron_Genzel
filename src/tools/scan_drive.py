@@ -23,9 +23,21 @@ Also flags cheap extra anomalies: cross-rat-named .rec under the wrong Rat
 folder, leftover copy temp files (.goutputstream-*, *.tmp), and empty recording
 folders.
 
+Outputs, all written to <root>:
+
+    drive_scan.xlsx            every table as a sheet (inventory / issues / files)
+                               plus one sheet per animal - open and copy-paste
+    drive_scan_inventory.tsv   the inventory alone, tab separated so it pastes
+                               into a spreadsheet already split into columns
+    drive_scan_paste/<rat>.tsv the same, one file per animal
+    drive_scan_report.md       the readable summary
+    drive_scan_inventory.md    the readable per-folder file listing
+    drive_scan_*.csv           the same tables for anything reading them in code
+
 Usage:
     python scan_drive.py --root <drive> [--rat Rat5] [--no-videos] [--deep]
                          [--workers 8] [--ffprobe /path/to/ffprobe]
+                         [--no-per-rat]
 """
 
 import os
@@ -500,6 +512,7 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
         issues += bad_videos
 
     _write_inventory(root, inv_rows, file_rows, per_rat=paste_per_rat)
+    _write_workbook(root, inv_rows, file_rows, issues, per_rat=paste_per_rat)
     _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos, inv_rows)
 
 
@@ -632,6 +645,86 @@ def _write_inventory_tsv(root, inv_rows, per_rat=False):
           f"({written} animal(s), one file each)")
 
 
+ISSUE_COLS = ["category", "rat", "session", "path", "detail"]
+FILE_COLS = ["rat", "session", "folder", "file", "type", "size_bytes"]
+
+# Excel forbids these in a sheet name, and caps the name at 31 characters.
+_BAD_SHEET = re.compile(r"[\[\]:*?/\\]")
+
+
+def _sheet_name(name, taken):
+    """A legal, unique Excel sheet name for `name`."""
+    s = _BAD_SHEET.sub("_", str(name)).strip("'") or "sheet"
+    s = s[:31]
+    base, i = s, 2
+    while s.lower() in taken:
+        suffix = f"_{i}"
+        s = base[:31 - len(suffix)] + suffix
+        i += 1
+    taken.add(s.lower())
+    return s
+
+
+def _add_sheet(wb, title, cols, rows, taken):
+    """One table as a worksheet: bold frozen header, then the rows, columns sized
+    to their content so nothing has to be widened before reading or copying."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet(_sheet_name(title, taken))
+    ws.append(list(cols))
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    widths = [len(str(c)) for c in cols]
+    for r in rows:
+        vals = [r.get(c) for c in cols]
+        # dicts and lists have no cell representation; the phase_bytes column is
+        # the one that would otherwise raise here
+        vals = [v if v is None or isinstance(v, (str, int, float)) else str(v)
+                for v in vals]
+        ws.append(vals)
+        for i, v in enumerate(vals):
+            widths[i] = max(widths[i], min(len(str(v)) if v is not None else 0, 60))
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w + 2
+    return ws
+
+
+def _write_workbook(root, inv_rows, file_rows, issues, per_rat=False):
+    """Every table of the scan in one .xlsx, so the results can be opened and
+    copied straight into a spreadsheet without an import step. The CSV/TSV files
+    stay as they are for anything that reads them programmatically."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("openpyxl not installed - skipping drive_scan.xlsx (pip install openpyxl).")
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    xlsx = root / "drive_scan.xlsx"
+    wb = Workbook()
+    wb.remove(wb.active)                       # drop the default empty sheet
+    taken = set()
+    inv_sorted = sorted(inv_rows, key=lambda x: (x["rat"], x["session"]))
+    _add_sheet(wb, "inventory", INV_COLS + ["scanned_at"],
+               [{**r, "scanned_at": ts} for r in inv_sorted], taken)
+    _add_sheet(wb, "issues", ISSUE_COLS, issues, taken)
+    _add_sheet(wb, "files", FILE_COLS, file_rows, taken)
+    if per_rat:
+        by_rat = {}
+        for r in inv_sorted:
+            by_rat.setdefault(r["rat"], []).append(r)
+        for rat, rows in sorted(by_rat.items()):
+            _add_sheet(wb, rat, INV_COLS + ["scanned_at"],
+                       [{**r, "scanned_at": ts} for r in rows], taken)
+    try:
+        wb.save(xlsx)
+    except OSError as e:
+        print(f"Could not write {xlsx} ({e}).")
+        return
+    print(f"Excel workbook: {xlsx}")
+    print(f"  sheets: {', '.join(wb.sheetnames)}")
+
+
 def _write_inventory(root, inv_rows, file_rows, per_rat=False):
     """Readable inventory MD + per-session inventory CSV + full per-file CSV,
     plus a paste-ready TSV of the same per-session table."""
@@ -744,6 +837,7 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
     print(f"Inventory: {root / 'drive_scan_inventory.md'}  (readable file listing)")
     print(f"Issues:    {csv_path}")
     print(f"CSVs:      drive_scan_inventory.csv (per session) / drive_scan_files.csv (every file)")
+    print(f"Excel:     drive_scan.xlsx - every table as a sheet, plus one sheet per animal")
     print("=" * 56)
 
 
@@ -756,8 +850,8 @@ if __name__ == "__main__":
     ap.add_argument("--deep", action="store_true", help="fully decode each video (slow) instead of a header check.")
     ap.add_argument("--workers", type=int, default=8, help="parallel video checks (default 8).")
     ap.add_argument("--ffprobe", default=None, help="path to ffprobe (else FFPROBE_CMD / FFMPEG_CMD sibling / PATH).")
-    ap.add_argument("--paste-per-rat", action="store_true",
-                    help="also write drive_scan_paste/<rat>.tsv, one paste-ready block per animal.")
+    ap.add_argument("--no-per-rat", dest="paste_per_rat", action="store_false",
+                    help="skip the per-animal outputs (one .tsv each + one sheet each in the workbook).")
     args = ap.parse_args()
     try:
         run(args.root, do_videos=args.videos, deep=args.deep, workers=args.workers,
