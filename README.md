@@ -331,11 +331,14 @@ python src/tracker/plot_trials.py --input_folder <ip> --output_folder <op>
 
 Generates a PDF report with trial-level visualizations from the tracker output:
 
-- Reads **`.log` files** from the output folder (produced by the tracker). Extracts rat position events (`The rat position is: (x, y) @ frame`) and trial markers (`Recording Trial N`) via regex.
+- Reads **`*Coordinates_Full*.csv`** from the output (or input) folder — `Rat_X/Y`, `Trial_Num` and `Frame_Index`. Frame indices give the timing, so frames the tracker lost widen the interval instead of silently shortening the trial.
+- Falls back to the **`.log`** when no coordinate CSV is present, extracting rat position events (`The rat position is: (x, y) @ node`) and trial markers (`Recording Trial N`) via regex. This path has no frame-index clock and prints a warning.
 - Optionally reads the `*.txt` node-sequence file from the output folder and `RecordingMeta.xlsx` from the input folder for goal/start node overlays.
 - Reconstructs the hex maze graph from the hardcoded node coordinate file (`src/tools/node_list_new.csv`) using NetworkX, connecting nodes within **65 px** of each other. Manually adds bridge edges (121↔302, 324↔401, 305↔220, 404↔223, 201↔124, 224↔218).
 - Per-trial speed is computed from pixel coordinates at **30 fps** and smoothed at multiple windows (0.4 s, 0.5 s, 1.0 s, 2.0 s, 5.0 s).
+- Repairs camera-stitch artefacts: a step that crosses a tile seam, exceeds `--max-speed` (0.6 m/s) *and* is over `--jump-ratio` times the local speed is interpolated away. Disable with `--no-seam-repair`.
 - Outputs a multi-page PDF with per-trial trajectory plots (coloured by speed), aggregate speed distributions, occupancy heatmaps, and path-scoring statistics.
+- The PDF is named after the **session** (`<YYYYMMDD>_Rat<N>_analysis_final.pdf`) whichever input was read, so a rerun overwrites it in place instead of leaving two differently-named copies behind.
 
 ---
 

@@ -453,7 +453,8 @@ def scan_session(sess, issues, inv_rows, file_rows):
     return has_ephys, mp4s
 
 
-def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cmd=None):
+def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cmd=None,
+        paste_per_rat=False):
     root = Path(root)
     sessions = find_sessions(root)
     if rat_filter:
@@ -498,7 +499,7 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
                                            path=str(p), detail=reason))
         issues += bad_videos
 
-    _write_inventory(root, inv_rows, file_rows)
+    _write_inventory(root, inv_rows, file_rows, per_rat=paste_per_rat)
     _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos, inv_rows)
 
 
@@ -568,15 +569,78 @@ def _write_inventory_md(root, inv_rows, file_rows):
     return md_path
 
 
-def _write_inventory(root, inv_rows, file_rows):
-    """Readable inventory MD + per-session inventory CSV + full per-file CSV."""
+INV_COLS = ["rat", "session", "has_ephys", "phases", "n_video", "n_meta",
+            "n_rec", "n_merged", "n_logger", "video_gb", "ephys_gb", "rec_folders"]
+
+
+def _cell(v):
+    """One spreadsheet cell: tabs and newlines inside a value would shift every
+    following column, so flatten them."""
+    return " ".join(str("" if v is None else v).split())
+
+
+def _tsv_lines(rows, ts):
+    """Header + one line per session, tab separated."""
+    out = ["\t".join(INV_COLS + ["scanned_at"])]
+    for r in sorted(rows, key=lambda x: (x["rat"], x["session"])):
+        out.append("\t".join([_cell(r.get(c)) for c in INV_COLS] + [ts]))
+    return out
+
+
+def _write_inventory_tsv(root, inv_rows, per_rat=False):
+    """Tab-separated copy of the inventory, for pasting straight into a spreadsheet.
+
+    Tabs, not commas: pasting CSV into Google Sheets drops the whole row into one
+    cell, while TSV splits into columns on its own with no import dialog. Open the
+    file, select all, copy, paste.
+
+    With per_rat, also writes one file per animal under drive_scan_paste/ so each
+    rat can be pasted into its own sheet or tab without picking rows out of the
+    combined table.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tsv_path = root / "drive_scan_inventory.tsv"
+    try:
+        tsv_path.write_text("\n".join(_tsv_lines(inv_rows, ts)) + "\n", encoding="utf-8")
+        print(f"Paste-ready inventory: {tsv_path}  ({len(inv_rows)} rows)")
+        print("  Open it, select all, copy, paste into the sheet - it splits into columns.")
+    except OSError as e:
+        print(f"Could not write {tsv_path} ({e}).")
+
+    if not per_rat:
+        return
+    by_rat = {}
+    for r in inv_rows:
+        by_rat.setdefault(r["rat"], []).append(r)
+    out_dir = root / "drive_scan_paste"
+    try:
+        out_dir.mkdir(exist_ok=True)
+    except OSError as e:
+        print(f"Could not create {out_dir} ({e}).")
+        return
+    written = 0
+    for rat, rows in sorted(by_rat.items()):
+        # rat folder names come from the drive, so keep them filename-safe
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", rat) or "unknown"
+        p = out_dir / f"{safe}.tsv"
+        try:
+            p.write_text("\n".join(_tsv_lines(rows, ts)) + "\n", encoding="utf-8")
+            written += 1
+        except OSError as e:
+            print(f"Could not write {p} ({e}).")
+    print(f"Per-rat paste files: {out_dir}{os.sep}<rat>.tsv  "
+          f"({written} animal(s), one file each)")
+
+
+def _write_inventory(root, inv_rows, file_rows, per_rat=False):
+    """Readable inventory MD + per-session inventory CSV + full per-file CSV,
+    plus a paste-ready TSV of the same per-session table."""
     _write_inventory_md(root, inv_rows, file_rows)
+    _write_inventory_tsv(root, inv_rows, per_rat=per_rat)
     inv_path = root / "drive_scan_inventory.csv"
     try:
         with open(inv_path, "w", newline="", encoding="utf-8") as f:
-            cols = ["rat", "session", "has_ephys", "phases", "n_video", "n_meta",
-                    "n_rec", "n_merged", "n_logger", "video_gb", "ephys_gb", "rec_folders"]
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=INV_COLS, extrasaction="ignore")
             w.writeheader()
             for r in sorted(inv_rows, key=lambda x: (x["rat"], x["session"])):
                 w.writerow(r)
@@ -692,10 +756,13 @@ if __name__ == "__main__":
     ap.add_argument("--deep", action="store_true", help="fully decode each video (slow) instead of a header check.")
     ap.add_argument("--workers", type=int, default=8, help="parallel video checks (default 8).")
     ap.add_argument("--ffprobe", default=None, help="path to ffprobe (else FFPROBE_CMD / FFMPEG_CMD sibling / PATH).")
+    ap.add_argument("--paste-per-rat", action="store_true",
+                    help="also write drive_scan_paste/<rat>.tsv, one paste-ready block per animal.")
     args = ap.parse_args()
     try:
         run(args.root, do_videos=args.videos, deep=args.deep, workers=args.workers,
-            rat_filter=args.rat, ffprobe_cmd=args.ffprobe)
+            rat_filter=args.rat, ffprobe_cmd=args.ffprobe,
+            paste_per_rat=args.paste_per_rat)
     except Exception as e:
         import traceback
         print(f"[scan-drive] Failed: {e}")

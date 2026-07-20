@@ -144,6 +144,27 @@ def build_df_from_coords(work_dir, input_dir):
 
 
 
+_SESSION_RE = re.compile(r"(\d{8})_(Rat\s*_?\d+)", re.I)
+
+
+def session_stem(name: str) -> str:
+    """Session prefix (<YYYYMMDD>_Rat<N>) to name outputs after.
+
+    The PDF used to be named after whichever input happened to be read, so one
+    session produced either <date>_Rat<n>_Coordinates_Full_with_frames_analysis_
+    final.pdf or log_<date>_Rat<n>_analysis_final.pdf depending on which path ran,
+    and a rerun that switched paths left both behind. Anchoring the name to the
+    session keeps it stable and lets a rerun overwrite in place.
+    """
+    m = _SESSION_RE.search(name)
+    if m:
+        return f"{m.group(1)}_{m.group(2).replace(' ', '').replace('_', '')}"
+    # no recognisable session prefix — strip the bits that name the SOURCE file
+    s = re.sub(r"^log[_-]", "", name, flags=re.I)
+    s = re.sub(r"_Coordinates_Full(_with_frames)?$", "", s, flags=re.I)
+    return s or name
+
+
 def parse_video_to_seconds(ts_str):
     """Parses HH:MM:SS.mmm strings into total seconds."""
     if not ts_str:
@@ -470,7 +491,13 @@ if __name__ == "__main__":
         log_paths = sorted(glob.glob(LOG_GLOB, recursive=True))
         if not log_paths:
             sys.exit(f"No Coordinates_Full CSV or .log files found in {work_dir}")
-        print(f"Found {len(log_paths)} log files in {work_dir}")
+        # The PDF is named after the session either way now, so the filename no
+        # longer says which path ran — make the console say it instead. Reaching
+        # here means step 4 left no Coordinates_Full CSV for this session, and the
+        # legacy .log parse has no frame-index clock.
+        print(f"[WARNING] No Coordinates_Full CSV found - falling back to the .log "
+              f"({len(log_paths)} file(s) in {work_dir}).")
+        print("          Trial timing comes from the log's own seconds, not frame indices.")
         log_file_stem = Path(log_paths[0]).stem
 
     # --- 1b. Find and Parse Node Sequence Text File ---
@@ -716,7 +743,18 @@ if __name__ == "__main__":
     else:
         print(f"Warning: {node_file_path} not found. Nodes and Paths will not be plotted.")
 
-    pdf_path = work_dir / f"{log_file_stem}_analysis_final.pdf"
+    pdf_path = work_dir / f"{session_stem(log_file_stem)}_analysis_final.pdf"
+    # Runs before the session-based naming produced <source>_analysis_final.pdf.
+    # Those are not overwritten, and preprocess_check globs *_analysis_final.pdf,
+    # so it would count a stale one as this step's output. Flag, never delete.
+    stale = [p for p in sorted(work_dir.glob("*_analysis_final.pdf"))
+             if p.name != pdf_path.name]
+    if stale:
+        print(f"[WARNING] {len(stale)} PDF(s) from the old naming are still here and "
+              f"will NOT be overwritten:")
+        for p in stale:
+            print(f"            {p.name}")
+        print("          Delete them so only the current report remains.")
     print(f"Generating PDF: {pdf_path}")
 
     agg_data = {'0.5s': [], '1.0s': [], '2.0s': [], '5.0s': []}

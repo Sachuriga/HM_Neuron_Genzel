@@ -106,7 +106,7 @@ You can run the tracking using a GPU on a computer that has installed the tracke
   - Date_Rat_framewise_ts.csv
   - Collected_frames.mp4
   - Log_ Date_Rat.log
-  - Log_ Date_Rat_analysis_final.pdf
+  - Date_Rat_analysis_final.pdf
   - RecordingMeta.xlsx
   - Stitched _framewise_seconds.csv: only present in ephys animals
 
@@ -121,7 +121,7 @@ You can run the tracking using a GPU on a computer that has installed the tracke
 
 ## Validating the output files (Maze only)
 
-- Compare the Log_ Date_Rat_analysis_final.pdf vs the metafile to make sure that:
+- Compare the Date_Rat_analysis_final.pdf vs the metafile to make sure that:
   - The number of trials aligns
   - All trials are correctly labelled as **did not reach** or **did reach**
     - Note: sometimes when a trial is labelled as did not reach, the rat still reaches the end due to guiding, this is not an issue, you can continue.
