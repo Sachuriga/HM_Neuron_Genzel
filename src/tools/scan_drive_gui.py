@@ -597,6 +597,8 @@ def video_scatter_rows(videos: list[dict], implanted_rats=None) -> list[dict]:
     for v in videos:
         if not v.get("rat_no") or v["rat_no"] in implanted_rats:
             continue
+        if v.get("is_filed"):        # already under Rat/date — not lost, don't list it
+            continue
         vol = str(Path(v["path"]).drive or Path(v["path"]).anchor).upper()
         out.append(dict(kind="video", rat=v.get("rat") or "?", date8=v.get("date8") or "?",
                         day=v.get("day", ""), session=v.get("session", ""),
@@ -649,9 +651,12 @@ class SearchWorker(QObject):
             have_video = {k for k, hits in found.items()
                           if any(h.get("n_video", 0) for h in hits)}
             vols = [str(v) for v in sd.list_drive_roots(include_system=self.include_system)]
+            # include_filed=True: already-sorted camera folders are not re-filed,
+            # but assign_videos needs them to hold their slot in the by-time
+            # ordering so a still-loose folder gets the right session number.
             loose = fvid.find_loose_camera_folders(
                 vols, max_depth=self.depth, on_dir=self._tick,
-                should_stop=lambda: self._stop)
+                should_stop=lambda: self._stop, include_filed=True)
             videos = fvid.assign_videos(loose, self.roster, have_video)
 
             self.raw_index.emit({"sessions": found, "videos": videos})

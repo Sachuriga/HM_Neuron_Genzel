@@ -84,24 +84,39 @@ def classify_video(v: dict) -> str:
     return IMPLANT if v["avg_mb"] >= IMPLANT_MB else NON_IMPLANT
 
 
+def _filed_rat_date(p) -> tuple:
+    """The (rat_no, date8) a path is currently filed under, or (None, None) if it
+    is loose. Read from the ``Rat<N>/<YYYYMMDD>/`` segment of the path itself —
+    where the folder *currently* sits, which the re-sort compares against where it
+    *should* sit."""
+    parts = Path(p).parts
+    for i, seg in enumerate(parts):
+        if _DATE_RE.match(seg) and i >= 1:
+            rn = sd._rat_of(parts[i - 1])
+            if rn is not None:
+                return rn, seg
+    return None, None
+
+
 def _is_filed(p: Path) -> bool:
     """True if p already sits under a ``Rat<N>/<YYYYMMDD>/`` path — i.e. it has
     been sorted to a rat and is not loose."""
-    parts = p.parts
-    for i, seg in enumerate(parts):
-        if _DATE_RE.match(seg) and i >= 1 and sd._rat_of(parts[i - 1]) is not None:
-            return True
-    return False
+    return _filed_rat_date(p)[0] is not None
 
 
-def find_loose_camera_folders(roots, max_depth: int = 6,
-                              on_dir=None, should_stop=None) -> list[dict]:
-    """Camera-video folders under `roots` that are NOT already filed to a rat.
+def find_loose_camera_folders(roots, max_depth: int = 6, on_dir=None,
+                              should_stop=None, include_filed: bool = False) -> list[dict]:
+    """Camera-video folders under `roots`, each tagged with ``is_filed``.
 
     Walks each root to `max_depth`, skipping the system/junk folders scan_drive
     already knows to avoid. A directory counts as a camera folder when it holds
-    at least one ``eye<NN>_*.mp4``; filed ones (already under Rat<N>/<date>) are
-    left out, since those are exactly the videos that are not lost."""
+    at least one ``eye<NN>_*.mp4``.
+
+    By default only *loose* folders are returned (not already under
+    ``Rat<N>/<date>/``) — those are the lost ones. Pass ``include_filed=True`` to
+    also return the already-filed folders: assign_videos needs them so a loose
+    folder gets the right session number when an earlier session that day is
+    already sorted (the filed one holds its slot in the by-time ordering)."""
     out = []
     seen = set()
     for root in roots:
@@ -123,9 +138,11 @@ def find_loose_camera_folders(roots, max_depth: int = 6,
             except OSError:
                 continue
             info = scan_camera_folder(d)
-            if info and not _is_filed(d):
-                if info["path"] not in seen:
+            if info:
+                filed = _is_filed(d)
+                if (include_filed or not filed) and info["path"] not in seen:
                     seen.add(info["path"])
+                    info["is_filed"] = filed
                     info["kind"] = classify_video(info)
                     out.append(info)
                 continue                     # a camera folder has no camera subfolders
@@ -139,42 +156,44 @@ def find_loose_camera_folders(roots, max_depth: int = 6,
 
 def assign_videos(loose: list[dict], roster: list[dict],
                   have_video=None) -> list[dict]:
-    """Attach each real loose camera folder to a rat + date from the rig rules.
+    """Attach each loose camera folder to a rat + session from the sheet.
 
-    Within one date, the videos of a given type (implanted vs not) are ordered by
-    start time and matched to that type's rats in the sheet's *training order* —
-    the row order the animals appear in the Raw sheet that day, carried on each
-    roster entry as ``train_order``. So the earliest recording goes to the rat
-    trained first, and so on. (Roster entries without ``train_order`` fall back to
-    ascending rat id, the historical behaviour.) Aborted folders are returned but
-    never assigned.
+    Matching is by date then time, using the sheet's *training order*. For one
+    date, every camera folder is ordered by start time and zipped 1:1 onto that
+    date's ``(rat, session)`` slots taken in ``train_order`` — the Raw-sheet row
+    order, which the experimenter confirms equals the recording order that day. So
+    the n-th recording of a day goes to the n-th session in the sheet; a rat with
+    several sessions in a day therefore gets several folders, one per session.
 
-    `have_video`, if given, is the set of (rat_no, date8) that already have video
-    on disk (from the coverage scan). It lets each row say whether the video fills
-    a genuine gap or merely duplicates video the session already has — so acting
-    on the finds never overwrites good data with a stray copy."""
-    have_video = have_video or set()
-    # Rats that ran on each (date, implanted-or-not), in training order — deduped,
-    # first appearance wins. Scoped per date so a date only draws on the animals
-    # actually run that day, not one global list reused for every date.
-    date_rats: dict = defaultdict(list)
-    seen_rat: set = set()
-    for e in sorted(roster, key=lambda x: x.get("train_order", x["rat_no"])):
-        if not e["date8"]:
-            continue
-        key = (e["date8"], e["implanted"])
-        if (key, e["rat_no"]) in seen_rat:
-            continue
-        seen_rat.add((key, e["rat_no"]))
-        date_rats[key].append(e["rat_no"])
-    roster_by = {(e["rat_no"], e["date8"]): e for e in roster if e["date8"]}
+    Implant status is NOT inferred from file size (a non-implant session can still
+    run 40+ minutes); it comes from the sheet's Implant column, carried on the
+    roster. The only size test kept is the tiny ``ABORTED`` one that drops a
+    few-MB false start so it never consumes a session slot.
+
+    `loose` may include already-filed folders (tagged ``is_filed``, from
+    ``find_loose_camera_folders(include_filed=True)``). No folder is trusted as
+    correctly placed — an earlier sort may have filed them to the wrong rat, so
+    *every* folder is re-derived from the by-time / training-order rule. A filed
+    folder already under its re-derived ``Rat<N>/<date>`` is reported "already
+    correctly filed"; one under a different rat/date is flagged ``refile`` so it
+    can be re-sorted.
+
+    `have_video` is accepted for signature compatibility; positional slotting
+    already keeps a loose folder from colliding with another, and the organizer's
+    own destination checks prevent any overwrite."""
+    # Every (rat, session) slot per date, in training order — NOT deduped, so a
+    # rat with several sessions in a day gets one slot per session. Fall back to
+    # rat id / session for any roster lacking train_order.
+    date_slots: dict = defaultdict(list)
+    for e in sorted(roster, key=lambda x: (x.get("train_order", x["rat_no"]),
+                                           x["rat_no"], x.get("session", 0))):
+        if e["date8"]:
+            date_slots[e["date8"]].append(e)
 
     # Only videos dated within this experiment's window are ours to assign. The
-    # drives also hold earlier batches (Rat1/Rat2 from 2020) whose loose folders
-    # would otherwise be zipped onto this batch's rats by date — a 2020 clip
-    # landing under Rat5. Pad a year each way so a session just outside the logged
-    # span still counts; a stray sheet date can only widen this, never hide a real
-    # video. Out-of-window folders are returned, clearly, but never assigned.
+    # drives also hold earlier batches whose loose folders would otherwise be
+    # zipped onto this batch's rats by date. Pad a year each way; out-of-window
+    # folders are returned, clearly, but never assigned.
     dates = sorted(e["date8"] for e in roster if e["date8"])
     if dates:
         lo = str(int(dates[0][:4]) - 1) + dates[0][4:]
@@ -183,37 +202,59 @@ def assign_videos(loose: list[dict], roster: list[dict],
         lo = hi = ""
 
     rows = []
-    groups: dict = defaultdict(list)
+    groups: dict = defaultdict(list)          # date8 -> [folder, ...] (loose + filed)
     for v in loose:
         if v["kind"] == ABORTED:
-            rows.append(dict(v, rat=None, rat_no=None, day="", session="",
-                             fills_missing=False, status="aborted false-start (skip)"))
+            if not v.get("is_filed"):
+                rows.append(dict(v, rat=None, rat_no=None, day="", session="", refile=False,
+                                 fills_missing=False, status="aborted false-start (skip)"))
             continue
         if lo and not (lo <= (v["date8"] or "") <= hi):
-            rows.append(dict(v, rat=None, rat_no=None, day="", session="",
-                             fills_missing=False,
-                             status="outside this experiment's dates — different batch"))
+            if not v.get("is_filed"):
+                rows.append(dict(v, rat=None, rat_no=None, day="", session="", refile=False,
+                                 fills_missing=False,
+                                 status="outside this experiment's dates — different batch"))
             continue
-        groups[(v["date8"], v["kind"])].append(v)
+        groups[v["date8"]].append(v)
 
-    for (date8, kind), vids in sorted(groups.items()):
-        vids.sort(key=lambda x: x["start"] or "")
-        rats = date_rats.get((date8, kind == IMPLANT), [])
+    # Re-sort EVERY date's folders (loose + filed) by start time and re-derive each
+    # one's (rat, session) from the training-order slots — the earlier filing is
+    # not trusted. A date is only reported if it has something to act on (a loose
+    # folder to file, a misfiled folder to move, or an extra); a date whose videos
+    # are all already correctly filed produces no rows.
+    for date8 in sorted(groups):
+        vids = sorted(groups[date8], key=lambda x: x["start"] or "")
+        slots = date_slots.get(date8, [])
+        date_rows = []
+        actionable = False
         for i, v in enumerate(vids):
-            rat_no = rats[i] if i < len(rats) else None
-            e = roster_by.get((rat_no, date8)) if rat_no else None
-            fills = False
-            if rat_no is None:
-                status = "extra recording — more videos than rats this date"
-            elif e is None:
-                status = "no roster session for this rat/date"
-            elif (rat_no, date8) in have_video:
-                status = "session already has video (possible duplicate)"
+            e = slots[i] if i < len(slots) else None
+            rat_no = e["rat_no"] if e else None
+            day = e["day"] if e else ""
+            session = e["session"] if e else ""
+            refile = False
+            if e is None:
+                fills = False
+                status = "extra recording — more folders than sessions this date"
+                actionable = True
+            elif v.get("is_filed"):
+                fills = False
+                cur_rat, cur_date = _filed_rat_date(v["path"])
+                if cur_rat == rat_no and cur_date == date8:
+                    status = "already correctly filed"
+                else:
+                    refile = True
+                    actionable = True
+                    status = (f"misfiled under Rat{cur_rat}/{cur_date} — belongs to "
+                              f"Rat{rat_no}/{date8} s{session}")
             else:
-                status = "fills a session with no video"
                 fills = True
-            rows.append(dict(v, rat=f"Rat{rat_no}" if rat_no else None, rat_no=rat_no,
-                             day=e["day"] if e else "", session=e["session"] if e else "",
-                             fills_missing=fills, status=status))
+                actionable = True
+                status = "fills a session with no video"
+            date_rows.append(dict(v, rat=f"Rat{rat_no}" if rat_no else None, rat_no=rat_no,
+                                  day=day, session=session, refile=refile,
+                                  fills_missing=fills, status=status))
+        if actionable:
+            rows.extend(date_rows)
     rows.sort(key=lambda r: (r["date8"] or "", r["start"] or ""))
     return rows

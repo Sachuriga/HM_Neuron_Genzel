@@ -365,20 +365,21 @@ def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
     roster_by = {(e["rat_no"], e["date8"]): e for e in roster if e["date8"]}
     for v in videos:
         rat_no, date8 = v.get("rat_no"), v.get("date8")
-        # Only file a video when it FILLS a roster session that currently has no
-        # video — the high-confidence case (the rat is expected that day and the
-        # session is empty). Everything else is shown but never moved: an aborted
-        # start, a folder from another batch, an in-window date no rat actually
-        # ran (a stray folder wrongly zipped onto a rat), or video the session
-        # already has. That keeps the rig rules from mis-filing look-alike folders.
-        if in_archive(v["path"]):
+        refile = v.get("refile")
+        # File a video when it FILLS an empty roster session (the high-confidence
+        # case), or when it is `refile` — already sorted, but to the WRONG rat, so
+        # it must be moved to the correct one (this is the deliberate exception to
+        # "leave archived data alone"). Everything else is shown but never moved:
+        # an aborted start, a folder from another batch, an in-window date no rat
+        # ran, or video the session already has.
+        if in_archive(v["path"]) and not refile:
             plan.append(dict(rat=v.get("rat") or "?", rat_no=rat_no, date8=date8 or "?",
                              day="", session="", repeat=None,
                              entry=Path(v["path"]).name, src=v["path"], dst="",
                              action=SKIP_ARCHIVED, n_files=0, bytes=v.get("total", 0),
                              reason="already under an HM_neuron archive — left in place"))
             continue
-        if not v.get("fills_missing") or rat_no is None or not date8:
+        if not (v.get("fills_missing") or refile) or rat_no is None or not date8:
             plan.append(dict(rat=v.get("rat") or "?", rat_no=rat_no, date8=date8 or "?",
                              day="", session="", repeat=None,
                              entry=Path(v["path"]).name, src=v["path"], dst="",
@@ -389,8 +390,11 @@ def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
         rdir = rat_dir.get(rat_no, f"Rat{rat_no}")
         src = Path(v["path"])
         dst = dest_root / rdir / date8 / src.name
+        # Prefer the per-folder day/session assign_videos resolved (correct even
+        # when a rat has several sessions in a day); fall back to the roster entry.
         base = dict(rat=v.get("rat") or f"Rat{rat_no}", rat_no=rat_no, date8=date8,
-                    day=e["day"] if e else "", session=e["session"] if e else "",
+                    day=v.get("day") or (e["day"] if e else ""),
+                    session=v.get("session") if v.get("session") != "" else (e["session"] if e else ""),
                     repeat=e["repeat"] if e else None, entry=src.name, dst=str(dst))
         sig = entry_signature(src)
         if sig is None:
@@ -408,10 +412,15 @@ def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
                              else "a different folder of this name is already there"))
             continue
         same_vol = volume_of(src) == dest_vol
+        if refile:
+            reason = ("re-file MISFILED video → correct rat (rename, same drive)"
+                      if same_vol else
+                      "re-file MISFILED video → correct rat (copy; wrong-place original kept)")
+        else:
+            reason = ("file unfiled video → session (rename, same drive)"
+                      if same_vol else "file unfiled video → session")
         plan.append(dict(base, src=str(src), action=MOVE if same_vol else COPY,
-                         n_files=sig[0], bytes=sig[1], is_video=True,
-                         reason=("file unfiled video → session (rename, same drive)"
-                                 if same_vol else "file unfiled video → session")))
+                         n_files=sig[0], bytes=sig[1], is_video=True, reason=reason))
 
 
 def _prefer(cands: list[tuple[Path, tuple, dict]], dest_vol: str):

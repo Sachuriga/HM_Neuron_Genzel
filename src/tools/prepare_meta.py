@@ -25,8 +25,18 @@ from __future__ import annotations
 import re
 import datetime
 from pathlib import Path
+from collections import defaultdict
 
 import pandas as pd
+
+# A camera folder's start, from its timestamp name (2019-05-27_11-51-08) as a
+# sortable YYYYMMDDHHMMSS key; falls back to the name so ordering stays stable.
+_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})")
+
+
+def _folder_start(folder_str: str) -> str:
+    m = _TS_RE.search(Path(folder_str).name)
+    return "".join(m.groups()) if m else Path(folder_str).name
 
 # The tracker's expected column order (from examples/RecordingMeta.xlsx).
 META_COLS = ["Rat_ID", "Date", "Repeat", "Day", "Session", "Goal_Node",
@@ -171,29 +181,48 @@ NO_TRIALS = "no-trials"    # no behavioural trials in the sheet for this session
 
 
 def plan_meta(roster: list[dict], found: dict, raw: pd.DataFrame) -> list[dict]:
-    """Work out, for every roster session, where a RecordingMeta.xlsx would be
-    written. Reads only; writes nothing. One row per (session, target folder)."""
+    """Work out where each session's RecordingMeta.xlsx would be written. Reads
+    only; writes nothing. One row per session (mapped to its own video folder).
+
+    A rat can run several sessions in a day, each its own timestamp camera folder.
+    Those folders are matched to sessions by time: within one (rat, date) the
+    folders are ordered by start time and zipped onto that rat's sessions taken in
+    training order, so session N's meta lands in session N's folder — not smeared
+    across every folder of the day. Run this after organizing, when each folder is
+    filed under its correct ``Rat<N>/<date>``."""
     prev_goals = session_prev_goals(raw)
+    by_rd: dict = defaultdict(list)
+    for e in roster:
+        if e["date8"]:
+            by_rd[(e["rat_no"], e["date8"])].append(e)
+
     plan = []
-    for e in sorted(roster, key=lambda x: (x["rat_no"], x["day"], x["session"])):
-        if not e["date8"]:
-            continue
-        df = build_meta_df(raw, e["rat_no"], e["day"], e["session"],
-                           prev_goals.get((e["rat_no"], e["day"], e["session"])))
-        base = dict(rat=e["rat"], rat_no=e["rat_no"], date8=e["date8"],
-                    day=e["day"], session=e["session"], repeat=e.get("repeat"),
-                    n_trials=0 if df is None else len(df))
-        if df is None:
-            plan.append(dict(base, action=NO_TRIALS, folder="", detail="no trials in sheet"))
-            continue
+    for (rat_no, date8), sessions in sorted(by_rd.items()):
+        # Sessions in training order (= recording order that day); folders in time
+        # order. Zip position i to position i.
+        sessions = sorted(sessions, key=lambda x: (x.get("train_order", x["session"]),
+                                                   x["session"]))
         folders = []
-        for _label, sess in _iter_session_paths(found, e["rat_no"], e["date8"]):
+        for _label, sess in _iter_session_paths(found, rat_no, date8):
             folders += find_video_folders(sess)
-        folders = sorted({str(f) for f in folders})
-        if not folders:
-            plan.append(dict(base, action=NO_VIDEO, folder="", detail="no video folder found"))
-            continue
-        for f in folders:
+        folders = sorted({str(f) for f in folders}, key=_folder_start)
+
+        for i, e in enumerate(sessions):
+            df = build_meta_df(raw, e["rat_no"], e["day"], e["session"],
+                               prev_goals.get((e["rat_no"], e["day"], e["session"])))
+            base = dict(rat=e["rat"], rat_no=e["rat_no"], date8=e["date8"],
+                        day=e["day"], session=e["session"], repeat=e.get("repeat"),
+                        n_trials=0 if df is None else len(df))
+            if df is None:
+                plan.append(dict(base, action=NO_TRIALS, folder="", detail="no trials in sheet"))
+                continue
+            # i keeps session<->folder aligned even when a no-trials session is
+            # skipped above; a session past the last folder simply has no video.
+            if i >= len(folders):
+                plan.append(dict(base, action=NO_VIDEO, folder="",
+                                 detail="no video folder for this session"))
+                continue
+            f = folders[i]
             exists = (Path(f) / _META_NAME).exists()
             plan.append(dict(base, action=EXISTS if exists else WRITE, folder=f,
                              df=df, detail="already present" if exists
