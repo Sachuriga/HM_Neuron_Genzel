@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scan_drive as sd  # noqa: E402
 import organize_data as od  # noqa: E402
+import reset_videos as rv  # noqa: E402
 import find_videos as fvid  # noqa: E402
 import summarize as smz  # noqa: E402
 import prepare_meta as pmeta  # noqa: E402
@@ -1107,6 +1108,214 @@ class OrganizeDialog(QDialog):
         QMessageBox.critical(self, "Organize failed", msg)
 
 
+# ------------------------------------------------------------------
+#         reset: un-file every camera folder back to per-drive raw/
+# ------------------------------------------------------------------
+_RESET_COLOR = {
+    rv.MOVE:        QColor(214, 234, 250),   # rename into raw/ (same drive)
+    rv.SKIP_IN_RAW: QColor(238, 238, 238),   # already in raw — nothing to do
+    rv.DUPLICATE:   QColor(255, 244, 205),   # identical copy already in raw — left
+    rv.CONFLICT:    QColor(250, 214, 214),   # name clash, different content — skipped
+}
+_RESET_COLS = ["action", "folder", "source", "raw destination", "reason"]
+
+
+class ResetScanWorker(QObject):
+    """Sweep the drives for every camera folder and build the reset plan. Reads
+    only; writes nothing."""
+    progress = pyqtSignal(str)
+    done = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, roots, depth):
+        super().__init__()
+        self.roots, self.depth = roots, depth
+        self._stop = False
+        self._n = 0
+
+    def stop(self):
+        self._stop = True
+
+    def _tick(self, d):
+        self._n += 1
+        if self._n % 400 == 0:
+            self.progress.emit(str(d))
+
+    def run(self):
+        try:
+            self.done.emit(rv.scan_and_plan(self.roots, depth=self.depth,
+                                            on_dir=self._tick,
+                                            should_stop=lambda: self._stop))
+        except Exception as exc:  # pragma: no cover
+            self.failed.emit(str(exc))
+
+
+class ResetRunWorker(QObject):
+    """Execute a reset plan (the same-drive moves) off the GUI thread."""
+    progress = pyqtSignal(int, int, str)
+    done = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = plan
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            self.done.emit(rv.execute_reset(
+                self.plan, on_progress=lambda i, n, s: self.progress.emit(i, n, s),
+                should_stop=lambda: self._stop))
+        except Exception as exc:  # pragma: no cover
+            self.failed.emit(str(exc))
+
+
+class ResetDialog(QDialog):
+    """Review the reset plan, then run it. Nothing moves until the plan on screen
+    is confirmed."""
+
+    def __init__(self, plan: list[dict], parent=None):
+        super().__init__(parent)
+        self.plan = plan
+        self.run_thread = None
+        self.run_worker = None
+        self.setWindowTitle("Reset videos → raw")
+        self.resize(1150, 650)
+        v = QVBoxLayout(self)
+
+        t = rv.totals(plan)
+        self.totals = t
+        v.addWidget(QLabel(
+            f"<b>{t[rv.MOVE]}</b> folder(s) move to per-drive <b>raw\\</b> (same-drive rename) "
+            f"&nbsp;·&nbsp; already in raw: {t[rv.SKIP_IN_RAW]} &nbsp;·&nbsp; "
+            f"identical duplicates left alone: {t[rv.DUPLICATE]} &nbsp;·&nbsp; "
+            f"<b>name conflicts: {t[rv.CONFLICT]}</b>"))
+
+        self.table = QTableWidget(len(plan), len(_RESET_COLS))
+        self.table.setHorizontalHeaderLabels(_RESET_COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        for i, p in enumerate(plan):
+            vals = [p["action"], p["name"], p["src"], p.get("dst") or "", p["reason"]]
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(str(val))
+                _paint(it, _RESET_COLOR.get(p["action"], Qt.GlobalColor.white))
+                self.table.setItem(i, c, it)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(_RESET_COLS.index("source"), QHeaderView.ResizeMode.Stretch)
+        v.addWidget(self.table, 1)
+
+        v.addWidget(QLabel(
+            "blue = moved into raw\\ by rename (same drive, instant) · grey = already in "
+            "raw · yellow = identical copy already in raw, left in place · red = a different "
+            "folder of that name is already in raw, skipped for you to resolve. "
+            "Emptied Rat/date folders are removed only while genuinely empty."))
+
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+        v.addWidget(self.bar)
+        self.run_lbl = QLabel("")
+        v.addWidget(self.run_lbl)
+
+        row = QHBoxLayout()
+        exp = QPushButton("Export plan CSV…")
+        exp.clicked.connect(self._export)
+        row.addWidget(exp)
+        row.addStretch(1)
+        self.run_btn = QPushButton(f"Run — move {t[rv.MOVE]}")
+        self.run_btn.clicked.connect(self._run)
+        self.run_btn.setEnabled(bool(t[rv.MOVE]))
+        row.addWidget(self.run_btn)
+        self.cancel_btn = QPushButton("Stop")
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.cancel_btn.setVisible(False)
+        row.addWidget(self.cancel_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        row.addWidget(self.close_btn)
+        v.addLayout(row)
+
+    def _export(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Export reset plan",
+                                           str(Path.home() / "reset_plan.xlsx"),
+                                           "Excel (*.xlsx)")
+        if not f:
+            return
+        cols = ["action", "name", "src", "dst", "reason"]
+        rows = [{c: p.get(c, "") for c in cols} for p in self.plan]
+        ok, msg = sd.write_xlsx(_xlsx(f), [("reset_plan", cols, rows)])
+        self.run_lbl.setText(f"Plan exported → {msg}" if ok else "")
+        if not ok:
+            QMessageBox.critical(self, "Export failed", msg)
+
+    def _run(self):
+        t = self.totals
+        warn = ""
+        if t[rv.CONFLICT]:
+            warn = (f"\n\n{t[rv.CONFLICT]} name conflict(s) will be SKIPPED (never "
+                    f"overwritten). Resolve those by hand.")
+        if QMessageBox.question(
+                self, "Run reset?",
+                f"MOVE {t[rv.MOVE]} camera folder(s) into their drive's raw\\ folder "
+                f"by rename.\n\n"
+                f"This undoes the Rat/date filing: the folders leave their current "
+                f"location (originals do not stay). Same-drive renames are instant and "
+                f"nothing is overwritten; emptied Rat/date folders are removed only "
+                f"while empty.{warn}\n\nProceed?"
+                ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self.run_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.cancel_btn.setVisible(True)
+        self.bar.setVisible(True)
+        self.bar.setRange(0, max(1, len(self.plan)))
+
+        self.run_thread = QThread()
+        self.run_worker = ResetRunWorker(self.plan)
+        self.run_worker.moveToThread(self.run_thread)
+        self.run_thread.started.connect(self.run_worker.run)
+        self.run_worker.progress.connect(self._progress)
+        self.run_worker.done.connect(self._done)
+        self.run_worker.failed.connect(self._failed)
+        self.run_worker.done.connect(self.run_thread.quit)
+        self.run_worker.failed.connect(self.run_thread.quit)
+        self.run_thread.start()
+
+    def _progress(self, i, n, name):
+        self.bar.setValue(i)
+        self.run_lbl.setText(f"{i}/{n} — {name}")
+
+    def _cancel(self):
+        if self.run_worker:
+            self.run_worker.stop()
+            self.run_lbl.setText("Stopping after the current folder…")
+
+    def _done(self, results: list):
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setEnabled(True)
+        self.bar.setValue(self.bar.maximum())
+        moved = sum(1 for r in results if r.get("result") == "moved")
+        errs = [r for r in results if r.get("result") == "error"]
+        skip = sum(1 for r in results if r.get("result") == "skipped")
+        self.run_lbl.setText(f"Done — {moved} moved, {len(errs)} error, {skip} skipped.")
+        detail = "\n".join(f"{r['name']}: {r.get('reason','')}" for r in errs[:12])
+        QMessageBox.information(
+            self, "Reset finished",
+            f"{moved} folder(s) moved into raw\\.\n{len(errs)} error(s), {skip} skipped."
+            + (f"\n\nErrors:\n{detail}" if detail else ""))
+
+    def _failed(self, msg: str):
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setEnabled(True)
+        QMessageBox.critical(self, "Reset failed", msg)
+
+
 _META_COLS = ["Action", "Rat", "Date", "d/s", "trials", "Folder", "Note"]
 _META_COLOR = {
     pmeta.WRITE:     QColor(210, 244, 214),   # will create a new file
@@ -1448,6 +1657,14 @@ class ScanDriveGUI(QMainWindow):
         self.organize_btn.setEnabled(False)
         act.addWidget(self.organize_btn)
 
+        self.reset_btn = QPushButton("Reset → raw…")
+        self.reset_btn.setToolTip(
+            "Undo all filing: MOVE every camera folder — both already under Rat<N>/<date>\n"
+            "and loose — into a flat raw\\ folder on its own drive, so matching can be redone\n"
+            "from scratch. Same-drive rename; shows the full plan before moving anything.")
+        self.reset_btn.clicked.connect(self._reset)
+        act.addWidget(self.reset_btn)
+
         self.summary_btn = QPushButton("Summary figure…")
         self.summary_btn.setToolTip(
             "Draw a one-look status figure: per rat, grouped by repeat, every session\n"
@@ -1775,6 +1992,53 @@ class ScanDriveGUI(QMainWindow):
         self.organize_btn.setEnabled(True)
         QMessageBox.critical(self, "Planning failed", msg)
         self.status_lbl.setText("Planning failed.")
+
+    # -- reset: un-file all videos to per-drive raw/ -----------------------
+    def _reset(self):
+        roots = [e.text().strip() for e in self.drive_edits if e.text().strip()]
+        if not roots:                      # nothing picked — sweep every mounted volume
+            roots = [str(r) for r in sd.list_drive_roots(
+                include_system=self.sysdrive_chk.isChecked())]
+        if not roots:
+            QMessageBox.information(self, "Reset", "No drives to scan.")
+            return
+        if QMessageBox.question(
+                self, "Reset videos → raw?",
+                "Look at:\n  " + "\n  ".join(roots) + "\n\nand plan moving EVERY camera "
+                "folder — both already filed under Rat/date AND loose — into a flat raw\\ "
+                "folder on its own drive, undoing all filing so matching can be redone.\n\n"
+                "You'll see the full plan before anything moves. Continue?"
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        self.status_lbl.setText("Scanning for camera folders…")
+        self.reset_btn.setEnabled(False)
+        self.reset_thread = QThread()
+        self.reset_worker = ResetScanWorker(roots, self.depth_spin.value())
+        self.reset_worker.moveToThread(self.reset_thread)
+        self.reset_thread.started.connect(self.reset_worker.run)
+        self.reset_worker.progress.connect(
+            lambda d: self.status_lbl.setText(f"Scanning… {d}"))
+        self.reset_worker.done.connect(self._reset_review)
+        self.reset_worker.failed.connect(self._reset_failed)
+        self.reset_worker.done.connect(self.reset_thread.quit)
+        self.reset_worker.failed.connect(self.reset_thread.quit)
+        self.reset_thread.start()
+
+    def _reset_review(self, plan: list):
+        self.reset_btn.setEnabled(True)
+        t = rv.totals(plan)
+        self.status_lbl.setText(
+            f"Reset plan: {t[rv.MOVE]} to move, {t[rv.CONFLICT]} conflict, "
+            f"{t[rv.SKIP_IN_RAW]} already in raw.")
+        if not plan:
+            QMessageBox.information(self, "Reset", "No camera folders found on those drives.")
+            return
+        ResetDialog(plan, self).exec()
+
+    def _reset_failed(self, msg: str):
+        self.reset_btn.setEnabled(True)
+        self.status_lbl.setText("Reset scan failed.")
+        QMessageBox.critical(self, "Reset failed", msg)
 
     # -- summary figure ----------------------------------------------------
     def _summary(self):
