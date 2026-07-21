@@ -150,6 +150,12 @@ def build_roster(xlsx_path: str, sheet: str = "Raw") -> list[dict]:
 
     sub = df.dropna(subset=["subject"]).copy()
     sub["date8"] = sub["Date"].apply(parse_date8)
+    # Row order in the sheet IS the training order: on a given date the animals
+    # appear in the sequence they were run. dropna() keeps that order, so a
+    # monotonic counter over the retained rows records each row's sheet position;
+    # a group's smallest position is where that session first appears — its rank
+    # in the training order. Used to assign loose videos to rats by time.
+    sub["_rowpos"] = range(len(sub))
     # 'repeat' is the repetition block a session belongs to. It is constant
     # within a (subject, day, session), so it rides along as an aggregate rather
     # than a grouping key — that way a stray value can never split one real
@@ -157,7 +163,8 @@ def build_roster(xlsx_path: str, sheet: str = "Raw") -> list[dict]:
     rep_col = _find_col(sub, "repeat")
     sub["_repeat"] = sub[rep_col] if rep_col else pd.NA
     grouped = (sub.groupby(["subject", "day", "session", "date8", "Implant"], dropna=False)
-                  .agg(trials=("subject", "size"), repeat=("_repeat", "first"))
+                  .agg(trials=("subject", "size"), repeat=("_repeat", "first"),
+                       first_row=("_rowpos", "min"))
                   .reset_index())
 
     roster = []
@@ -178,6 +185,7 @@ def build_roster(xlsx_path: str, sheet: str = "Raw") -> list[dict]:
             repeat=None if pd.isna(rep) else int(rep),
             implanted=implanted,
             trials=int(r["trials"]),
+            train_order=int(r["first_row"]),
             expected="video + ephys (pre/task/post)" if implanted else "video",
         ))
     roster.sort(key=lambda x: (x["rat_no"], x["day"], x["session"]))

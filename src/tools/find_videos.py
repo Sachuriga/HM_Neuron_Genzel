@@ -142,17 +142,31 @@ def assign_videos(loose: list[dict], roster: list[dict],
     """Attach each real loose camera folder to a rat + date from the rig rules.
 
     Within one date, the videos of a given type (implanted vs not) are ordered by
-    start time and matched to that type's rats in ascending id order — smaller id
-    first, exactly as the rig records. Aborted folders are returned but never
-    assigned.
+    start time and matched to that type's rats in the sheet's *training order* —
+    the row order the animals appear in the Raw sheet that day, carried on each
+    roster entry as ``train_order``. So the earliest recording goes to the rat
+    trained first, and so on. (Roster entries without ``train_order`` fall back to
+    ascending rat id, the historical behaviour.) Aborted folders are returned but
+    never assigned.
 
     `have_video`, if given, is the set of (rat_no, date8) that already have video
     on disk (from the coverage scan). It lets each row say whether the video fills
     a genuine gap or merely duplicates video the session already has — so acting
     on the finds never overwrites good data with a stray copy."""
     have_video = have_video or set()
-    impl_rats = sorted({e["rat_no"] for e in roster if e["implanted"]})
-    noni_rats = sorted({e["rat_no"] for e in roster if not e["implanted"]})
+    # Rats that ran on each (date, implanted-or-not), in training order — deduped,
+    # first appearance wins. Scoped per date so a date only draws on the animals
+    # actually run that day, not one global list reused for every date.
+    date_rats: dict = defaultdict(list)
+    seen_rat: set = set()
+    for e in sorted(roster, key=lambda x: x.get("train_order", x["rat_no"])):
+        if not e["date8"]:
+            continue
+        key = (e["date8"], e["implanted"])
+        if (key, e["rat_no"]) in seen_rat:
+            continue
+        seen_rat.add((key, e["rat_no"]))
+        date_rats[key].append(e["rat_no"])
     roster_by = {(e["rat_no"], e["date8"]): e for e in roster if e["date8"]}
 
     # Only videos dated within this experiment's window are ours to assign. The
@@ -184,7 +198,7 @@ def assign_videos(loose: list[dict], roster: list[dict],
 
     for (date8, kind), vids in sorted(groups.items()):
         vids.sort(key=lambda x: x["start"] or "")
-        rats = noni_rats if kind == NON_IMPLANT else impl_rats
+        rats = date_rats.get((date8, kind == IMPLANT), [])
         for i, v in enumerate(vids):
             rat_no = rats[i] if i < len(rats) else None
             e = roster_by.get((rat_no, date8)) if rat_no else None
