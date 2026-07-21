@@ -321,6 +321,75 @@ from sorter_common import (  # noqa: E402
 )
 
 
+# ---------------------------------------------------------------------------
+#   Grouping split recordings of the SAME phase so they sort as one recording.
+#
+#   When the acquisition PC crashes/restarts, one phase is written as several
+#   .rec files (..._post + ..._post2 / ..._post_part2). Those are one continuous
+#   recording, so they are concatenated in acquisition-time order and sorted once
+#   — while pre / task / post stay separate. Mirrors scan_drive's phase logic.
+# ---------------------------------------------------------------------------
+_PHASE_KEYS = (("post", "post"), ("maze", "task"), ("mazs", "task"),
+               ("awake", "task"), ("hab", "task"), ("pre", "pre"))
+_REC_TS_RE = re.compile(r"(\d{8})_(\d{6})")            # (date, time) from the Trodes name
+_RAT_ID_RE = re.compile(r"[Rr]at\s*_?(\d+)")
+
+
+def _recording_name(dat_file):
+    """The Trodes recording name for a *_group0.dat, taken from its .raw parent
+    folder (e.g. 'Rat5_..._090955_post.raw' -> 'Rat5_..._090955_post')."""
+    parent = Path(dat_file).parent.name
+    return parent[:-4] if parent.lower().endswith(".raw") else Path(dat_file).stem
+
+
+def _classify_phase(name):
+    n = name.lower()
+    for key, phase in _PHASE_KEYS:
+        if key in n:
+            return phase
+    return None
+
+
+def _phase_group_key(dat_file):
+    """(rat, date, phase): the split parts of one phase share this key."""
+    name = _recording_name(dat_file)
+    rat = _RAT_ID_RE.search(name)
+    ts = _REC_TS_RE.search(name)
+    return (rat.group(1) if rat else None,
+            ts.group(1) if ts else None,
+            _classify_phase(name))
+
+
+def _acq_time(dat_file):
+    """HHMMSS acquisition time for ordering split parts; falls back to the name."""
+    ts = _REC_TS_RE.search(_recording_name(dat_file))
+    return ts.group(2) if ts else _recording_name(dat_file)
+
+
+def group_split_recordings(dat_files):
+    """Group *_group0.dat files that are split parts of the same (rat, date, phase)
+    into one sort job, ordered by acquisition time. A file with no recognizable
+    phase, or the only part of its phase, comes back as a singleton — so a session
+    that was never split behaves exactly as before."""
+    buckets = {}
+    order = []
+    for f in dat_files:
+        k = _phase_group_key(f)
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(f)
+    groups = []
+    for k in order:
+        rat, date, phase = k
+        files = buckets[k]
+        if phase is None or len(files) == 1:
+            groups.extend([f] for f in files)          # unchanged: one sort per file
+        else:
+            groups.append(sorted(files, key=_acq_time))  # concatenate these parts
+    return groups
+
+
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
                         sorter_name=DEFAULT_SORTER, sorting_params=None):
@@ -329,7 +398,10 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     Plotting is disabled, progress bars are enabled for all computations.
     All intermediate files are deleted at the end, leaving only phy_export.
     """
-    file_path_obj = Path(file_path)
+    # `file_path` may be a single .dat, or a list of split parts of one phase to
+    # concatenate in time. Parts are pre-ordered by the caller (acquisition time).
+    paths = [Path(p) for p in (file_path if isinstance(file_path, (list, tuple)) else [file_path])]
+    file_path_obj = paths[0]
     file_stem = file_path_obj.stem
 
     # Resolve numeric sorting settings (band-pass cutoffs, detection params),
@@ -355,10 +427,24 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     print(f"\n--- Processing {file_stem} ---")
     print(f"Output folder: {output_dir}")
 
-    # 2. LOAD DATA
-    print("Loading data...")
-    raw = readTrodesExtractedDataFile(str(file_path_obj))
-    full_traces_raw = raw['data']['voltage']
+    # 2. LOAD DATA (concatenate split parts of the phase, in acquisition order)
+    if len(paths) == 1:
+        print("Loading data...")
+        full_traces_raw = readTrodesExtractedDataFile(str(paths[0]))['data']['voltage']
+    else:
+        print(f"Loading + concatenating {len(paths)} split parts of this phase:")
+        parts = []
+        for p in paths:
+            v = readTrodesExtractedDataFile(str(p))['data']['voltage']
+            print(f"  + {p.parent.name}  ({v.shape[0]} samples)")
+            parts.append(v)
+        # Time-concatenation: stack samples end-to-end, channels unchanged. Peak
+        # memory is the sum of the parts — if that is ever too large, this is the
+        # line to switch to a lazy/memmap concat.
+        full_traces_raw = np.concatenate(parts, axis=0)
+        del parts
+        print(f"  = {full_traces_raw.shape[0]} samples total "
+              f"({full_traces_raw.shape[0] / fs / 60:.1f} min)")
 
     # 3. CREATE SPIKEINTERFACE RECORDING
     print("Creating recording object...")
@@ -534,18 +620,26 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
         print(f"No .dat files found inside .raw folders under '{base_data_folder}'.")
         return
 
-    print(f"Found {len(dat_files)} recording(s) to process.")
+    # Split parts of the same phase (..._post + ..._post2) are concatenated and
+    # sorted as one recording; everything else is one sort per file, as before.
+    groups = group_split_recordings(dat_files)
+    n_concat = sum(1 for g in groups if len(g) > 1)
+    print(f"Found {len(dat_files)} recording(s) -> {len(groups)} sort job(s)"
+          + (f" ({n_concat} multi-part phase(s) will be concatenated)." if n_concat else "."))
 
-    for i, dat_file in enumerate(dat_files, 1):
+    for i, group in enumerate(groups, 1):
+        first = group[0]
+        label = (first.parent.name if len(group) == 1
+                 else f"{first.parent.name}  (+{len(group) - 1} split part(s), concatenated)")
         print(f"\n{'='*60}")
-        print(f"File {i}/{len(dat_files)}: {dat_file.name}")
+        print(f"Job {i}/{len(groups)}: {label}")
         print(f"{'='*60}")
 
         bad_channel_ids, ref_channels, eeg_channel_ids = resolve_rat_settings(
-            dat_file.stem, config)
+            first.stem, config)
         try:
             process_single_file(
-                file_path=dat_file,
+                file_path=group,                      # single-item or multi-part list
                 output_parent=output_path,
                 n_jobs=n_jobs,
                 bad_channel_ids=bad_channel_ids,
@@ -555,9 +649,9 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
                 sorting_params=sorting_params,
             )
         except Exception as e:
-            print(f"Error processing {dat_file.name}:\n{e}")
+            print(f"Error processing {first.name}:\n{e}")
             traceback.print_exc()
-            print("Skipping to next file...")
+            print("Skipping to next job...")
 
 
 # =========================================================
