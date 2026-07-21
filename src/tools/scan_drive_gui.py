@@ -55,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scan_drive as sd  # noqa: E402
 import organize_data as od  # noqa: E402
 import reset_videos as rv  # noqa: E402
+import fix_video_names as fx  # noqa: E402
 import find_videos as fvid  # noqa: E402
 import summarize as smz  # noqa: E402
 import prepare_meta as pmeta  # noqa: E402
@@ -1318,6 +1319,204 @@ class ResetDialog(QDialog):
         QMessageBox.critical(self, "Reset failed", msg)
 
 
+# ------------------------------------------------------------------
+#      fix video names: eye moved to the end -> eye<NN>_<date>_<time>
+# ------------------------------------------------------------------
+_FIX_COLOR = {
+    fx.RENAME:   QColor(214, 234, 250),   # will be renamed
+    fx.BROKEN:   QColor(255, 224, 178),   # broken original set aside (.broken)
+    fx.CONFLICT: QColor(250, 214, 214),   # target already exists — skipped
+    fx.UNKNOWN:  QColor(255, 244, 205),   # camera-looking but unparsed — left alone
+}
+_FIX_COLS = ["action", "folder", "current name", "corrected name", "reason"]
+
+
+class FixNamesScanWorker(QObject):
+    """Sweep the drives for misnamed camera videos and build the rename plan."""
+    progress = pyqtSignal(str)
+    done = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, roots, depth):
+        super().__init__()
+        self.roots, self.depth = roots, depth
+        self._stop = False
+        self._n = 0
+
+    def stop(self):
+        self._stop = True
+
+    def _tick(self, d):
+        self._n += 1
+        if self._n % 400 == 0:
+            self.progress.emit(str(d))
+
+    def run(self):
+        try:
+            self.done.emit(fx.scan_and_plan(self.roots, depth=self.depth,
+                                            on_dir=self._tick,
+                                            should_stop=lambda: self._stop))
+        except Exception as exc:  # pragma: no cover
+            self.failed.emit(str(exc))
+
+
+class FixNamesRunWorker(QObject):
+    """Execute a rename plan off the GUI thread."""
+    progress = pyqtSignal(int, int, str)
+    done = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = plan
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            self.done.emit(fx.execute_renames(
+                self.plan, on_progress=lambda i, n, s: self.progress.emit(i, n, s),
+                should_stop=lambda: self._stop))
+        except Exception as exc:  # pragma: no cover
+            self.failed.emit(str(exc))
+
+
+class FixNamesDialog(QDialog):
+    """Review the rename plan, then run it. Nothing is renamed until confirmed."""
+
+    def __init__(self, plan: list[dict], parent=None):
+        super().__init__(parent)
+        self.plan = plan
+        self.run_thread = None
+        self.run_worker = None
+        self.setWindowTitle("Fix video names")
+        self.resize(1150, 650)
+        v = QVBoxLayout(self)
+
+        t = fx.totals(plan)
+        self.totals = t
+        v.addWidget(QLabel(
+            f"<b>{t[fx.RENAME]}</b> file(s) to rename to eye&lt;NN&gt;_&lt;date&gt;_&lt;time&gt;.mp4 "
+            f"&nbsp;·&nbsp; broken originals set aside: {t[fx.BROKEN]} &nbsp;·&nbsp; "
+            f"<b>conflicts: {t[fx.CONFLICT]}</b> &nbsp;·&nbsp; "
+            f"unparsed camera-looking: {t[fx.UNKNOWN]}"))
+
+        self.table = QTableWidget(len(plan), len(_FIX_COLS))
+        self.table.setHorizontalHeaderLabels(_FIX_COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        for i, p in enumerate(plan):
+            vals = [p["action"], p["folder"], p["old"], p.get("new") or "", p["reason"]]
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(str(val))
+                _paint(it, _FIX_COLOR.get(p["action"], Qt.GlobalColor.white))
+                self.table.setItem(i, c, it)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(_FIX_COLS.index("folder"), QHeaderView.ResizeMode.Stretch)
+        v.addWidget(self.table, 1)
+
+        v.addWidget(QLabel(
+            "blue = renamed in place · orange = broken original set aside as ....mp4.broken "
+            "so its _fixed re-encode can take the real name · red = corrected name already "
+            "exists, skipped for you to resolve · yellow = camera-looking but unparsed, left "
+            "untouched. Nothing is ever overwritten or deleted."))
+
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+        v.addWidget(self.bar)
+        self.run_lbl = QLabel("")
+        v.addWidget(self.run_lbl)
+
+        row = QHBoxLayout()
+        exp = QPushButton("Export plan CSV…")
+        exp.clicked.connect(self._export)
+        row.addWidget(exp)
+        row.addStretch(1)
+        self.run_btn = QPushButton(f"Run — rename {t[fx.RENAME]}")
+        self.run_btn.clicked.connect(self._run)
+        self.run_btn.setEnabled(bool(t[fx.RENAME]))
+        row.addWidget(self.run_btn)
+        self.cancel_btn = QPushButton("Stop")
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.cancel_btn.setVisible(False)
+        row.addWidget(self.cancel_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        row.addWidget(self.close_btn)
+        v.addLayout(row)
+
+    def _export(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Export rename plan",
+                                           str(Path.home() / "rename_plan.xlsx"),
+                                           "Excel (*.xlsx)")
+        if not f:
+            return
+        cols = ["action", "folder", "old", "new", "reason"]
+        rows = [{c: p.get(c, "") for c in cols} for p in self.plan]
+        ok, msg = sd.write_xlsx(_xlsx(f), [("rename_plan", cols, rows)])
+        self.run_lbl.setText(f"Plan exported → {msg}" if ok else "")
+        if not ok:
+            QMessageBox.critical(self, "Export failed", msg)
+
+    def _run(self):
+        t = self.totals
+        warn = (f"\n\n{t[fx.CONFLICT]} conflict(s) will be SKIPPED, never overwritten."
+                if t[fx.CONFLICT] else "")
+        if QMessageBox.question(
+                self, "Run rename?",
+                f"Rename {t[fx.RENAME]} file(s) in place to eye<NN>_<date>_<time>.mp4.\n\n"
+                f"Only the file names change; nothing is moved or overwritten.{warn}\n\n"
+                f"Proceed?") != QMessageBox.StandardButton.Yes:
+            return
+        self.run_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.cancel_btn.setVisible(True)
+        self.bar.setVisible(True)
+        self.bar.setRange(0, max(1, len(self.plan)))
+        self.run_thread = QThread()
+        self.run_worker = FixNamesRunWorker(self.plan)
+        self.run_worker.moveToThread(self.run_thread)
+        self.run_thread.started.connect(self.run_worker.run)
+        self.run_worker.progress.connect(self._progress)
+        self.run_worker.done.connect(self._done)
+        self.run_worker.failed.connect(self._failed)
+        self.run_worker.done.connect(self.run_thread.quit)
+        self.run_worker.failed.connect(self.run_thread.quit)
+        self.run_thread.start()
+
+    def _progress(self, i, n, name):
+        self.bar.setValue(i)
+        self.run_lbl.setText(f"{i}/{n} — {name}")
+
+    def _cancel(self):
+        if self.run_worker:
+            self.run_worker.stop()
+            self.run_lbl.setText("Stopping after the current file…")
+
+    def _done(self, results: list):
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setEnabled(True)
+        self.bar.setValue(self.bar.maximum())
+        ren = sum(1 for r in results if r.get("result") == "renamed")
+        errs = [r for r in results if r.get("result") == "error"]
+        skip = sum(1 for r in results if r.get("result") == "skipped")
+        self.run_lbl.setText(f"Done — {ren} renamed, {len(errs)} error, {skip} skipped.")
+        detail = "\n".join(f"{r['old']}: {r.get('reason','')}" for r in errs[:12])
+        QMessageBox.information(
+            self, "Rename finished",
+            f"{ren} file(s) renamed.\n{len(errs)} error(s), {skip} skipped."
+            + (f"\n\nErrors:\n{detail}" if detail else ""))
+
+    def _failed(self, msg: str):
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setEnabled(True)
+        QMessageBox.critical(self, "Rename failed", msg)
+
+
 _META_COLS = ["Action", "Rat", "Date", "d/s", "trials", "Folder", "Note"]
 _META_COLOR = {
     pmeta.WRITE:     QColor(210, 244, 214),   # will create a new file
@@ -1666,6 +1865,15 @@ class ScanDriveGUI(QMainWindow):
             "from scratch. Same-drive rename; shows the full plan before moving anything.")
         self.reset_btn.clicked.connect(self._reset)
         act.addWidget(self.reset_btn)
+
+        self.fixnames_btn = QPushButton("Fix video names…")
+        self.fixnames_btn.setToolTip(
+            "Find camera videos whose name has the parts out of order (e.g.\n"
+            "2019-05-27_13-45-32_eye01.mp4) and rename them to the standard\n"
+            "eye<NN>_<date>_<time>.mp4 so scanning and matching can see them.\n"
+            "Renames in place; shows the full old→new plan before changing anything.")
+        self.fixnames_btn.clicked.connect(self._fix_names)
+        act.addWidget(self.fixnames_btn)
 
         self.summary_btn = QPushButton("Summary figure…")
         self.summary_btn.setToolTip(
@@ -2041,6 +2249,46 @@ class ScanDriveGUI(QMainWindow):
         self.reset_btn.setEnabled(True)
         self.status_lbl.setText("Reset scan failed.")
         QMessageBox.critical(self, "Reset failed", msg)
+
+    # -- fix misordered video file names -----------------------------------
+    def _fix_names(self):
+        roots = [e.text().strip() for e in self.drive_edits if e.text().strip()]
+        if not roots:
+            roots = [str(r) for r in sd.list_drive_roots(
+                include_system=self.sysdrive_chk.isChecked())]
+        if not roots:
+            QMessageBox.information(self, "Fix video names", "No drives to scan.")
+            return
+        self.status_lbl.setText("Scanning for misnamed videos…")
+        self.fixnames_btn.setEnabled(False)
+        self.fix_thread = QThread()
+        self.fix_worker = FixNamesScanWorker(roots, self.depth_spin.value())
+        self.fix_worker.moveToThread(self.fix_thread)
+        self.fix_thread.started.connect(self.fix_worker.run)
+        self.fix_worker.progress.connect(
+            lambda d: self.status_lbl.setText(f"Scanning… {d}"))
+        self.fix_worker.done.connect(self._fix_review)
+        self.fix_worker.failed.connect(self._fix_failed)
+        self.fix_worker.done.connect(self.fix_thread.quit)
+        self.fix_worker.failed.connect(self.fix_thread.quit)
+        self.fix_thread.start()
+
+    def _fix_review(self, plan: list):
+        self.fixnames_btn.setEnabled(True)
+        t = fx.totals(plan)
+        self.status_lbl.setText(
+            f"Rename plan: {t[fx.RENAME]} to fix, {t[fx.CONFLICT]} conflict, "
+            f"{t[fx.UNKNOWN]} unparsed.")
+        if not any(p["action"] in (fx.RENAME, fx.CONFLICT, fx.UNKNOWN) for p in plan):
+            QMessageBox.information(self, "Fix video names",
+                                    "No misnamed camera videos found — all names look correct.")
+            return
+        FixNamesDialog(plan, self).exec()
+
+    def _fix_failed(self, msg: str):
+        self.fixnames_btn.setEnabled(True)
+        self.status_lbl.setText("Rename scan failed.")
+        QMessageBox.critical(self, "Fix video names failed", msg)
 
     # -- summary figure ----------------------------------------------------
     def _summary(self):
