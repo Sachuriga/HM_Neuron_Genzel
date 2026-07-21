@@ -29,20 +29,54 @@ MOVE = "move"                 # same-drive rename into <drive>/raw/
 SKIP_IN_RAW = "skip-in-raw"   # already under a raw/ folder — nothing to do
 DUPLICATE = "duplicate"       # an identical folder is already in raw — left in place
 CONFLICT = "conflict"         # a different folder of that name is in raw — needs a human
+BLOCKED = "blocked"           # the drive's raw/ location is not writable (permissions)
 
 WRITING = (MOVE,)
 
 
 def _drive_anchor(p: Path) -> Path:
-    """The drive root a path lives on: ``D:\\`` on Windows, the mount root on posix
-    (best effort). Used as the base for that drive's ``raw/`` folder."""
-    if p.anchor:
-        return Path(p.anchor)
-    return Path(p.parts[0]) if p.parts else p
+    """The drive/mount root a path lives on — ``D:\\`` on Windows, the mount point
+    (e.g. ``/media/you/EXT``) on Linux/mac. This is where that drive's ``raw/``
+    folder is created, so it must be the writable mount root, NOT the filesystem
+    root ``/`` (writing there needs sudo and is the classic Errno 13 on Linux)."""
+    d = Path(p).resolve()
+    if not d.is_dir():
+        d = d.parent
+    while True:
+        try:
+            if os.path.ismount(d):
+                return d
+        except OSError:
+            pass
+        if d.parent == d:                 # reached the filesystem root
+            return d
+        d = d.parent
 
 
 def _in_raw(p: Path) -> bool:
     return any(part.lower() == RAW_DIRNAME for part in p.parts)
+
+
+def _is_ancestor(a: Path, b: Path) -> bool:
+    try:
+        b.relative_to(a)
+        return True
+    except ValueError:
+        return False
+
+
+def _base_for(src: Path, roots) -> Path:
+    """The folder under which this drive's ``raw/`` goes. Prefer the deepest scan
+    root the user actually picked that contains ``src`` — that root is a location
+    they can read/write. Fall back to the auto-detected mount root only when the
+    folder sits under no given root."""
+    if roots:
+        src_r = src.resolve()
+        owning = [Path(r).resolve() for r in roots if r
+                  and _is_ancestor(Path(r).resolve(), src_r)]
+        if owning:
+            return max(owning, key=lambda r: len(r.parts))
+    return _drive_anchor(src)
 
 
 def _signature(path: Path):
@@ -59,12 +93,15 @@ def _signature(path: Path):
         return None
 
 
-def plan_reset(camera_folders: list[dict]) -> list[dict]:
+def plan_reset(camera_folders: list[dict], roots=None) -> list[dict]:
     """Work out where every camera folder would move. Reads only.
 
     `camera_folders` is the list from
     ``find_videos.find_loose_camera_folders(roots, include_filed=True)`` — each
-    dict has a ``path`` (and ``is_filed``). One plan row per folder."""
+    dict has a ``path`` (and ``is_filed``). `roots` are the drive roots being
+    swept; when given, a folder's ``raw/`` goes under the root that contains it
+    (a writable place the user picked), else under its mount root. One plan row
+    per folder."""
     plan = []
     claimed: dict = {}                       # target path -> source already headed there
     for v in camera_folders:
@@ -75,9 +112,18 @@ def plan_reset(camera_folders: list[dict]) -> list[dict]:
                              is_filed=v.get("is_filed", False),
                              total=v.get("total", 0), reason="already under a raw/ folder"))
             continue
-        dst = _drive_anchor(src) / RAW_DIRNAME / name
+        base = _base_for(src, roots)
+        dst = base / RAW_DIRNAME / name
         row = dict(src=str(src), dst=str(dst), name=name,
                    is_filed=v.get("is_filed", False), total=v.get("total", 0))
+        # the drive's raw/ location must be writable — otherwise the move would die
+        # with Errno 13. Flag it here, up front, instead of failing mid-run.
+        raw_dir = base / RAW_DIRNAME
+        probe = raw_dir if raw_dir.exists() else base
+        if not os.access(probe, os.W_OK):
+            plan.append(dict(row, action=BLOCKED,
+                             reason=f"{probe} is not writable — mount the drive or fix permissions"))
+            continue
         # collide with something already at the destination, or with another
         # source we already planned to move there
         rival = claimed.get(str(dst))
@@ -138,7 +184,7 @@ def execute_reset(plan: list[dict], on_progress=None, should_stop=None) -> list[
 
 
 def totals(plan: list[dict]) -> dict:
-    out = {a: 0 for a in (MOVE, SKIP_IN_RAW, DUPLICATE, CONFLICT)}
+    out = {a: 0 for a in (MOVE, SKIP_IN_RAW, DUPLICATE, CONFLICT, BLOCKED)}
     for p in plan:
         out[p["action"]] = out.get(p["action"], 0) + 1
     out["bytes_move"] = sum(p.get("total", 0) for p in plan if p["action"] == MOVE)
@@ -150,7 +196,7 @@ def scan_and_plan(roots, depth: int = 6, on_dir=None, should_stop=None) -> list[
     the reset in one call."""
     folders = fv.find_loose_camera_folders(roots, max_depth=depth, on_dir=on_dir,
                                            should_stop=should_stop, include_filed=True)
-    return plan_reset(folders)
+    return plan_reset(folders, roots=roots)
 
 
 def main(argv=None):

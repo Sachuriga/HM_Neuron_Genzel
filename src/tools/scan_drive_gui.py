@@ -1116,6 +1116,7 @@ _RESET_COLOR = {
     rv.SKIP_IN_RAW: QColor(238, 238, 238),   # already in raw — nothing to do
     rv.DUPLICATE:   QColor(255, 244, 205),   # identical copy already in raw — left
     rv.CONFLICT:    QColor(250, 214, 214),   # name clash, different content — skipped
+    rv.BLOCKED:     QColor(250, 214, 214),   # raw/ not writable (permissions)
 }
 _RESET_COLS = ["action", "folder", "source", "raw destination", "reason"]
 
@@ -1189,10 +1190,11 @@ class ResetDialog(QDialog):
         t = rv.totals(plan)
         self.totals = t
         v.addWidget(QLabel(
-            f"<b>{t[rv.MOVE]}</b> folder(s) move to per-drive <b>raw\\</b> (same-drive rename) "
+            f"<b>{t[rv.MOVE]}</b> folder(s) move to per-drive <b>raw/</b> (same-drive rename) "
             f"&nbsp;·&nbsp; already in raw: {t[rv.SKIP_IN_RAW]} &nbsp;·&nbsp; "
             f"identical duplicates left alone: {t[rv.DUPLICATE]} &nbsp;·&nbsp; "
-            f"<b>name conflicts: {t[rv.CONFLICT]}</b>"))
+            f"<b>name conflicts: {t[rv.CONFLICT]}</b> &nbsp;·&nbsp; "
+            f"<b>blocked (not writable): {t[rv.BLOCKED]}</b>"))
 
         self.table = QTableWidget(len(plan), len(_RESET_COLS))
         self.table.setHorizontalHeaderLabels(_RESET_COLS)
@@ -1211,9 +1213,9 @@ class ResetDialog(QDialog):
         v.addWidget(self.table, 1)
 
         v.addWidget(QLabel(
-            "blue = moved into raw\\ by rename (same drive, instant) · grey = already in "
-            "raw · yellow = identical copy already in raw, left in place · red = a different "
-            "folder of that name is already in raw, skipped for you to resolve. "
+            "blue = moved into raw/ by rename (same drive, instant) · grey = already in "
+            "raw · yellow = identical copy already in raw, left in place · red = name "
+            "conflict, or the drive's raw/ is not writable (permissions) — both skipped. "
             "Emptied Rat/date folders are removed only while genuinely empty."))
 
         self.bar = QProgressBar()
