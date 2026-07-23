@@ -97,9 +97,20 @@ _BY_PLATFORM = {'Windows': [_NVENC, _QSV, _AMF, _MF],
 
 # Decode accelerators, best first. Saving the CPU 12 concurrent h264 decodes
 # matters more here than the encoder does.
-_HWACCELS = {'Windows': ['cuda', 'd3d11va', 'qsv', 'dxva2'],
-             'Linux': ['cuda', 'vaapi', 'qsv'],
-             'Darwin': ['videotoolbox']}
+#
+# The -threads variants exist because nvdec caps decode surfaces at 32 for the
+# whole process. ffmpeg's h264 decoder defaults to 16 threads, and with 12 inputs
+# that asks for 34 surfaces, so every stream fails with CUDA_ERROR_INVALID_VALUE
+# and drops to software. Fewer decoder threads means fewer surfaces; ffmpeg's own
+# advice on that error is "try lowering the amount of threads".
+_CUDA_LADDER = [['-hwaccel', 'cuda'],
+                ['-hwaccel', 'cuda', '-threads', '4'],
+                ['-hwaccel', 'cuda', '-threads', '2'],
+                ['-hwaccel', 'cuda', '-threads', '1']]
+_HWACCELS = {'Windows': _CUDA_LADDER + [['-hwaccel', 'd3d11va'], ['-hwaccel', 'qsv'],
+                                        ['-hwaccel', 'dxva2']],
+             'Linux': _CUDA_LADDER + [['-hwaccel', 'vaapi'], ['-hwaccel', 'qsv']],
+             'Darwin': [['-hwaccel', 'videotoolbox']]}
 
 # Media Foundation transforms that are CPU implementations. A hardware MFT names
 # its vendor ("NVIDIA H.264 Encoder MFT", "Intel(R) Quick Sync Video ...").
@@ -221,21 +232,35 @@ def select(mode='quality', size=(1920, 1080), bitrate='4000k', verbose=True):
 
 
 # ---------------------------------------------------------------- decoding
-def probe_decode(videos, hwaccel):
-    """True if `hwaccel` can decode ALL `videos` at once.
+# A failed -hwaccel is NOT fatal to ffmpeg: it logs, silently drops to software
+# decoding and still exits 0. Checking the exit code alone therefore reports a GPU
+# win while the CPU does all the work, so the log has to be read.
+_DECODE_FAILED = ('failed setup for format',
+                  'hwaccel initialisation returned error',
+                  'no device available',
+                  'device creation failed')
 
-    Deliberately opens every input in one process: a card that decodes one stream
-    may refuse twelve, and finding that out mid-stitch costs an hour."""
-    cmd = [_ffmpeg(), '-hide_banner', '-loglevel', 'error', '-nostdin']
+
+def probe_decode(videos, args):
+    """True if `args` (e.g. ['-hwaccel','cuda']) really decode ALL `videos` at once.
+
+    Deliberately opens every input in one process: nvdec caps total decode surfaces
+    across the whole process, so one stream can succeed where twelve fail — and
+    finding that out mid-stitch costs an hour."""
+    cmd = [_ffmpeg(), '-hide_banner', '-loglevel', 'warning', '-nostdin']
     for v in videos:
-        cmd += ['-hwaccel', hwaccel, '-i', str(v)]
+        cmd += list(args) + ['-i', str(v)]
     for n in range(len(videos)):
         cmd += ['-map', '{}:v'.format(n)]
     cmd += ['-t', '0.2', '-f', 'null', '-']
     try:
-        return sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=180).returncode == 0
+        p = sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.PIPE, timeout=180)
     except (OSError, sp.SubprocessError):
         return False
+    if p.returncode != 0:
+        return False
+    err = (p.stderr or b'').decode('utf-8', 'replace').lower()
+    return not any(m in err for m in _DECODE_FAILED)
 
 
 def select_decoder(videos, verbose=True):
@@ -250,17 +275,23 @@ def select_decoder(videos, verbose=True):
     if key in _cache:
         return _cache[key]
 
-    names = [forced] if forced else _HWACCELS.get(platform.system(), [])
-    for name in names:
-        if probe_decode(videos, name):
+    if forced:
+        # Keep the thread ladder for a forced accel; the surface cap applies just
+        # the same, and the point of forcing is to get that accel to work.
+        ladder = [['-hwaccel', forced]] + [['-hwaccel', forced, '-threads', n]
+                                           for n in ('4', '2', '1')]
+    else:
+        ladder = _HWACCELS.get(platform.system(), [])
+    for args in ladder:
+        if probe_decode(videos, args):
             if verbose:
-                _say('[INFO] GPU decode: -hwaccel {} for all {} inputs.'
-                     .format(name, len(videos)))
-            _cache[key] = ['-hwaccel', name]
+                _say('[INFO] GPU decode: {} for all {} inputs.'
+                     .format(' '.join(args), len(videos)))
+            _cache[key] = list(args)
             return _cache[key]
         if verbose:
-            _say('[DEBUG] -hwaccel {} cannot decode all {} inputs, trying next.'
-                 .format(name, len(videos)))
+            _say('[DEBUG] {} cannot decode all {} inputs on the GPU, trying next.'
+                 .format(' '.join(args), len(videos)))
     if verbose:
         _say('[INFO] Software decode (no working -hwaccel). Set FFMPEG_HWACCEL to force one.')
     _cache[key] = []
