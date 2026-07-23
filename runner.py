@@ -253,6 +253,47 @@ def _tool(var):
     return p if p and Path(p).exists() else ""
 
 
+# Compression settings per encoder; nvenc's p-presets/-cq are not valid for CPU codecs.
+QUALITY_ARGS = {"h264_nvenc": ["-preset", "p6", "-cq", "28"],
+                "hevc_nvenc": ["-preset", "p6", "-cq", "30"],
+                "h264_videotoolbox": ["-q:v", "55"],
+                "libx264": ["-preset", "veryfast", "-crf", "28"],
+                "libx265": ["-preset", "veryfast", "-crf", "30"]}
+CPU_VCODEC = "libx264"
+_probed = {}
+
+
+def probe_encoder(name):
+    """True if ffmpeg can actually *open* `name` here.
+
+    h264_nvenc is compiled into most builds but refuses to open when the NVIDIA
+    driver is older than the nvenc API that build wants, so only a real one-frame
+    encode is conclusive."""
+    if name not in _probed:
+        ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+               "-i", "nullsrc=s=64x64:d=0.04", "-c:v", name, "-f", "null", "-"]
+        try:
+            _probed[name] = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL).returncode == 0
+        except OSError:
+            _probed[name] = False
+    return _probed[name]
+
+
+def pick_vcodec():
+    """FFMPEG_VCODEC if set, else GPU when it works, else CPU."""
+    forced = os.environ.get("FFMPEG_VCODEC", "")
+    if forced:
+        return forced
+    if probe_encoder("h264_nvenc"):
+        return "h264_nvenc"
+    print(f"[WARNING] h264_nvenc will not open (NVIDIA driver too old for this ffmpeg "
+          f"build?). Falling back to {CPU_VCODEC} — slower, but it will finish. "
+          f"Set FFMPEG_VCODEC to override (Mac: h264_videotoolbox).")
+    return CPU_VCODEC
+
+
 def log(out, msg):
     print(msg, file=out, flush=True)
 
@@ -286,7 +327,6 @@ def run_worker(ip, op, steps, out):
     freq = os.environ.get("FREQ", FREQ)
     sync_start = os.environ.get("SYNC_START_SEC", "45")
     sync_led = os.environ.get("SYNC_LED", "auto")        # auto|red|blue (which LED drives sync)
-    vcodec = os.environ.get("FFMPEG_VCODEC", "h264_nvenc")
     recs = sorted(ip.glob("*.rec"))
 
     # --- STEP 1: Trodes DIO/Raw/Analog export (per .rec) ---
@@ -332,7 +372,9 @@ def run_worker(ip, op, steps, out):
     # --- STEP 3: stitching ---
     if "3" in steps and Path("./src/tracker/join_views.py").exists():
         log(out, "[STEP 3] Running Stitching...")
-        run([PYTHON, "-u", "./src/tracker/join_views.py", ip], out=out)
+        if run([PYTHON, "-u", "./src/tracker/join_views.py", ip], out=out):
+            log(out, "[ERROR] Stitching failed — stitched.mp4 not produced, so the tracker "
+                     "(step 4) and everything downstream of it will be skipped.")
 
     # --- STEP 4: tracker ---
     if "4" in steps and (ip / "stitched.mp4").exists():
@@ -464,7 +506,7 @@ def sequential_targets(root, ops):
 def compress_all_op_videos(op_dirs):
     """STEP 6 (final phase): GPU-compress EVERY top-level .mp4 in each op folder,
     in-place. Runs last so it never re-encodes a video another step still reads."""
-    vcodec = os.environ.get("FFMPEG_VCODEC", "h264_nvenc")
+    vcodec = pick_vcodec()
     ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
     print("\n" + "=" * 56)
     print(f"[MASTER] STEP 6 — Compression (codec: {vcodec}) over {len(op_dirs)} "
@@ -482,7 +524,7 @@ def compress_all_op_videos(op_dirs):
                 temp_file.unlink()
             print(f"\n[COMPRESS] {op.name}/{video.name} ...")
             rc = run([ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                      "-stats", "-i", video, "-c:v", vcodec, "-preset", "p6", "-cq", "28",
+                      "-stats", "-i", video, "-c:v", vcodec, *QUALITY_ARGS.get(vcodec, ["-b:v", "4000k"]),
                       "-c:a", "copy", temp_file])
             if rc == 0:
                 shutil.move(str(temp_file), str(video))

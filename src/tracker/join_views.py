@@ -18,14 +18,54 @@ import subprocess as sp
 GLOB_STR_OLD = '*_eye??.mp4'
 GLOB_STR_NEW = 'eye??_*.mp4'
 
+# Quality/rate settings per encoder. Unlisted encoders just get a bitrate target.
+ENCODER_ARGS = {'h264_nvenc': '-b:v 4000k -preset fast',
+                'hevc_nvenc': '-b:v 4000k -preset fast',
+                'h264_qsv': '-b:v 4000k -preset fast',
+                'libx264': '-preset veryfast -crf 18',
+                'libx265': '-preset veryfast -crf 20'}
+CPU_VCODEC = 'libx264'
+
+_probed = {}
+
+
+def probe_encoder(name):
+    """True if ffmpeg can actually *open* `name` here.
+
+    Listing an encoder (`-encoders`) is not enough: h264_nvenc is compiled in but
+    refuses to open when the NVIDIA driver is older than the nvenc API the build
+    wants. Only a real one-frame encode tells us."""
+    if name not in _probed:
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+               '-i', 'nullsrc=s=64x64:d=0.04', '-c:v', name, '-f', 'null', '-']
+        try:
+            _probed[name] = sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode == 0
+        except OSError:
+            _probed[name] = False
+    return _probed[name]
+
+
+def pick_encoder():
+    """FFMPEG_VCODEC if set, else GPU when it works, else CPU."""
+    forced = os.environ.get('FFMPEG_VCODEC', '')
+    if forced:
+        return forced
+    if probe_encoder('h264_nvenc'):
+        return 'h264_nvenc'
+    print('[WARNING] h264_nvenc will not open (NVIDIA driver too old for this ffmpeg build?). '
+          'Falling back to {} — slower, but it will finish. Set FFMPEG_VCODEC to override.'
+          .format(CPU_VCODEC), file=sys.stderr)
+    return CPU_VCODEC
+
 
 def ffmpeg(cmd):
-    os.system(cmd)
+    return os.system(cmd)
     # p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
     # p.wait()
 
 
-def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False, glob=GLOB_STR_NEW, n_videos=None):
+def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False, glob=GLOB_STR_NEW, n_videos=None,
+                 vcodec=None):
     path = Path(path).resolve()
     if not path.exists():
         print("Can't find requested path! [{}]!".format(path), file=sys.stderr)
@@ -94,8 +134,8 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
     cmd += f'-t {dur}' if dur else ''
 
     # encoding settings
-    # cmd += '-c:v libx264 -preset veryfast -crf 18 '
-    cmd += '-c:v h264_nvenc -b:v 4000k -preset fast -pix_fmt yuv420p -r 30 '# '-c:v h264_nvenc -b:v 4000k -preset fast -pix_fmt yuv420p '
+    vcodec = vcodec or pick_encoder()
+    cmd += '-c:v {} {} -pix_fmt yuv420p -r 30 '.format(vcodec, ENCODER_ARGS.get(vcodec, '-b:v 4000k'))
 
     outpath = videos[0].parent / 'stitched.mp4'
     cmd += f'{outpath}'
@@ -103,9 +143,11 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
 
 def _main(cli_args):
     paths = [Path(p) for p in cli_args.paths]
+    vcodec = cli_args.vcodec or pick_encoder()
     for path in paths:
         print('Joining "{}"'.format(str(path)))
-        command = make_command(path, crop_x=104, crop_y=91, quiet=True, glob=cli_args.glob, n_videos=cli_args.n_videos)
+        command = make_command(path, crop_x=104, crop_y=91, quiet=True, glob=cli_args.glob, n_videos=cli_args.n_videos,
+                               vcodec=vcodec)
 
         if not command:
             print('Command generation for video set "{}" encountered error, stopping.'.format(path), file=sys.stderr)
@@ -115,7 +157,9 @@ def _main(cli_args):
         if cli_args.dry_run:
             print(command)
         else:
-            ffmpeg(command)  # shlex.split(command)
+            if ffmpeg(command):  # shlex.split(command)
+                print('ffmpeg failed for video set "{}", stopping.'.format(path), file=sys.stderr)
+                return 1
 
 
 if __name__ == '__main__':
@@ -128,6 +172,8 @@ if __name__ == '__main__':
                         help='Number of videos to expect. Checks glob result (default: %(default)s)')
     parser.add_argument('-D', '--dry_run', help='Do not launch process, only print the command.', action='store_true')
     parser.add_argument('-g', '--glob', help='Video file glob (default: "%(default)s")', default=GLOB_STR_NEW)
+    parser.add_argument('-c', '--vcodec', default=os.environ.get('FFMPEG_VCODEC', ''),
+                        help='Video encoder, e.g. h264_nvenc or libx264 (default: auto-detect, GPU if usable)')
 
     # parser.add_argument('-s', '--starttime', type=float, help='Start video from time (in seconds)')
     # parser.add_argument('-d', '--duration', type=float, help='Duration of video (in seconds)')
