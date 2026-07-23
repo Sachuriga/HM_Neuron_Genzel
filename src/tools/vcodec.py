@@ -36,6 +36,7 @@ Environment overrides:
 import os
 import sys
 import glob
+import shutil
 import platform
 import collections
 import subprocess as sp
@@ -109,8 +110,25 @@ _CUDA_LADDER = [['-hwaccel', 'cuda'],
                 ['-hwaccel', 'cuda', '-threads', '1']]
 _HWACCELS = {'Windows': _CUDA_LADDER + [['-hwaccel', 'd3d11va'], ['-hwaccel', 'qsv'],
                                         ['-hwaccel', 'dxva2']],
+             # 'vaapi' is expanded per render node at probe time, see _decode_ladder.
              'Linux': _CUDA_LADDER + [['-hwaccel', 'vaapi'], ['-hwaccel', 'qsv']],
              'Darwin': [['-hwaccel', 'videotoolbox']]}
+
+
+def _decode_ladder():
+    """Platform decode ladder, with VAAPI expanded across the DRM render nodes.
+
+    Same reason as the encoder side: the usable node is not always renderD128, so
+    naming no device at all leaves ffmpeg to guess on a multi-GPU box."""
+    ladder = []
+    for args in _HWACCELS.get(platform.system(), []):
+        if args[-1] == 'vaapi':
+            # -hwaccel_device, not -vaapi_device: these args sit in front of every
+            # -i, and only the former is an input-level option.
+            ladder += [args + ['-hwaccel_device', d] for d in render_nodes()]
+        else:
+            ladder.append(args)
+    return ladder
 
 # Media Foundation transforms that are CPU implementations. A hardware MFT names
 # its vendor ("NVIDIA H.264 Encoder MFT", "Intel(R) Quick Sync Video ...").
@@ -119,8 +137,17 @@ _SOFTWARE_MFT = ('h264 encoder mft', 'hevc encoder mft')
 _cache = {}
 
 
-def _ffmpeg():
-    return os.environ.get('FFMPEG_CMD', 'ffmpeg')
+def ffmpeg_cmd():
+    """The ffmpeg to run: FFMPEG_CMD when it resolves, else whatever is on PATH.
+
+    runner.py repairs FFMPEG_CMD before launching steps, but these scripts also get
+    run directly. A stale config path — a Windows path on a Linux box, say — would
+    otherwise make every probe raise OSError, which reads as "no GPU here" and
+    quietly drops the whole job onto the CPU."""
+    ff = os.environ.get('FFMPEG_CMD', '').strip()
+    if ff and (os.path.isfile(ff) or shutil.which(ff)):
+        return ff
+    return shutil.which('ffmpeg') or 'ffmpeg'
 
 
 def _say(msg):
@@ -160,7 +187,7 @@ def probe_encoder(enc, size=(1920, 1080)):
     can pass where the actual 2352x1424 stitch would fail."""
     w, h = size
     # Global options (VAAPI device) must come before the input to take effect.
-    cmd = [_ffmpeg(), '-hide_banner', '-loglevel', 'verbose'] + list(enc.global_args)
+    cmd = [ffmpeg_cmd(), '-hide_banner', '-loglevel', 'verbose'] + list(enc.global_args)
     cmd += ['-f', 'lavfi', '-i', 'nullsrc=s={}x{}:d=0.07:r=30'.format(w, h)]
     cmd += ['-vf', enc.filter_chain] if enc.filter_chain else ['-pix_fmt', 'yuv420p']
     cmd += ['-c:v', enc.codec] + list(enc.args) + ['-f', 'null', '-']
@@ -247,7 +274,7 @@ def probe_decode(videos, args):
     Deliberately opens every input in one process: nvdec caps total decode surfaces
     across the whole process, so one stream can succeed where twelve fail — and
     finding that out mid-stitch costs an hour."""
-    cmd = [_ffmpeg(), '-hide_banner', '-loglevel', 'warning', '-nostdin']
+    cmd = [ffmpeg_cmd(), '-hide_banner', '-loglevel', 'warning', '-nostdin']
     for v in videos:
         cmd += list(args) + ['-i', str(v)]
     for n in range(len(videos)):
@@ -281,7 +308,7 @@ def select_decoder(videos, verbose=True):
         ladder = [['-hwaccel', forced]] + [['-hwaccel', forced, '-threads', n]
                                            for n in ('4', '2', '1')]
     else:
-        ladder = _HWACCELS.get(platform.system(), [])
+        ladder = _decode_ladder()
     for args in ladder:
         if probe_decode(videos, args):
             if verbose:
@@ -303,7 +330,7 @@ if __name__ == '__main__':
     if len(sys.argv) >= 3:
         size = (int(sys.argv[1]), int(sys.argv[2]))
     print('platform      : {}'.format(platform.system()))
-    print('ffmpeg        : {}'.format(_ffmpeg()))
+    print('ffmpeg        : {}'.format(ffmpeg_cmd()))
     print('probe size    : {}x{}'.format(*size))
     if platform.system() == 'Linux':
         print('render nodes  : {}'.format(', '.join(render_nodes()) or 'none'))

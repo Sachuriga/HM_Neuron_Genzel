@@ -77,7 +77,7 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
     # path with spaces ("C:\Users\Genzel Lab\..."), and the command also contains
     # its own quotes around the filter graph, so cmd.exe strips the wrong pair and
     # the whole thing falls apart. A list sidesteps quoting on both platforms.
-    cmd = [os.environ.get('FFMPEG_CMD', 'ffmpeg'), '-y']
+    cmd = [vcodec.ffmpeg_cmd(), '-y']
     # VAAPI needs its device opened before the inputs.
     cmd += list(encoder.global_args)
 
