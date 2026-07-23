@@ -129,7 +129,10 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
         cmd += ['-pix_fmt', 'yuv420p']
     cmd += ['-r', '30']
 
-    cmd += [str(videos[0].parent / 'stitched.mp4')]
+    # A truncated run is a benchmark, so keep it away from the real stitched.mp4 —
+    # overwriting a finished hour-long stitch with 60 s would be an expensive slip.
+    name = 'stitched.mp4' if not dur else 'stitched_{:g}s.mp4'.format(dur)
+    cmd += [str(videos[0].parent / name)]
     return cmd
 
 
@@ -140,8 +143,8 @@ def _main(cli_args):
     encoder = vcodec.Encoder(cli_args.vcodec, ['-b:v', '4000k'], [], '') if cli_args.vcodec else None
     for path in paths:
         print('Joining "{}"'.format(str(path)))
-        command = make_command(path, crop_x=104, crop_y=91, quiet=True, glob=cli_args.glob, n_videos=cli_args.n_videos,
-                               encoder=encoder)
+        command = make_command(path, crop_x=104, crop_y=91, dur=cli_args.duration, quiet=True, glob=cli_args.glob,
+                               n_videos=cli_args.n_videos, encoder=encoder)
 
         if not command:
             print('Command generation for video set "{}" encountered error, stopping.'.format(path), file=sys.stderr)
@@ -168,8 +171,10 @@ if __name__ == '__main__':
                         help='Force a video encoder, e.g. h264_nvenc or libx264. Default: auto-detect, '
                              'preferring the GPU. Also settable via FFMPEG_VCODEC (which is still probed).')
 
+    parser.add_argument('-d', '--duration', type=float,
+                        help='Only stitch the first N seconds. Useful for timing a run: compare the '
+                             'ffmpeg "speed=" figure with and without FFMPEG_HWACCEL=none.')
     # parser.add_argument('-s', '--starttime', type=float, help='Start video from time (in seconds)')
-    # parser.add_argument('-d', '--duration', type=float, help='Duration of video (in seconds)')
 
     cli_args = parser.parse_args()
 
