@@ -253,45 +253,11 @@ def _tool(var):
     return p if p and Path(p).exists() else ""
 
 
-# Compression settings per encoder; nvenc's p-presets/-cq are not valid for CPU codecs.
-QUALITY_ARGS = {"h264_nvenc": ["-preset", "p6", "-cq", "28"],
-                "hevc_nvenc": ["-preset", "p6", "-cq", "30"],
-                "h264_videotoolbox": ["-q:v", "55"],
-                "libx264": ["-preset", "veryfast", "-crf", "28"],
-                "libx265": ["-preset", "veryfast", "-crf", "30"]}
-CPU_VCODEC = "libx264"
-_probed = {}
-
-
-def probe_encoder(name):
-    """True if ffmpeg can actually *open* `name` here.
-
-    h264_nvenc is compiled into most builds but refuses to open when the NVIDIA
-    driver is older than the nvenc API that build wants, so only a real one-frame
-    encode is conclusive."""
-    if name not in _probed:
-        ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
-               "-i", "nullsrc=s=64x64:d=0.04", "-c:v", name, "-f", "null", "-"]
-        try:
-            _probed[name] = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL).returncode == 0
-        except OSError:
-            _probed[name] = False
-    return _probed[name]
-
-
-def pick_vcodec():
-    """FFMPEG_VCODEC if set, else GPU when it works, else CPU."""
-    forced = os.environ.get("FFMPEG_VCODEC", "")
-    if forced:
-        return forced
-    if probe_encoder("h264_nvenc"):
-        return "h264_nvenc"
-    print(f"[WARNING] h264_nvenc will not open (NVIDIA driver too old for this ffmpeg "
-          f"build?). Falling back to {CPU_VCODEC} — slower, but it will finish. "
-          f"Set FFMPEG_VCODEC to override (Mac: h264_videotoolbox).")
-    return CPU_VCODEC
+def pick_vcodec(size=(1920, 1080)):
+    """(codec, args) for compression: GPU when any GPU path works, else CPU."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+    from tools import vcodec
+    return vcodec.select(mode="quality", size=size)
 
 
 def log(out, msg):
@@ -503,18 +469,40 @@ def sequential_targets(root, ops):
     return [(op, op) for op in seen.values()]
 
 
+def _video_size(video):
+    """(w, h) of `video` via ffprobe, or None if it cannot be read."""
+    ffprobe = os.environ.get("FFPROBE_CMD", "ffprobe")
+    try:
+        p = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(video)],
+                           capture_output=True, text=True, timeout=30)
+        w, h = p.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def compress_all_op_videos(op_dirs):
     """STEP 6 (final phase): GPU-compress EVERY top-level .mp4 in each op folder,
     in-place. Runs last so it never re-encodes a video another step still reads."""
-    vcodec = pick_vcodec()
     ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
+    todo = [(op, [f for f in sorted(op.glob("*.mp4")) if f.name != "__temp_compressed.mp4"])
+            for op in op_dirs]
+
+    # Probe at the largest frame we actually have to encode: an old GPU can manage
+    # 1080p and still refuse the ~2352x1424 stitch, and we would rather find that
+    # out now than after re-encoding half the folder.
+    sizes = [s for _, vids in todo for s in map(_video_size, vids) if s]
+    probe_size = max(sizes, key=lambda s: s[0] * s[1]) if sizes else (1920, 1080)
+    vcodec, vargs = pick_vcodec(size=probe_size)
+
     print("\n" + "=" * 56)
-    print(f"[MASTER] STEP 6 — Compression (codec: {vcodec}) over {len(op_dirs)} "
-          f"op folder(s), all videos, running LAST...")
+    print(f"[MASTER] STEP 6 — Compression (codec: {vcodec} {' '.join(vargs)}, probed at "
+          f"{probe_size[0]}x{probe_size[1]}) over {len(op_dirs)} op folder(s), all videos, "
+          f"running LAST...")
     print("=" * 56)
     n_ok = n_fail = 0
-    for op in op_dirs:
-        videos = [f for f in sorted(op.glob("*.mp4")) if f.name != "__temp_compressed.mp4"]
+    for op, videos in todo:
         if not videos:
             print(f"[COMPRESS] {op.name}: no .mp4 to compress.")
             continue
@@ -524,15 +512,15 @@ def compress_all_op_videos(op_dirs):
                 temp_file.unlink()
             print(f"\n[COMPRESS] {op.name}/{video.name} ...")
             rc = run([ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                      "-stats", "-i", video, "-c:v", vcodec, *QUALITY_ARGS.get(vcodec, ["-b:v", "4000k"]),
+                      "-stats", "-i", video, "-c:v", vcodec, *vargs,
                       "-c:a", "copy", temp_file])
             if rc == 0:
                 shutil.move(str(temp_file), str(video))
                 print(f"[SUCCESS] Compressed: {video}")
                 n_ok += 1
             else:
-                print(f"[ERROR] FFmpeg failed for {video} (codec '{vcodec}'; "
-                      f"Mac: try FFMPEG_VCODEC=h264_videotoolbox).")
+                print(f"[ERROR] FFmpeg failed for {video} (codec '{vcodec}'). "
+                      f"Set FFMPEG_VCODEC to force another encoder, e.g. libx264.")
                 if temp_file.exists():
                     temp_file.unlink()
                 n_fail += 1
