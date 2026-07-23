@@ -428,27 +428,30 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     print(f"Output folder: {output_dir}")
 
     # 2. LOAD DATA (concatenate split parts of the phase, in acquisition order)
-    if len(paths) == 1:
-        print("Loading data...")
-        full_traces_raw = readTrodesExtractedDataFile(str(paths[0]))['data']['voltage']
-    else:
-        print(f"Loading + concatenating {len(paths)} split parts of this phase:")
-        parts = []
-        for p in paths:
-            v = readTrodesExtractedDataFile(str(p))['data']['voltage']
+    #
+    # Memory-mapped, never read whole: 128 channels of int16 at 30 kHz is ~27 GiB
+    # an hour, so np.fromfile + np.concatenate needed the sum of the parts PLUS a
+    # copy, and simply failed to allocate. The samples stay on disk and the sorter
+    # streams them chunk by chunk.
+    print("Memory-mapping data..." if len(paths) == 1
+          else f"Memory-mapping {len(paths)} split parts of this phase:")
+    parts = []
+    for p in paths:
+        v = readTrodesExtractedDataFile(str(p), memmap=True)['data']['voltage']
+        if len(paths) > 1:
             print(f"  + {p.parent.name}  ({v.shape[0]} samples)")
-            parts.append(v)
-        # Time-concatenation: stack samples end-to-end, channels unchanged. Peak
-        # memory is the sum of the parts — if that is ever too large, this is the
-        # line to switch to a lazy/memmap concat.
-        full_traces_raw = np.concatenate(parts, axis=0)
-        del parts
-        print(f"  = {full_traces_raw.shape[0]} samples total "
-              f"({full_traces_raw.shape[0] / fs / 60:.1f} min)")
+        parts.append(v)
+
+    total_samples = sum(v.shape[0] for v in parts)
+    print(f"  = {total_samples} samples total ({total_samples / fs / 60:.1f} min, "
+          f"{total_samples * parts[0].shape[1] * 2 / 2**30:.1f} GiB on disk)")
 
     # 3. CREATE SPIKEINTERFACE RECORDING
     print("Creating recording object...")
-    rec = si.NumpyRecording(traces_list=[full_traces_raw], sampling_frequency=fs)
+    recs = [si.NumpyRecording(traces_list=[v], sampling_frequency=fs) for v in parts]
+    # Lazy time-concatenation: one continuous segment spanning the parts, without
+    # ever materialising them. Equivalent to the old np.concatenate, minus the RAM.
+    rec = recs[0] if len(recs) == 1 else si.concatenate_recordings(recs)
     rec.set_channel_gains(gain)
     rec.set_channel_offsets(offset)
 
