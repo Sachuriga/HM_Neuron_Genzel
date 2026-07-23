@@ -113,7 +113,8 @@ def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = Non
 
 def main():
     parser = argparse.ArgumentParser(description="Run DLC on collected frames and merge coordinates back into the CSV.")
-    parser.add_argument("--op_folder", "-o", required=True, help="The op folder (input)")
+    parser.add_argument("--output_folder", "--op_folder", "-o", dest="op_folder",
+                        required=True, help="The op folder (input); runner passes --output_folder")
     parser.add_argument("--config", "-g", required=True, help="Path to DLC project config.yaml")
     parser.add_argument("--csv", "-c", help="Specific path to the *_with_frames.csv (optional)")
     parser.add_argument("--shuffle", "-s", type=int, default=2, help="DLC shuffle index")

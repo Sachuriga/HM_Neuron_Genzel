@@ -12,6 +12,16 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 TRODES_EXPORT_LFP=C:\Users\gl_pc\Desktop\Trodes_2-8-0_Windows11\exportLFP.exe
 
 # -------------------------------------------------------------------
+# DeepLabCut inference (menu [d] part 2, src/dlc/dlc_coordinates.py).
+# DLC_CONFIG_PATH : full path to your trained DLC project's config.yaml. Step [d]
+#                   runs DeepLabCut on the collected_frames.mp4 it just exported,
+#                   then merges the predicted keypoints back into the CSV.
+#                   Leave blank to run step [d] as export-only (no inference).
+# DLC_SHUFFLE     : DLC shuffle index to analyze with. Defaults to 2 if omitted.
+DLC_CONFIG_PATH=
+DLC_SHUFFLE=2
+
+# -------------------------------------------------------------------
 # Video/LED sync (menu [2]).
 # SYNC_START_SEC : seconds to skip at the START of each eye video before
 #                  locating and detecting the sync LED. Use this when the LED

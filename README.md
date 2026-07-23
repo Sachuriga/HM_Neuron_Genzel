@@ -31,7 +31,7 @@ A batch-processing pipeline for neuroscience experiments — integrates video-ba
    - [Step 6 — GPU Video Compression](#step-6--gpu-video-compression)
    - [Step 7 — Spike Sorting](#step-7--spike-sorting)
    - [Step 8 — LFP Extraction](#step-8--lfp-extraction)
-   - [Step d — DeepLabCut Export](#step-d--deeplabcut-export)
+   - [Step d — DeepLabCut Export + Inference](#step-d--deeplabcut-export--inference)
    - [Step 9 — Cleanup](#step-9--cleanup)
    - [Step n — Node Analysis](#step-n--node-analysis)
 8. [Tracker — How It Works](#tracker--how-it-works)
@@ -73,7 +73,8 @@ HM_Tracker_2025/
 │   │   ├── hex_maze_analysis.py     # Hex maze behavioral metrics
 │   │   └── README.md                # Column-by-column calculation reference
 │   └── dlc/
-│       └── tracking_eyes.py         # DeepLabCut eye-tracking export
+│       ├── tracking_eyes.py         # Step d (part 1): export eye frames -> collected_frames.mp4
+│       └── dlc_coordinates.py       # Step d (part 2): run DeepLabCut, merge keypoints into CSV
 ├── runner.py                        # cross-platform pipeline runner (single source of truth)
 ├── tracker_gui.py                   # genzeltracker GUI (Qt launcher)
 ├── pyproject.toml                   # deps ([gpu]/[mac] extras) + genzeltracker command
@@ -181,7 +182,7 @@ Select steps to run (e.g., 123 for steps 1, 2, and 3):
 [6] Compression
 [7] Sorting
 [8] LFP
-[d] DeepLabCut
+[d] DeepLabCut (extract frames + run DLC)
 [9] Cleaning
 [n] Node Analysis
 ```
@@ -481,23 +482,43 @@ Reads the Trodes-exported LFP `.dat` files (produced by Step e) and compiles the
 
 ---
 
-### Step d — DeepLabCut Export
+### Step d — DeepLabCut Export + Inference
 
 **Key:** `d`  
-**Script:** `src/dlc/tracking_eyes.py`  
-**Command:**
+**Scripts:** `src/dlc/tracking_eyes.py` (export) → `src/dlc/dlc_coordinates.py` (inference)  
+**Commands:**
 
 ```bash
-python tracking_eyes.py --input_folder <ip> --output_folder <op>
+python tracking_eyes.py   --input_folder <ip> --output_folder <op>
+python dlc_coordinates.py --output_folder <op> --config <DLC config.yaml> --shuffle 2
 ```
 
-Extracts eye-camera frames aligned to the rat's tracked position for DeepLabCut training or analysis:
+A single step that runs the whole DeepLabCut flow per folder: **export eye frames → run DLC → write keypoints back into the CSV.** Both parts run inside the same parallel worker (like the Step 4 tracker, DLC uses the GPU; the per-worker `MAX_GPU` resource gate throttles concurrent launches). The inference part is **skipped** unless `DLC_CONFIG_PATH` is set, so `d` still works as a frame-export-only step if you have no trained model yet.
+
+**Part 1 — frame export** (`tracking_eyes.py`) — extracts eye-camera frames aligned to the rat's tracked position:
 
 1. **Position data** — Reads `*_Coordinates_Full.csv` from the output folder (or input folder as fallback).
 2. **Region mapping** — Divides the stitched frame (1176 × 712 px) into a grid of 196 × 356 px regions. Each frame's rat XY position is mapped to a region ID indicating which individual eye camera captured it.
 3. **Video lookup** — Pre-maps each unique region ID to the corresponding raw eye camera video file (`eye01_*.mp4`, `eye02_*.mp4`, etc.).
 4. **Frame extraction** — For each row in the CSV, seeks to the corresponding frame in the matched eye camera video using a cached `VideoCapture` (sequential reads where possible to avoid costly `cap.set()` calls).
-5. **Output** — Writes all extracted frames as a single `collected_frames.mp4` to the output folder. The source frame index is stored back into the CSV as `extracted_frame_idx`.
+5. **Output** — Writes all extracted frames as a single `collected_frames.mp4` to the output folder, plus a `*_with_frames.csv` with the source frame index stored as `extracted_frame_idx`.
+
+**Part 2 — DeepLabCut inference** (`dlc_coordinates.py`, only if `DLC_CONFIG_PATH` is set) — runs the trained model on the frames just exported and merges the keypoints back in:
+
+1. **Inputs** — Locates the `collected_frames.mp4` and `*_with_frames.csv` from part 1 under the op folder.
+2. **Inference** — Runs `deeplabcut.analyze_videos` at the given `--shuffle`, then reads the resulting `.h5` and keeps the `x`/`y` columns per bodypart.
+3. **Merge** — Writes each frame's keypoints back into the CSV rows that were extracted (matched via `extracted_frame_idx`), as `<bodypart>_x` / `<bodypart>_y` columns.
+4. **Re-centering** — Subtracts `mid_brain_x` / `mid_brain_y` from every bodypart so `mid_brain` is the origin (requires a `mid_brain` bodypart in the DLC config).
+5. **Output** — Overwrites the same CSV with the added keypoint columns, and writes a DLC-labeled QC video next to `collected_frames.mp4`.
+
+**Config keys** (in `hm_tracker_paths.txt`):
+
+| Key | Meaning |
+|---|---|
+| `DLC_CONFIG_PATH` | Full path to your trained DLC project's `config.yaml`. Leave blank to run part 1 only (export, no inference). |
+| `DLC_SHUFFLE` | DLC shuffle index to analyze with (default `2`). |
+
+> **Dependency note.** `deeplabcut` is listed in the `[gpu]` extra but is **not** version-pinned, because DLC ships its own `torch` pin that can conflict with this repo's `torch==2.10.0+cu128`. Install/verify DeepLabCut in your environment to match the version you trained your model with before running Step d inference.
 
 ---
 

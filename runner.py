@@ -63,7 +63,7 @@ MENU = [
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP"),
-    ("d", "deeplabcut"),
+    ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
     ("n", "Node Analysis"),
     ("w", "nwblfp (NWB / LFP package)"),
@@ -369,11 +369,24 @@ def run_worker(ip, op, steps, out):
             run([PYTHON, "-u", "./src/sorter/export_motion.py",
                  "--input_folder", ip, "--output_folder", op], out=out)
 
-    # --- STEP d: DeepLabCut export ---
+    # --- STEP d: DeepLabCut export + inference (extract frames -> run DLC -> write) ---
     if "d" in steps and Path("./src/dlc/tracking_eyes.py").exists():
-        log(out, "[STEP d] Exporting video for DeepLabCut...")
+        log(out, "[STEP d] Exporting eye frames for DeepLabCut...")
         run([PYTHON, "-u", "./src/dlc/tracking_eyes.py",
              "--input_folder", ip, "--output_folder", op], out=out)
+        # Run DeepLabCut on the collected_frames.mp4 just exported and merge the
+        # predicted keypoints back into the CSV. Uses the GPU like step 4; the
+        # per-worker resource gate (MAX_GPU) throttles concurrent launches. Skipped
+        # unless DLC_CONFIG_PATH (the DLC project's config.yaml) points to a real file.
+        dlc_cfg = os.environ.get("DLC_CONFIG_PATH", "").strip()
+        if Path("./src/dlc/dlc_coordinates.py").exists():
+            if Path(dlc_cfg).is_file():
+                log(out, "[STEP d] Running DeepLabCut inference...")
+                run([PYTHON, "-u", "./src/dlc/dlc_coordinates.py",
+                     "--output_folder", op, "--config", dlc_cfg,
+                     "--shuffle", os.environ.get("DLC_SHUFFLE", "2")], out=out)
+            else:
+                log(out, f"[STEP d] Skipping DLC inference: DLC_CONFIG_PATH not set or not found: '{dlc_cfg}'")
 
     # --- STEP n: node analysis ---
     if "n" in steps and Path("./src/node_analysis/hex_maze_analysis.py").exists():

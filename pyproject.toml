@@ -28,6 +28,10 @@ mac = [
 gpu = [
     "torch==2.10.0+cu128", "torchvision==0.25.0+cu128", "torchaudio==2.10.0+cu128",
     "ultralytics", "opencv-python", "sahi", "pillow",
+    # DeepLabCut inference (menu [d] part 2, src/dlc/dlc_coordinates.py). NOTE: DLC pins its
+    # own torch — reconcile with the torch==2.10.0+cu128 pin above for your DLC
+    # version before installing (see README "Step p").
+    "deeplabcut",
     "spikeinterface[full]", "kilosort", "neuroconv", "ephyviewer",
     "probeinterface", "pynwb", "neo", "numba", "mountainsort4",
     "numpy<2", "scipy", "pandas", "matplotlib", "networkx", "shapely", "polars",
