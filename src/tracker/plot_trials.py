@@ -19,6 +19,25 @@ import networkx as nx
 from scipy.spatial.distance import pdist, squareform
 from scipy import stats 
 
+# Camera frame rate. Frame indices are the only clock that survives for non-ephys
+# sessions (step 2 needs the .rec DIO), so timing is derived from them.
+FS = 30.0
+
+# Maze frame used by every spatial plot below (metres).
+MAZE_W, MAZE_H = 9.0, 5.0
+
+# Camera-stitch geometry, from join_views.py: 12 views tiled as 2 rows x 6 columns
+# with no blending, so the tile borders land on fixed lines of the maze frame.
+STITCH_COLS, STITCH_ROWS = 6, 2
+SEAM_X = [MAZE_W * k / STITCH_COLS for k in range(1, STITCH_COLS)]   # 1.5 .. 7.5
+SEAM_Y = [MAZE_H * k / STITCH_ROWS for k in range(1, STITCH_ROWS)]   # 2.5
+
+# A rat crossing a seam is re-detected a few centimetres away in the neighbouring
+# tile, which reads as a one-frame teleport. Steps faster than this are not real.
+MAX_SPEED = 0.6          # m/s — fastest single step accepted across a seam
+JUMP_RATIO = 3.0         # ...and it must also be this many times the local speed
+MAX_SPREAD = 1.0         # s — hard cap on how far one repair may be spread
+
 # --- Helper Functions ---
 def load_decoded_track(work_dir):
     """Load a decoded-position track written by the decoder (step b) into
@@ -100,6 +119,14 @@ def build_df_from_coords(work_dir, input_dir):
             f2s = dict(zip(pd.to_numeric(sdf[fcol], errors="coerce"),
                            pd.to_numeric(sdf[scol], errors="coerce")))
             secs = pd.to_numeric(cf["Frame_Index"], errors="coerce").map(f2s)
+    # Frame-index clock: Frame_Index / FS. Untracked frames are dropped below, so
+    # sample count is NOT proportional to elapsed time — this is what keeps speed
+    # and trial duration honest across tracking dropouts. It is the only clock a
+    # non-ephys session has (no stitched seconds), and it is exact for ephys too.
+    if "Frame_Index" in cf.columns:
+        frame_time = pd.to_numeric(cf["Frame_Index"], errors="coerce") / FS
+    else:
+        frame_time = pd.Series(np.arange(len(cf), dtype=float) / FS)
     df = pd.DataFrame({
         "x": pd.to_numeric(cf["Rat_X"], errors="coerce"),
         "y": pd.to_numeric(cf["Rat_Y"], errors="coerce"),
@@ -108,12 +135,34 @@ def build_df_from_coords(work_dir, input_dir):
         # canonical trial-window clock = the stitched seconds (same as the decoder),
         # NOT the raw unix 'Timestamp' — keeps step-5 windows on the spike clock.
         "sys_time": np.asarray(secs, dtype=float),
+        "frame_time": np.asarray(frame_time, dtype=float),
         "event": "rat_position",
     }).dropna(subset=["x", "y", "trial_id"])
     df["trial_id"] = df["trial_id"].astype(int)
     return df, Path(coords).stem
 
 
+
+
+_SESSION_RE = re.compile(r"(\d{8})_(Rat\s*_?\d+)", re.I)
+
+
+def session_stem(name: str) -> str:
+    """Session prefix (<YYYYMMDD>_Rat<N>) to name outputs after.
+
+    The PDF used to be named after whichever input happened to be read, so one
+    session produced either <date>_Rat<n>_Coordinates_Full_with_frames_analysis_
+    final.pdf or log_<date>_Rat<n>_analysis_final.pdf depending on which path ran,
+    and a rerun that switched paths left both behind. Anchoring the name to the
+    session keeps it stable and lets a rerun overwrite in place.
+    """
+    m = _SESSION_RE.search(name)
+    if m:
+        return f"{m.group(1)}_{m.group(2).replace(' ', '').replace('_', '')}"
+    # no recognisable session prefix — strip the bits that name the SOURCE file
+    s = re.sub(r"^log[_-]", "", name, flags=re.I)
+    s = re.sub(r"_Coordinates_Full(_with_frames)?$", "", s, flags=re.I)
+    return s or name
 
 
 def parse_video_to_seconds(ts_str):
@@ -139,13 +188,239 @@ def moving_average(a: np.ndarray, k: int) -> np.ndarray:
         out = out[:a.size]
     return out
 
-def compute_speed_from_xy(x: np.ndarray, y: np.ndarray, fs: float) -> np.ndarray:
-    dt = 1.0 / fs
-    vx = np.gradient(x) / dt
-    vy = np.gradient(y) / dt
+def compute_speed_from_xy(x: np.ndarray, y: np.ndarray, fs: float, t=None) -> np.ndarray:
+    """Speed from a position track. When `t` (seconds per sample) is given the
+    gradient is taken against it, so frames the tracker lost widen the interval
+    instead of silently becoming a 1/fs step (which would double the speed there).
+    Falls back to a uniform 1/fs sampling when no clock is available."""
+    if t is None:
+        vx = np.gradient(x) * fs
+        vy = np.gradient(y) * fs
+    else:
+        t = np.asarray(t, dtype=float)
+        # np.gradient needs a strictly increasing coordinate; a stalled or
+        # duplicated timestamp would blow up to inf.
+        if t.size != x.size or not np.all(np.isfinite(t)) or np.any(np.diff(t) <= 0):
+            vx = np.gradient(x) * fs
+            vy = np.gradient(y) * fs
+        else:
+            vx = np.gradient(x, t)
+            vy = np.gradient(y, t)
     spd = np.hypot(vx, vy)
     spd = np.nan_to_num(spd, nan=0.0, posinf=0.0, neginf=0.0)
     return spd
+
+
+def maze_edge_segments(maze_graph, x_den, y_den):
+    """The maze's corridors as plot segments in the scaled metre frame.
+
+    Built once from the connectivity graph (which already drops 501/502 and adds
+    the manual bridges), then reused on every axis — the node rings alone don't
+    show which nodes are actually connected, so a trajectory can't be read against
+    the maze it was walked in.
+    """
+    if maze_graph is None:
+        return []
+    pos = nx.get_node_attributes(maze_graph, "pos")
+    segs = []
+    for u, v in maze_graph.edges():
+        if u in pos and v in pos:
+            (ux, uy), (vx, vy) = pos[u], pos[v]
+            segs.append([(ux / x_den, uy / y_den), (vx / x_den, vy / y_den)])
+    return segs
+
+
+def draw_maze(ax, segments, nodes_data, node_color="grey", node_size=100,
+              node_alpha=0.3, node_zorder=5, edge_alpha=0.35, edge_width=1.0,
+              labels=False, label_size=4, label_color="grey", label_zorder=6):
+    """Draw the hex maze (corridors + node rings) as the backdrop of a spatial plot.
+
+    Corridors go at zorder 0 so every trajectory, heatmap and marker stays on top.
+    """
+    if segments:
+        ax.add_collection(LineCollection(segments, colors=node_color,
+                                         linewidths=edge_width, alpha=edge_alpha,
+                                         zorder=0))
+    if nodes_data is None:
+        return
+    ax.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=node_size,
+               facecolors="none", edgecolors=node_color, linewidths=2 if node_size >= 90 else 1,
+               alpha=node_alpha, zorder=node_zorder)
+    if labels:
+        for _, nrow in nodes_data.iterrows():
+            ax.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], str(int(nrow["id"])),
+                    color=label_color, fontsize=label_size, va="center",
+                    zorder=label_zorder,
+                    **({"fontweight": "bold"} if label_size >= 8 else {}))
+
+
+def crosses_seam(x, y):
+    """Per-step mask: does the segment from sample i to i+1 cross a stitch seam?"""
+    out = np.zeros(max(x.size - 1, 0), bool)
+    for seam, c in ((SEAM_X, x), (SEAM_Y, y)):
+        for s in seam:
+            out |= (c[:-1] - s) * (c[1:] - s) <= 0
+    return out
+
+
+def _local_speed(v, half=15):
+    """Median step speed around each step — what the animal was actually doing
+    either side of it, used as the reference a jump has to stand out from."""
+    n = v.size
+    out = np.empty(n)
+    for i in range(n):
+        out[i] = np.median(v[max(0, i - half):min(n, i + half + 1)])
+    return out
+
+
+def _cap_runs(mask, cap):
+    """Trim every contiguous True run down to `cap` samples about its centre, so a
+    repair can never creep along the track without bound."""
+    if cap >= mask.size or not mask.any():
+        return mask
+    out = mask.copy()
+    idx = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
+    for a, b in zip(idx[::2], idx[1::2]):
+        if b - a > cap:
+            mid = (a + b) // 2
+            out[a:b] = False
+            out[max(a, mid - cap // 2):min(b, mid - cap // 2 + cap)] = True
+    return out
+
+
+def repair_stitch_jumps(x, y, t=None, fs: float = FS, max_speed: float = MAX_SPEED,
+                        jump_ratio: float = JUMP_RATIO, max_spread: float = MAX_SPREAD,
+                        passes: int = 20):
+    """Remove the speed spikes the camera stitching creates at tile borders.
+
+    The stitched video is 12 views pasted edge to edge, so the same rat is detected
+    a few centimetres apart on either side of a seam. A crossing therefore shows up
+    as a one-frame teleport (several m/s) and often as a flicker back and forth
+    while the rat straddles the border.
+
+    A step only seeds a repair when all three hold: it crosses a seam line, it
+    exceeds `max_speed`, and it is at least `jump_ratio` times the local step speed.
+    That last test is what keeps a genuinely fast run from being flattened — a rat
+    cruising at 0.8 m/s has neighbours just as fast, while a stitch jump is several
+    times anything around it. Flagged samples are refilled by linear interpolation
+    over time, and each pass widens the window by one sample a side until the
+    leftover step falls under `max_speed`, bounded by `max_spread` seconds.
+
+    Returns (x, y, n_repaired) in the same units as the input (metres).
+    """
+    x0 = np.asarray(x, dtype=float)
+    y0 = np.asarray(y, dtype=float)
+    n = x0.size
+    if n < 3:
+        return x0.copy(), y0.copy(), 0
+    t = (np.arange(n) / fs) if t is None else np.asarray(t, dtype=float)
+    if t.size != n or not np.all(np.isfinite(t)):
+        t = np.arange(n) / fs
+
+    x, y = x0.copy(), y0.copy()
+    bad = np.zeros(n, bool)
+    cap = max(3, int(round(max_spread * fs)))
+    for _ in range(passes):
+        gap = np.diff(t)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = np.where(gap > 0, np.hypot(np.diff(x), np.diff(y)) / gap, np.inf)
+        seed = (crosses_seam(x, y) & (v > max_speed)
+                & (v > jump_ratio * _local_speed(np.where(np.isfinite(v), v, 0.0))))
+        # once a window is open, keep widening its edges until the residual step is
+        # ordinary again — widening pushes the boundary off the seam, so the seam
+        # test no longer applies there
+        artefact = seed | ((v > max_speed) & (bad[:-1] | bad[1:]))
+        if not artefact.any():
+            break
+        new = bad.copy()
+        new[:-1] |= artefact          # both samples bounding the bad step
+        new[1:] |= artefact
+        new |= np.roll(new, 1) | np.roll(new, -1)
+        new[0] = new[-1] = False      # never extrapolate off the ends
+        new = _cap_runs(new, cap)
+        if new.sum() == bad.sum() or (~new).sum() < 2:
+            break
+        bad = new
+        # always re-interpolate from the ORIGINAL samples, so repeated passes widen
+        # the window instead of compounding earlier interpolations
+        good = ~bad
+        x, y = x0.copy(), y0.copy()
+        x[bad] = np.interp(t[bad], t[good], x0[good])
+        y[bad] = np.interp(t[bad], t[good], y0[good])
+    return x, y, int(bad.sum())
+
+
+def find_teleports(x, y, t=None, fs: float = FS, max_speed: float = MAX_SPEED,
+                   jump_ratio: float = JUMP_RATIO):
+    """Per-step mask of jumps that are not movement and not a seam artefact.
+
+    A rat cannot cross the maze between two frames. What can is a trial whose
+    Trial_Num spans two disjoint blocks, a detection landing on the wrong object,
+    or the tracker's own end-of-trial snap to the goal. These are discontinuities,
+    not slow or fast running, so the step across them is not a distance the animal
+    travelled and not a speed it reached — the caller treats them as gaps.
+
+    Same two-part test as the seam repair (impossible AND out of scale with the
+    local motion), minus the seam-crossing requirement, so genuine fast running is
+    left alone. Run AFTER repair_stitch_jumps so seam artefacts are already gone.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = x.size
+    if n < 3:
+        return np.zeros(max(n - 1, 0), bool)
+    t = (np.arange(n) / fs) if t is None else np.asarray(t, float)
+    if t.size != n or not np.all(np.isfinite(t)):
+        t = np.arange(n) / fs
+    gap = np.diff(t)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = np.where(gap > 0, np.hypot(np.diff(x), np.diff(y)) / gap, np.inf)
+    local = _local_speed(np.where(np.isfinite(v), v, 0.0))
+    return (v > max_speed) & (v > jump_ratio * local)
+
+
+def speed_with_gaps(x, y, t, fs: float, teleport):
+    """Speed with the track cut at every teleport, so no gradient spans a gap.
+
+    Each contiguous run between gaps is differentiated on its own; a run of one
+    sample has no motion to measure and contributes 0.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = x.size
+    if teleport is None or not np.any(teleport):
+        return compute_speed_from_xy(x, y, fs, t=t)
+    cuts = np.flatnonzero(teleport) + 1              # gap sits before this sample
+    out = np.zeros(n)
+    for a, b in zip(np.r_[0, cuts], np.r_[cuts, n]):
+        if b - a >= 2:
+            out[a:b] = compute_speed_from_xy(
+                x[a:b], y[a:b], fs, t=(None if t is None else np.asarray(t)[a:b]))
+    return out
+
+
+def path_length_gapped(x, y, teleport):
+    """Path length with teleport steps left out, instead of counted as distance."""
+    if len(x) < 2:
+        return 0.0
+    step = np.hypot(np.diff(np.asarray(x, float)), np.diff(np.asarray(y, float)))
+    return float(step[~teleport].sum()) if teleport is not None else float(step.sum())
+
+
+def sample_durations(t, fs: float, n: int) -> np.ndarray:
+    """Seconds each sample stands for, for occupancy maps. Midpoint rule on `t`
+    so a gap's time is split between the samples bracketing it; uniform 1/fs when
+    there is no usable clock."""
+    dt = 1.0 / fs
+    if t is None or n == 0:
+        return np.full(n, dt)
+    t = np.asarray(t, dtype=float)
+    if t.size != n or not np.all(np.isfinite(t)):
+        return np.full(n, dt)
+    if n == 1:
+        return np.full(1, dt)
+    edges = np.concatenate(([t[0] - dt / 2], (t[:-1] + t[1:]) / 2, [t[-1] + dt / 2]))
+    return np.clip(np.diff(edges), 0.0, None)
 
 def compute_path_length(x: np.ndarray, y: np.ndarray) -> float:
     """Calculates the total Euclidean distance of the trajectory."""
@@ -267,9 +542,23 @@ if __name__ == "__main__":
     
     parser.add_argument('-o', "--output_folder", dest='output_folder', required=True, 
                         help='Folder path containing .log files (PDF will be saved here too)')
-    parser.add_argument('-i', "--input_folder", dest='input_folder', required=True, 
+    parser.add_argument('-i', "--input_folder", dest='input_folder', required=True,
                         help='Folder path containing .log files (PDF will be saved here too)')
+    parser.add_argument("--no-seam-repair", dest='seam_repair', action='store_false',
+                        help='Keep the raw track across camera-stitch seams (no jump repair)')
+    parser.add_argument("--max-speed", type=float, default=MAX_SPEED,
+                        help='A step across a stitch seam faster than this (m/s) may be '
+                             'a stitching artefact (default: %(default)s)')
+    parser.add_argument("--jump-ratio", type=float, default=JUMP_RATIO,
+                        help='...but only if it is also this many times the local step '
+                             'speed, so real fast running survives (default: %(default)s)')
+    parser.add_argument("--max-spread", type=float, default=MAX_SPREAD,
+                        help='Hard cap (s) on how far one seam repair is spread '
+                             '(default: %(default)s)')
     args = parser.parse_args()
+
+    repair_seams = args.seam_repair
+    seam_fix_total = 0
 
     work_dir = Path(args.output_folder)
     input_dir = Path(args.input_folder) # Add this line
@@ -302,7 +591,13 @@ if __name__ == "__main__":
         log_paths = sorted(glob.glob(LOG_GLOB, recursive=True))
         if not log_paths:
             sys.exit(f"No Coordinates_Full CSV or .log files found in {work_dir}")
-        print(f"Found {len(log_paths)} log files in {work_dir}")
+        # The PDF is named after the session either way now, so the filename no
+        # longer says which path ran — make the console say it instead. Reaching
+        # here means step 4 left no Coordinates_Full CSV for this session, and the
+        # legacy .log parse has no frame-index clock.
+        print(f"[WARNING] No Coordinates_Full CSV found - falling back to the .log "
+              f"({len(log_paths)} file(s) in {work_dir}).")
+        print("          Trial timing comes from the log's own seconds, not frame indices.")
         log_file_stem = Path(log_paths[0]).stem
 
     # --- 1b. Find and Parse Node Sequence Text File ---
@@ -468,6 +763,17 @@ if __name__ == "__main__":
     if sort_cols:
         pos_df = pos_df.sort_values(sort_cols, na_position="last")
 
+    # Per-sample clock for speed/duration. The coords path already carries the
+    # frame-index clock; the .log path has no frame index (the '@ N' in the line is
+    # a maze node, not a frame), so use its own video/sys seconds instead.
+    if "frame_time" not in pos_df.columns:
+        for _c in ("video_seconds", "sys_time"):
+            if _c in pos_df.columns and pos_df[_c].notna().any():
+                pos_df["frame_time"] = pd.to_numeric(pos_df[_c], errors="coerce")
+                break
+        else:
+            pos_df["frame_time"] = np.nan
+
     # --- 6. Per-Trial Aggregation ---
     records = []
     grouped = pos_df.groupby("trial_id", sort=False)
@@ -486,9 +792,12 @@ if __name__ == "__main__":
             g_valid = g_valid.iloc[:-5]
 
         xy_seq = list(zip(g_valid["x"], g_valid["y"]))
+        ft = np.asarray(g_valid["frame_time"], dtype=float)
         records.append({
             "trial_id": tid,
             "xy": xy_seq,
+            # seconds per sample within the trial (NaN-free or None), see below
+            "t": ft if np.all(np.isfinite(ft)) else None,
             # trial time window (for overlaying decoded position, step 5 + decoder)
             "t0": float(g_valid[_tcol].min()) if _tcol else None,
             "t1": float(g_valid[_tcol].max()) if _tcol else None,
@@ -501,8 +810,7 @@ if __name__ == "__main__":
         )
 
     # --- 7. Plotting Preparation ---
-    FS = 30.0
-    DT = 1.0 / FS
+    DT = 1.0 / FS               # FS is the module-level frame rate
     
     X_SCALE_DEN = (2352 / 2 / 9)
     Y_SCALE_DEN = (1424 / 2 / 5)
@@ -535,7 +843,31 @@ if __name__ == "__main__":
     else:
         print(f"Warning: {node_file_path} not found. Nodes and Paths will not be plotted.")
 
-    pdf_path = work_dir / f"{log_file_stem}_analysis_final.pdf"
+    # Maze corridors, scaled once and reused as the backdrop of every spatial plot.
+    maze_segs = maze_edge_segments(maze_graph, X_SCALE_DEN, Y_SCALE_DEN)
+    # Draw only the nodes the graph actually keeps: build_hexmaze_graph drops 501
+    # and 502, so leaving them in the backdrop would show two rings with no
+    # corridors attached, in a maze the scoring never routes through. nodes_data
+    # itself stays intact — the goal lookup still needs every id.
+    maze_nodes = nodes_data
+    if nodes_data is not None and maze_graph is not None:
+        maze_nodes = nodes_data[nodes_data["id_str"].isin(set(maze_graph.nodes))]
+    if maze_segs:
+        print(f"Maze backdrop: {len(maze_segs)} corridors, "
+              f"{len(maze_nodes) if maze_nodes is not None else 0} nodes.")
+
+    pdf_path = work_dir / f"{session_stem(log_file_stem)}_analysis_final.pdf"
+    # Runs before the session-based naming produced <source>_analysis_final.pdf.
+    # Those are not overwritten, and preprocess_check globs *_analysis_final.pdf,
+    # so it would count a stale one as this step's output. Flag, never delete.
+    stale = [p for p in sorted(work_dir.glob("*_analysis_final.pdf"))
+             if p.name != pdf_path.name]
+    if stale:
+        print(f"[WARNING] {len(stale)} PDF(s) from the old naming are still here and "
+              f"will NOT be overwritten:")
+        for p in stale:
+            print(f"            {p.name}")
+        print("          Delete them so only the current report remains.")
     print(f"Generating PDF: {pdf_path}")
 
     agg_data = {'0.5s': [], '1.0s': [], '2.0s': [], '5.0s': []}
@@ -543,7 +875,12 @@ if __name__ == "__main__":
     global_x_scaled = []
     global_y_scaled = []
     global_speed_vals = []
-    
+    global_dt_vals = []          # seconds each position sample stands for
+    global_tel_vals = []         # per-step teleport mask, to break aggregate lines
+    global_tids = []             # trial id per entry, parallel to the lists above
+    teleport_total = 0
+    teleport_trials = []
+
     summary_metrics = []
     print(f"Total Trials Processed: {len(per_trial_df)}")
     print(f"Graph Loaded: {maze_graph is not None}")
@@ -587,7 +924,32 @@ if __name__ == "__main__":
             # 1. CALCULATE SPEED ON RAW DATA (Before modifying path)
             x_calc = x_raw / X_SCALE_DEN
             y_calc = y_raw / Y_SCALE_DEN
-            speed = compute_speed_from_xy(x_calc, y_calc, FS)
+            # Frame-index seconds for this trial (None when no clock is available).
+            # Frames the tracker lost were dropped from the sample list, so the
+            # clock — not the sample count — is what carries elapsed time.
+            t_trial = row.get("t")
+            if t_trial is not None:
+                t_trial = np.asarray(t_trial, dtype=float) - float(t_trial[0])
+            if repair_seams:
+                x_calc, y_calc, n_fixed = repair_stitch_jumps(
+                    x_calc, y_calc, t=t_trial, fs=FS, max_speed=args.max_speed,
+                    jump_ratio=args.jump_ratio, max_spread=args.max_spread)
+                if n_fixed:
+                    seam_fix_total += n_fixed
+                    # keep the pixel-frame copies (path length, goal arrival) in sync
+                    x_raw = x_calc * X_SCALE_DEN
+                    y_raw = y_calc * Y_SCALE_DEN
+            # Teleports left after the seam repair are discontinuities, not motion.
+            # Treated as gaps: the step is excluded from speed, from path length and
+            # from every line plot, rather than being smoothed into the data.
+            teleport = find_teleports(x_calc, y_calc, t=t_trial, fs=FS,
+                                      max_speed=args.max_speed,
+                                      jump_ratio=args.jump_ratio)
+            if teleport.any():
+                teleport_total += int(teleport.sum())
+                teleport_trials.append(trial_id)
+            speed = speed_with_gaps(x_calc, y_calc, t_trial, FS, teleport)
+            dt_samples = sample_durations(t_trial, FS, len(x_calc))
 
             # 2. PLOTTING PATH (Always use FULL path)
             x_plot = x_calc.copy()
@@ -623,12 +985,18 @@ if __name__ == "__main__":
             trial_failed = current_goal_node is not None and not goal_reached_naturally
 
             # -- Stats for Correlation Plots --
-            avg_speed_trial = np.mean(speed) if len(speed) > 0 else 0
+            # time-weighted, so samples that bracket a tracking gap don't count the
+            # same as the ones 1/FS apart
+            avg_speed_trial = (float(np.average(speed, weights=dt_samples))
+                               if len(speed) > 0 else 0)
             median_speed_trial = np.median(speed) if len(speed) > 0 else 0
 
             global_x_scaled.append(x_calc) # Store original for aggregates
             global_y_scaled.append(y_calc)
             global_speed_vals.append(speed)
+            global_dt_vals.append(dt_samples)
+            global_tel_vals.append(teleport)
+            global_tids.append(trial_id)
 
             speed_raw_smooth = moving_average(speed, SMOOTH_SAMPLES_RAW) 
             speed_05 = moving_average(speed, SMOOTH_SAMPLES_05)
@@ -647,7 +1015,7 @@ if __name__ == "__main__":
                 agg_data['2.0s'].append(np.interp(norm_time_common, curr_norm_time, speed_20))
                 agg_data['5.0s'].append(np.interp(norm_time_common, curr_norm_time, speed_50))
 
-            time_vec = np.arange(len(speed)) * DT
+            time_vec = t_trial if t_trial is not None else np.arange(len(speed)) * DT
             norm_time_vec = np.linspace(0, 1, len(speed)) if len(speed) > 1 else np.array([0.0])
 
             speed_vis = speed_raw_smooth.copy()
@@ -656,9 +1024,11 @@ if __name__ == "__main__":
             bins_x, bins_y = 50, 30
             range_map = [[0, 9], [0, 5]]
             H, _, _ = np.histogram2d(x_calc, y_calc, bins=[bins_x, bins_y], range=range_map)
-            H = H.T 
+            H = H.T
             H_rel = H / (H.sum() if H.sum() > 0 else 1)
-            H_sec = H * DT 
+            H_sec, _, _ = np.histogram2d(x_calc, y_calc, bins=[bins_x, bins_y],
+                                         range=range_map, weights=dt_samples)
+            H_sec = H_sec.T
             H_rel_masked = np.ma.masked_where(H == 0, H_rel)
             H_sec_masked = np.ma.masked_where(H == 0, H_sec)
 
@@ -668,11 +1038,16 @@ if __name__ == "__main__":
             # If not reached, score is based on total path + distance to goal (if appended).
             
             # 1. Physical Dist Calculation for SCORING
+            # Teleport steps are excluded: a discontinuity is not distance the rat
+            # ran, and counting it inflates the actual path, which deflates
+            # ln(optimal/actual) into a worse-looking score than the animal earned.
             if goal_reached_naturally and first_goal_visit_idx > 0:
-                actual_dist_score_basis = compute_path_length(x_raw[:first_goal_visit_idx+1], y_raw[:first_goal_visit_idx+1])
+                _end = first_goal_visit_idx + 1
+                actual_dist_score_basis = path_length_gapped(
+                    x_raw[:_end], y_raw[:_end], teleport[:_end - 1])
                 score_note = "(Start->FirstGoal)"
             else:
-                actual_dist_score_basis = compute_path_length(x_raw, y_raw)
+                actual_dist_score_basis = path_length_gapped(x_raw, y_raw, teleport)
                 score_note = "(Full Path — Failed)"
 
             # 2. Hops Calculation for SCORING
@@ -798,14 +1173,12 @@ if __name__ == "__main__":
                 pts = np.column_stack([x_plot, y_plot])
                 segments = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_arr = np.linspace(0.0, 1.0, len(pts) - 1)
-                # Skip segments where consecutive points jump too far apart
-                # (tracking dropouts leave gaps that would otherwise draw a straight
-                # line across the maze, often start→goal).
-                seg_lengths = np.hypot(np.diff(x_plot), np.diff(y_plot))
-                JUMP_THRESHOLD = 0.5  # scaled units (~65 raw px, ~one node spacing)
-                valid_mask = seg_lengths < JUMP_THRESHOLD
-                segments = segments[valid_mask]
-                t_arr = t_arr[valid_mask]
+                # Break the line at the same gaps the scoring uses, instead of the
+                # old standalone distance threshold - one definition of "not real
+                # movement" for the picture and the numbers alike.
+                keep = ~teleport
+                segments = segments[keep]
+                t_arr = t_arr[keep]
                 if len(segments) > 0:
                     lc = LineCollection(segments, cmap="cool", norm=mpl.colors.Normalize(0, 1), linewidths=1.5, rasterized=True)
                     lc.set_array(t_arr)
@@ -862,17 +1235,8 @@ if __name__ == "__main__":
             fig.colorbar(im4, ax=ax3, fraction=0.025, pad=0.02, label="Seconds")
             ax3.set_title(f"Trial {trial_id}: Absolute Occupancy")
 
-            if nodes_data is not None:
-                spatial_axes = [ax0, ax1, ax_path_dist, ax_path_hops, ax2, ax3]
-                for sax in spatial_axes:
-                    sax.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                s=100, facecolors='none', edgecolors='grey', 
-                                linewidths=2, alpha=0.3, zorder=5)
-                    for _, nrow in nodes_data.iterrows():
-                        sax.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                 str(int(nrow["id"])), 
-                                 color='grey', fontsize=4, 
-                                 va='center', zorder=6)
+            for sax in (ax0, ax1, ax_path_dist, ax_path_hops, ax2, ax3):
+                draw_maze(sax, maze_segs, maze_nodes, labels=True)
 
             ax4.plot(time_vec, speed_raw_smooth, color='gray', alpha=0.3, label='Raw (0.4s)', linewidth=1)
             ax4.plot(time_vec, speed_05, color='#1f77b4', linewidth=1.5, label='0.5s')
@@ -907,10 +1271,8 @@ if __name__ == "__main__":
             # decoded position for THIS trial, one panel per unit set (good, good+mua):
             # grey = actual path, colored = decoded, 'cool' colormap by within-trial time.
             for axd, trk in zip(dec_axes, decoded_all):
-                if nodes_data is not None:
-                    axd.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=22,
-                                facecolors='none', edgecolors='grey', linewidths=1,
-                                alpha=0.25, zorder=1)
+                draw_maze(axd, maze_segs, maze_nodes, node_size=22,
+                          node_alpha=0.25, edge_alpha=0.25, node_zorder=1)
                 t0, t1 = row.get("t0"), row.get("t1")
                 if t0 is not None and t1 is not None:
                     m = (trk["t"] >= t0) & (trk["t"] <= t1)
@@ -1037,13 +1399,14 @@ if __name__ == "__main__":
             all_segments = []
             all_times = []
             
-            for x_i, y_i in zip(global_x_scaled, global_y_scaled):
+            for x_i, y_i, tel_i in zip(global_x_scaled, global_y_scaled, global_tel_vals):
                 if len(x_i) < 2: continue
                 pts = np.column_stack([x_i, y_i])
                 segs = np.stack([pts[:-1], pts[1:]], axis=1)
                 t_i = np.linspace(0.0, 1.0, len(pts) - 1)
-                all_segments.append(segs)
-                all_times.append(t_i)
+                keep = ~tel_i                      # never draw across a gap
+                all_segments.append(segs[keep])
+                all_times.append(t_i[keep])
                 
             if all_segments:
                 combined_segments = np.concatenate(all_segments, axis=0)
@@ -1062,15 +1425,10 @@ if __name__ == "__main__":
                 ax_traj.set_aspect('equal')
                 ax_traj.set_title(f"Aggregate Trajectories (All Trials)", fontsize=16)
                 
-                if nodes_data is not None:
-                    ax_traj.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                      s=100, facecolors='none', edgecolors='black', 
-                                      linewidths=2, alpha=0.7, zorder=20)
-                    for _, nrow in nodes_data.iterrows():
-                        ax_traj.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                      str(int(nrow["id"])), 
-                                      color='black', fontsize=8, fontweight='bold',
-                                      va='center', zorder=21)
+                draw_maze(ax_traj, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25,
+                          labels=True, label_size=8, label_color='black',
+                          label_zorder=21)
 
             pdf.savefig(fig_traj)
             plt.close(fig_traj)
@@ -1080,15 +1438,18 @@ if __name__ == "__main__":
             all_x = np.concatenate(global_x_scaled)
             all_y = np.concatenate(global_y_scaled)
             all_spd = np.concatenate(global_speed_vals)
+            all_dt = np.concatenate(global_dt_vals)
 
             bins_x, bins_y = 90, 50
             x_edges = np.linspace(0, 9, bins_x + 1)
             y_edges = np.linspace(0, 5, bins_y + 1)
-            
+
             H_count, _, _ = np.histogram2d(all_x, all_y, bins=[x_edges, y_edges])
             n_trials = len(global_x_scaled)
-            H_occupancy_avg = (H_count * DT) / n_trials 
-            
+            H_seconds, _, _ = np.histogram2d(all_x, all_y, bins=[x_edges, y_edges],
+                                             weights=all_dt)
+            H_occupancy_avg = H_seconds / n_trials
+
             H_speed_sum, _, _ = np.histogram2d(all_x, all_y, bins=[x_edges, y_edges], weights=all_spd)
             with np.errstate(divide='ignore', invalid='ignore'):
                 H_speed_avg = H_speed_sum / H_count
@@ -1099,7 +1460,7 @@ if __name__ == "__main__":
             seg_list_spd = []
             val_list_spd = []
 
-            for x_i, y_i in zip(global_x_scaled, global_y_scaled):
+            for x_i, y_i, tel_i in zip(global_x_scaled, global_y_scaled, global_tel_vals):
                 if len(x_i) < 2: continue
                 pts = np.column_stack([x_i, y_i])
                 segs = np.stack([pts[:-1], pts[1:]], axis=1)
@@ -1107,8 +1468,10 @@ if __name__ == "__main__":
                 iy = np.searchsorted(y_edges, y_i[:-1]) - 1
                 ix = np.clip(ix, 0, bins_x - 1)
                 iy = np.clip(iy, 0, bins_y - 1)
-                vals_occ = H_occupancy_avg[ix, iy]
-                vals_spd = H_speed_avg[ix, iy]
+                keep = ~tel_i
+                vals_occ = H_occupancy_avg[ix, iy][keep]
+                vals_spd = H_speed_avg[ix, iy][keep]
+                segs = segs[keep]
                 seg_list_occ.append(segs)
                 val_list_occ.append(vals_occ)
                 seg_list_spd.append(segs)
@@ -1133,10 +1496,8 @@ if __name__ == "__main__":
                 ax_ov_occ.set_xlim(0, 9)
                 ax_ov_occ.set_ylim(5, 0)
                 ax_ov_occ.set_aspect('equal')
-                if nodes_data is not None:
-                    ax_ov_occ.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_ov_occ, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_ov_occ)
                 plt.close(fig_ov_occ)
 
@@ -1153,10 +1514,8 @@ if __name__ == "__main__":
                 ax_ov_spd.set_xlim(0, 9)
                 ax_ov_spd.set_ylim(5, 0)
                 ax_ov_spd.set_aspect('equal')
-                if nodes_data is not None:
-                    ax_ov_spd.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_ov_spd, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_ov_spd)
                 plt.close(fig_ov_spd)
 
@@ -1165,26 +1524,23 @@ if __name__ == "__main__":
             fig_cum, ax_cum = plt.subplots(figsize=(12, 10))
             all_x = np.concatenate(global_x_scaled)
             all_y = np.concatenate(global_y_scaled)
+            all_dt = np.concatenate(global_dt_vals)
             bins_x, bins_y = 50, 30
             range_map = [[0, 9], [0, 5]]
             H, _, _ = np.histogram2d(all_x, all_y, bins=[bins_x, bins_y], range=range_map)
-            H = H.T 
-            H_sec = H * DT 
+            H = H.T
+            H_sec, _, _ = np.histogram2d(all_x, all_y, bins=[bins_x, bins_y],
+                                         range=range_map, weights=all_dt)
+            H_sec = H_sec.T
             H_masked = np.ma.masked_where(H == 0, H_sec)
             im_cum = ax_cum.imshow(H_masked, interpolation='nearest', origin='upper', 
                                    extent=[0, 9, 5, 0], cmap='jet', aspect='equal')
             cbar_cum = fig_cum.colorbar(im_cum, ax=ax_cum, fraction=0.046, pad=0.04)
             cbar_cum.set_label("Cumulative Time (Total Seconds)", rotation=270, labelpad=20)
             ax_cum.set_title("Cumulative Occupancy Map (All Trials)", fontsize=16)
-            if nodes_data is not None:
-                ax_cum.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                  s=100, facecolors='none', edgecolors='black', 
-                                  linewidths=2, alpha=0.7, zorder=20)
-                for _, nrow in nodes_data.iterrows():
-                    ax_cum.text(nrow["x_scaled"] + 0.15, nrow["y_scaled"], 
-                                  str(int(nrow["id"])), 
-                                  color='black', fontsize=8, fontweight='bold',
-                                  va='center', zorder=21)
+            draw_maze(ax_cum, maze_segs, maze_nodes, node_color='black',
+                      node_alpha=0.7, node_zorder=20, edge_alpha=0.25,
+                      labels=True, label_size=8, label_color='black', label_zorder=21)
             pdf.savefig(fig_cum)
             plt.close(fig_cum)
 
@@ -1192,17 +1548,18 @@ if __name__ == "__main__":
         if len(global_x_scaled) > 0:
             seg_list_trials = []
             val_list_trials = []
-            for i, row in per_trial_df.iterrows():
-                tid = row.get("trial_id")
-                xy_arr = row["xy"]
-                if xy_arr.size < 2: continue
-                x = xy_arr[:, 0] / X_SCALE_DEN
-                y = (xy_arr[:, 1] / Y_SCALE_DEN) + i*0.005 
+            # Walk the global lists, not per_trial_df: they hold the seam-repaired
+            # coordinates the rest of the report uses, and their order is what the
+            # teleport masks are aligned to (a df index would skip past empty trials).
+            for i, (x_i, y_i, tel_i, tid) in enumerate(
+                    zip(global_x_scaled, global_y_scaled, global_tel_vals, global_tids)):
+                if len(x_i) < 2: continue
+                x = x_i
+                y = y_i + i * 0.005          # fan the trials apart so they stay legible
                 pts = np.column_stack([x, y])
-                segs = np.stack([pts[:-1], pts[1:]], axis=1)
-                t_vals = np.full(len(segs), tid)
+                segs = np.stack([pts[:-1], pts[1:]], axis=1)[~tel_i]
                 seg_list_trials.append(segs)
-                val_list_trials.append(t_vals)
+                val_list_trials.append(np.full(len(segs), tid))
                 
             if seg_list_trials:
                 combined_segs_trial = np.concatenate(seg_list_trials, axis=0)
@@ -1221,10 +1578,8 @@ if __name__ == "__main__":
                 ax_idx.set_xlim(0, 9)
                 ax_idx.set_ylim(5, 0)
                 ax_idx.set_aspect('equal')
-                if nodes_data is not None:
-                     ax_idx.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], 
-                                    s=100, facecolors='none', edgecolors='black', 
-                                    linewidths=2, alpha=0.7, zorder=20)
+                draw_maze(ax_idx, maze_segs, maze_nodes, node_color='black',
+                          node_alpha=0.7, node_zorder=20, edge_alpha=0.25)
                 pdf.savefig(fig_idx)
                 plt.close(fig_idx)
 
@@ -1335,10 +1690,8 @@ if __name__ == "__main__":
                                         (axD, (trk["dx"], trk["dy"], "Decoded path"))):
                 sc = pane.scatter(xx, yy, c=ct, cmap="cool", s=12,
                                   vmin=0, vmax=1, rasterized=True, zorder=4)
-                if nodes_data is not None:
-                    pane.scatter(nodes_data["x_scaled"], nodes_data["y_scaled"], s=90,
-                                 facecolors='none', edgecolors='grey',
-                                 linewidths=1.5, alpha=0.3, zorder=2)
+                draw_maze(pane, maze_segs, maze_nodes, node_size=90,
+                          node_alpha=0.3, node_zorder=2, edge_alpha=0.3)
                 pane.set_title(ttl, fontsize=14)
                 pane.set_aspect("equal", adjustable="box")
                 pane.set_xlim(0, 9); pane.set_ylim(5, 0)
@@ -1355,4 +1708,11 @@ if __name__ == "__main__":
             print(f"Added {len(decoded_all)} decoded-track page(s): "
                   f"{', '.join(t['quality'] for t in decoded_all)}.")
 
+    if teleport_total:
+        print(f"Teleports treated as gaps: {teleport_total} step(s) across "
+              f"{len(set(teleport_trials))} trial(s) - excluded from speed, path "
+              f"length and every line plot.")
+    if repair_seams:
+        print(f"Stitch-seam repair: interpolated {seam_fix_total} position sample(s) "
+              f"at seams x={SEAM_X}, y={SEAM_Y} (> {args.max_speed} m/s).")
     print(f"Done. PDF saved to {pdf_path}")

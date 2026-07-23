@@ -34,8 +34,16 @@ if _SRC_DIR not in _sys.path:
 
 from tools import mask
 import cv2
+
+# Every frame is resized to this before detection, annotation and writing, so all
+# pixel coordinates in the logs, the CSVs and src/tools/maze_roi.txt live in it.
+# maze_roi.txt records the resolution it was drawn at and is checked against this
+# at startup — changing it here without redrawing the ROI would silently shift the
+# polygon off the maze.
+DISPLAY_SIZE = (1176, 712)      # (width, height)
 from ultralytics import YOLO 
 import os
+import re
 import math
 import time
 import logging
@@ -380,7 +388,7 @@ class Tracker:
         self.save_video = '{}/{}_{}.mp4'.format(out, str(self.date), 'Rat' + self.rat) 
         self.vid_fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         
-        self.out = ThreadedVideoWriter('{}'.format(self.save_video), self.codec, self.vid_fps, (1176, 712))
+        self.out = ThreadedVideoWriter('{}'.format(self.save_video), self.codec, self.vid_fps, DISPLAY_SIZE)
         
         self.researcher_goal_timer = 0.0
         self.pickup_timer = 0.0
@@ -397,7 +405,7 @@ class Tracker:
         # --- GUI SETUP ---
         window_name = f"Tracker - Rat {self.rat}"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL) 
-        cv2.resizeWindow(window_name, 1176, 712) 
+        cv2.resizeWindow(window_name, *DISPLAY_SIZE)
         # -----------------
 
         with open(self.save, 'w') as file:
@@ -444,7 +452,7 @@ class Tracker:
             
             pbar.update(1)
 
-            self.disp_frame = cv2.resize(self.frame, (1176, 712))
+            self.disp_frame = cv2.resize(self.frame, DISPLAY_SIZE)
             
             self.t1 = time.time()
             self.cnn(self.disp_frame)
@@ -723,25 +731,76 @@ class Tracker:
         return min(self.all_researchers, key=lambda r: points_dist(r, point))
 
     def _load_maze_roi(self, _unused):
-        """Load src/tools/maze_roi.txt (committed to repo, shared by all users)."""
-        roi_path = Path(__file__).parent / "tools" / "maze_roi.txt"
+        """Load src/tools/maze_roi.txt (committed to repo, shared by all users).
+
+        The polygon restricts RAT detections only (see cnn()). Researchers are
+        deliberately left unrestricted: they work around the outside of the maze,
+        and the trial-start trigger, the 10s/30s force-end and the "rat is being
+        held" test all need them detected out there. That asymmetry is also why the
+        frame must not be masked before inference — pixels cannot be blacked out
+        per class.
+        """
+        # __file__ is src/tracker/TrackerYolov11.py; the file lives in src/tools/
+        roi_path = Path(_SRC_DIR) / "tools" / "maze_roi.txt"
         if roi_path.exists():
             try:
                 points = []
-                for line in roi_path.read_text().splitlines():
+                roi_res = None
+                # the header comment carries a cp1252 dash, so don't assume utf-8
+                text = roi_path.read_text(encoding="utf-8", errors="replace")
+                for line in text.splitlines():
                     line = line.strip()
-                    if not line or line.startswith("#"):
+                    if not line:
+                        continue
+                    if line.startswith("#"):
+                        # "... display resolution 1176x712" — what it was drawn at
+                        m = re.search(r"resolution\s+(\d+)\s*x\s*(\d+)", line, re.I)
+                        if m:
+                            roi_res = (int(m.group(1)), int(m.group(2)))
                         continue
                     x, y = line.split(",")
                     points.append((int(x), int(y)))
-                self.maze_roi = np.array(points, dtype=np.int32)
-                print(f"Maze ROI loaded: {len(points)} vertices from {roi_path}")
+                if len(points) < 3:
+                    raise ValueError(f"need at least 3 vertices, got {len(points)}")
+                roi = np.array(points, dtype=np.int32)
             except Exception as e:
-                print(f"Warning: could not load maze_roi.txt: {e}")
+                print(f"Warning: could not load {roi_path}: {type(e).__name__}: {e}")
+                print("  -> rat detection NOT spatially restricted.")
                 self.maze_roi = None
+                return
+            # Outside the try on purpose: a polygon that does not belong to this
+            # frame must stop the run, not be swallowed and silently ignored.
+            self._assert_roi_matches_frame(roi_path, roi_res, roi)
+            self.maze_roi = roi
+            print(f"Maze ROI loaded: {len(points)} vertices from {roi_path} "
+                  f"(frame {DISPLAY_SIZE[0]}x{DISPLAY_SIZE[1]})")
         else:
             self.maze_roi = None
-            print("No maze_roi.txt found — rat detection not spatially restricted.")
+            print(f"No maze_roi.txt at {roi_path} - rat detection not spatially restricted.")
+
+    @staticmethod
+    def _assert_roi_matches_frame(roi_path, roi_res, roi):
+        """Fail fast when maze_roi.txt was not drawn in the frame we detect in.
+
+        The ROI is raw pixel coordinates, so if DISPLAY_SIZE ever changes without
+        the polygon being redrawn it lands somewhere else on the maze and silently
+        throws away valid rat detections. That is far worse than not having an ROI
+        at all, and invisible in the output, so refuse to run instead.
+        """
+        w, h = DISPLAY_SIZE
+        if roi_res is not None and tuple(roi_res) != (w, h):
+            raise RuntimeError(
+                f"maze_roi.txt was drawn at {roi_res[0]}x{roi_res[1]} but frames are "
+                f"resized to {w}x{h} (DISPLAY_SIZE in {Path(__file__).name}).\n"
+                f"  Redraw the ROI at {w}x{h}, or restore DISPLAY_SIZE to "
+                f"{roi_res[0]}x{roi_res[1]}.  File: {roi_path}")
+        x_lo, y_lo = int(roi[:, 0].min()), int(roi[:, 1].min())
+        x_hi, y_hi = int(roi[:, 0].max()), int(roi[:, 1].max())
+        if x_lo < 0 or y_lo < 0 or x_hi >= w or y_hi >= h:
+            raise RuntimeError(
+                f"maze_roi.txt has vertices outside the {w}x{h} frame: "
+                f"x {x_lo}..{x_hi}, y {y_lo}..{y_hi}. "
+                f"The polygon does not belong to this video geometry.  File: {roi_path}")
 
     @staticmethod
     def _box_overlap_ratio(box_a, box_b):
@@ -1224,8 +1283,14 @@ class Tracker:
             if not rat_reached_goal and dist_to_goal_at_end <= self.goal_node_radius:
                 rat_reached_goal = True
 
-        self.pos_centroid = self.goal_location
-        self.centroid_list.append(self.pos_centroid)
+        # Close the track ON the goal only when the rat actually got there. Doing
+        # it unconditionally teleported the last logged position across the maze
+        # whenever a trial ended for any other reason (researcher pickup, timeout,
+        # scheduled end), which shows up as a jump back to the goal node in the
+        # raw trace and inflates the path length the distance score is built on.
+        if rat_reached_goal and self.goal_location is not None:
+            self.pos_centroid = self.goal_location
+            self.centroid_list.append(self.pos_centroid)
 
         # If the rat reached the goal, force-record the goal node in the path.
         # Without this, the node-detection loop in annotate_frame is skipped

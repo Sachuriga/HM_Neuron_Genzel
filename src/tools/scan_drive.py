@@ -23,15 +23,22 @@ Also flags cheap extra anomalies: cross-rat-named .rec under the wrong Rat
 folder, leftover copy temp files (.goutputstream-*, *.tmp), and empty recording
 folders.
 
+Outputs, all written to <root>:
+
+    drive_scan.xlsx            every table as a sheet (inventory / issues / files)
+                               plus one sheet per animal - open and copy-paste
+    drive_scan_report.md       the readable summary
+    drive_scan_inventory.md    the readable per-folder file listing
+
 Usage:
     python scan_drive.py --root <drive> [--rat Rat5] [--no-videos] [--deep]
                          [--workers 8] [--ffprobe /path/to/ffprobe]
+                         [--no-per-rat]
 """
 
 import os
 import re
 import sys
-import csv
 import argparse
 import subprocess
 from pathlib import Path
@@ -45,6 +52,30 @@ _RAT_RE = re.compile(r"[Rr]at\s*_?(\d+)")
 _TEMP_RE = re.compile(r"(^\.goutputstream-|\.tmp$|\.partial$|\.crdownload$)", re.I)
 
 PHASES = ("pre", "task", "post")
+
+# Folders never worth descending into when hunting for scattered session data.
+_SKIP_DIRS = {
+    "$recycle.bin", "system volume information", "windows", "winnt",
+    "program files", "program files (x86)", "programdata", "appdata",
+    "$windows.~bt", "$windows.~ws", "msocache", "recovery", "perflogs",
+    "node_modules", "__pycache__", ".git", ".svn", ".trash", ".trashes",
+    "library", "applications", "system",
+}
+
+# Folder-name fragments that mean "derived output, not raw acquisition" — the
+# preprocessing tree (HM_neuron_preprocess) holds DLC coordinates, LFP exports
+# and labelled videos for sessions whose raw copies live elsewhere. Scanning it
+# only turns up look-alikes of data we already have, so it is skipped whole.
+_SKIP_SUBSTRINGS = ("preprocess",)
+
+
+def skip_dir(name: str) -> bool:
+    """True if a directory should never be descended into during a scan — a known
+    junk/system folder, a dotfile, or anything in the preprocessing tree."""
+    n = name.lower()
+    if n in _SKIP_DIRS or name.startswith("."):
+        return True
+    return any(s in n for s in _SKIP_SUBSTRINGS)
 
 
 def _classify_phase(name):
@@ -62,6 +93,61 @@ def _classify_phase(name):
 def _rat_of(name):
     m = _RAT_RE.search(name)
     return int(m.group(1)) if m else None
+
+
+# A recording name embeds an acquisition timestamp: Rat5_HM_neurons_20260619_160501_post
+_REC_TS_RE = re.compile(r"\d{8}_(\d{6})")
+# Explicit "resumed after a crash" markers the acquisition software appends when
+# a recording is split: ..._post_part2, ..._awake_part2, ..._pre_2, ..._post2.
+_SPLIT_SUFFIX_RE = re.compile(r"(_part_?\d+|part_?\d+|_\d+)$", re.I)
+
+
+def _stem(name):
+    """A recording entry's name without a trailing .rec, for phase/split tests."""
+    n = name
+    for suf in (".rec",):
+        if n.lower().endswith(suf):
+            n = n[: -len(suf)]
+    return n
+
+
+def detect_session_splits(sess):
+    """Which phases of one session were recorded in more than one part.
+
+    When the acquisition PC crashes and the recording is restarted, that phase
+    ends up as two files/folders at different clock times — ``..._post`` plus
+    ``..._post_part2`` — or simply two recordings the same phase classifies to.
+    They are one session's data, not two, and certainly not separate sessions.
+
+    Returns ``{phase: count}`` for phases that have more than one part (so an
+    empty dict means "not split"). Looks only at the top-level recording entries,
+    which is where each phase's recording lives; reads names only, no contents."""
+    # phase -> set of distinct acquisition timestamps seen for it
+    times = {}
+    forced = set()                       # phases with an explicit _part2 marker
+    try:
+        entries = list(sess.iterdir())
+    except OSError:
+        return {}
+    for c in entries:
+        stem = _stem(c.name)
+        ph = _classify_phase(stem)
+        if ph is None:
+            continue
+        # Ignore camera folders (2026-06-22_11-11-46) and merged rollups, which
+        # are not themselves a recording of a phase.
+        if _CAM_DIR_RE.match(c.name) or c.name.lower().endswith("_merged.rec"):
+            continue
+        m = _REC_TS_RE.search(c.name)
+        ts = m.group(1) if m else stem            # fall back to the whole name
+        times.setdefault(ph, set()).add(ts)
+        if _SPLIT_SUFFIX_RE.search(stem):
+            forced.add(ph)
+    out = {}
+    for ph, tss in times.items():
+        if len(tss) > 1 or ph in forced:
+            out[ph] = max(len(tss), 2)            # at least 2 parts if forced
+    return out
 
 
 # ------------------------------------------------------------
@@ -182,6 +268,90 @@ def find_sessions(root):
     return out
 
 
+def list_drive_roots(include_system=False, include_network=False):
+    """Every mounted volume worth searching, as a list of Path.
+
+    Windows: real drive letters, filtered by GetDriveTypeW so CD/DVD and (by
+    default) network and system drives are left out. POSIX: the usual removable
+    mount points. The system drive is excluded unless asked for — scattered raw
+    data lives on the externals, and walking C:\\ is slow for nothing."""
+    roots = []
+    if sys.platform.startswith("win"):
+        import string
+        import ctypes
+        DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_REMOTE = 2, 3, 4
+        want = {DRIVE_REMOVABLE, DRIVE_FIXED}
+        if include_network:
+            want.add(DRIVE_REMOTE)
+        try:
+            k32 = ctypes.windll.kernel32
+            mask = k32.GetLogicalDrives()
+        except Exception:
+            k32, mask = None, None
+        sysdrive = os.environ.get("SystemDrive", "C:")[0].upper()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if mask is not None and not (mask >> i) & 1:
+                continue
+            p = Path(f"{letter}:\\")
+            if mask is None and not p.exists():
+                continue
+            if k32 is not None and k32.GetDriveTypeW(str(p)) not in want:
+                continue
+            if not include_system and letter == sysdrive:
+                continue
+            roots.append(p)
+    else:
+        for base in ("/Volumes", "/media", "/mnt", "/run/media"):
+            b = Path(base)
+            if not b.is_dir():
+                continue
+            try:
+                for child in sorted(b.iterdir()):
+                    if child.is_dir():
+                        # /media/<user>/<label> on many Linux setups
+                        subs = [g for g in child.iterdir() if g.is_dir()] \
+                            if base in ("/media", "/run/media") else []
+                        roots += subs or [child]
+            except OSError:
+                continue
+    return roots
+
+
+def find_sessions_deep(root, max_depth=6, on_dir=None, should_stop=None):
+    """Find every ``<Rat folder>/<YYYYMMDD>`` session under `root`, at any depth
+    up to `max_depth` — unlike find_sessions(), which only looks one or two
+    levels down from a known drive root.
+
+    Use this to locate data that was filed somewhere unexpected (a backup
+    subfolder, a per-experimenter folder, a nested copy). `on_dir` is called with
+    each directory visited (progress); `should_stop` is polled to allow cancel."""
+    root = Path(root)
+    out = []
+    stack = [(root, 0)]
+    while stack:
+        if should_stop is not None and should_stop():
+            break
+        d, depth = stack.pop()
+        if on_dir is not None:
+            on_dir(d)
+        try:
+            children = [c for c in d.iterdir() if c.is_dir()]
+        except OSError:
+            continue                       # unreadable / permission denied
+        for c in children:
+            if skip_dir(c.name):
+                continue
+            if _DATE_RE.match(c.name):
+                # a session folder — only counts if its parent names a rat, and
+                # never worth descending into either way
+                if _rat_of(d.name) is not None:
+                    out.append(c)
+                continue
+            if depth < max_depth:
+                stack.append((c, depth + 1))
+    return out
+
+
 def _classify_file(name):
     """File kind for the inventory: video / meta / merged / rec / logger / config / other."""
     n = name.lower()
@@ -209,6 +379,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
     mp4s, rec_files, phases, rec_folders, empty_dirs = [], [], set(), [], []
     n = {k: 0 for k in ("video", "meta", "rec", "merged", "logger", "config", "other")}
     bytes_video = bytes_ephys = 0
+    phase_bytes = {p: 0 for p in PHASES}   # ephys bytes per pre/task/post
 
     # Groups of files to inventory: (folder_label, files, is_recording). Some rats
     # (Rat3/Rat4) drop the camera videos LOOSE in the date folder (no timestamp
@@ -226,6 +397,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
 
     for folder, files, is_recording in groups:
         has_rec_here = False
+        here_ephys = 0                       # ephys bytes in this recording folder
         for p in files:
             cat = _classify_file(p.name)
             try:
@@ -239,6 +411,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
                 mp4s.append(p); bytes_video += max(size, 0)
             elif cat in ("rec", "merged", "logger"):
                 rec_files.append(p); bytes_ephys += max(size, 0); has_rec_here = True
+                here_ephys += max(size, 0)
                 if cat in ("rec", "merged"):
                     rno = _rat_of(p.name)
                     if rat_no is not None and rno is not None and rno != rat_no:
@@ -251,6 +424,7 @@ def scan_session(sess, issues, inv_rows, file_rows):
             ph = _classify_phase(folder)
             if ph:
                 phases.add(ph)
+                phase_bytes[ph] += here_ephys
             rec_folders.append(f"{folder}[{ph or '?'}]")
 
     has_ephys = bool(rec_files)
@@ -281,11 +455,13 @@ def scan_session(sess, issues, inv_rows, file_rows):
         n_video=n["video"], n_meta=n["meta"],
         n_rec=n["rec"], n_merged=n["merged"], n_logger=n["logger"],
         video_gb=round(bytes_video / 1e9, 2), ephys_gb=round(bytes_ephys / 1e9, 2),
+        phase_bytes=dict(phase_bytes),
         rec_folders="; ".join(rec_folders)))
     return has_ephys, mp4s
 
 
-def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cmd=None):
+def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cmd=None,
+        paste_per_rat=False):
     root = Path(root)
     sessions = find_sessions(root)
     if rat_filter:
@@ -330,7 +506,8 @@ def run(root, do_videos=True, deep=False, workers=8, rat_filter=None, ffprobe_cm
                                            path=str(p), detail=reason))
         issues += bad_videos
 
-    _write_inventory(root, inv_rows, file_rows)
+    _write_inventory(root, inv_rows, file_rows, per_rat=paste_per_rat)
+    _write_workbook(root, inv_rows, file_rows, issues, per_rat=paste_per_rat)
     _write_report(root, sessions, n_ephys, len(all_mp4s), bad_videos, issues, do_videos, inv_rows)
 
 
@@ -400,30 +577,116 @@ def _write_inventory_md(root, inv_rows, file_rows):
     return md_path
 
 
-def _write_inventory(root, inv_rows, file_rows):
-    """Readable inventory MD + per-session inventory CSV + full per-file CSV."""
-    _write_inventory_md(root, inv_rows, file_rows)
-    inv_path = root / "drive_scan_inventory.csv"
-    try:
-        with open(inv_path, "w", newline="", encoding="utf-8") as f:
-            cols = ["rat", "session", "has_ephys", "phases", "n_video", "n_meta",
-                    "n_rec", "n_merged", "n_logger", "video_gb", "ephys_gb", "rec_folders"]
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            for r in sorted(inv_rows, key=lambda x: (x["rat"], x["session"])):
-                w.writerow(r)
-    except OSError as e:
-        print(f"Could not write {inv_path} ({e}).")
+INV_COLS = ["rat", "session", "has_ephys", "phases", "n_video", "n_meta",
+            "n_rec", "n_merged", "n_logger", "video_gb", "ephys_gb", "rec_folders"]
 
-    files_path = root / "drive_scan_files.csv"
+
+ISSUE_COLS = ["category", "rat", "session", "path", "detail"]
+FILE_COLS = ["rat", "session", "folder", "file", "type", "size_bytes"]
+
+# Excel forbids these in a sheet name, and caps the name at 31 characters.
+_BAD_SHEET = re.compile(r"[\[\]:*?/\\]")
+
+
+def _sheet_name(name, taken):
+    """A legal, unique Excel sheet name for `name`."""
+    s = _BAD_SHEET.sub("_", str(name)).strip("'") or "sheet"
+    s = s[:31]
+    base, i = s, 2
+    while s.lower() in taken:
+        suffix = f"_{i}"
+        s = base[:31 - len(suffix)] + suffix
+        i += 1
+    taken.add(s.lower())
+    return s
+
+
+def _add_sheet(wb, title, cols, rows, taken):
+    """One table as a worksheet: bold frozen header, then the rows, columns sized
+    to their content so nothing has to be widened before reading or copying."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet(_sheet_name(title, taken))
+    ws.append(list(cols))
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    widths = [len(str(c)) for c in cols]
+    for r in rows:
+        vals = [r.get(c) for c in cols]
+        # dicts and lists have no cell representation; the phase_bytes column is
+        # the one that would otherwise raise here
+        vals = [v if v is None or isinstance(v, (str, int, float)) else str(v)
+                for v in vals]
+        ws.append(vals)
+        for i, v in enumerate(vals):
+            widths[i] = max(widths[i], min(len(str(v)) if v is not None else 0, 60))
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w + 2
+    return ws
+
+
+def write_xlsx(path, sheets):
+    """Write tables to an .xlsx. `sheets` is [(title, cols, rows-as-dicts), ...].
+
+    Shared with scan_drive_gui so its export buttons produce the same workbook
+    styling as the scan itself. Returns (ok, message).
+    """
     try:
-        with open(files_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["rat", "session", "folder", "file", "type", "size_bytes"])
-            w.writeheader()
-            for r in file_rows:
-                w.writerow(r)
+        from openpyxl import Workbook
+    except ImportError:
+        return False, "openpyxl is not installed (pip install openpyxl)."
+    wb = Workbook()
+    wb.remove(wb.active)
+    taken = set()
+    for title, cols, rows in sheets:
+        _add_sheet(wb, title, cols, rows, taken)
+    try:
+        wb.save(path)
     except OSError as e:
-        print(f"Could not write {files_path} ({e}).")
+        return False, str(e)
+    return True, str(path)
+
+
+def _write_workbook(root, inv_rows, file_rows, issues, per_rat=False):
+    """Every table of the scan in one .xlsx, so the results can be opened and
+    copied straight into a spreadsheet without an import step. The CSV/TSV files
+    stay as they are for anything that reads them programmatically."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("openpyxl not installed - skipping drive_scan.xlsx (pip install openpyxl).")
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    xlsx = root / "drive_scan.xlsx"
+    wb = Workbook()
+    wb.remove(wb.active)                       # drop the default empty sheet
+    taken = set()
+    inv_sorted = sorted(inv_rows, key=lambda x: (x["rat"], x["session"]))
+    _add_sheet(wb, "inventory", INV_COLS + ["scanned_at"],
+               [{**r, "scanned_at": ts} for r in inv_sorted], taken)
+    _add_sheet(wb, "issues", ISSUE_COLS, issues, taken)
+    _add_sheet(wb, "files", FILE_COLS, file_rows, taken)
+    if per_rat:
+        by_rat = {}
+        for r in inv_sorted:
+            by_rat.setdefault(r["rat"], []).append(r)
+        for rat, rows in sorted(by_rat.items()):
+            _add_sheet(wb, rat, INV_COLS + ["scanned_at"],
+                       [{**r, "scanned_at": ts} for r in rows], taken)
+    try:
+        wb.save(xlsx)
+    except OSError as e:
+        print(f"Could not write {xlsx} ({e}).")
+        return
+    print(f"Excel workbook: {xlsx}")
+    print(f"  sheets: {', '.join(wb.sheetnames)}")
+
+
+def _write_inventory(root, inv_rows, file_rows, per_rat=False):
+    """The readable per-folder file listing. Every tabular output now lives in
+    drive_scan.xlsx, written separately by _write_workbook."""
+    _write_inventory_md(root, inv_rows, file_rows)
 
 
 def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_videos, inv_rows=None):
@@ -431,18 +694,6 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
              "empty-folder", "leftover-temp", "stat-failed", "scan-failed"]
     by_cat = {c: [i for i in issues if i["category"] == c] for c in order}
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # CSV (machine-readable)
-    csv_path = root / "drive_scan_issues.csv"
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["category", "rat", "session", "path", "detail"])
-            w.writeheader()
-            for c in order:
-                for i in by_cat[c]:
-                    w.writerow(i)
-    except OSError as e:
-        print(f"Could not write {csv_path} ({e}).")
 
     # Markdown report (human-readable)
     titles = {
@@ -481,7 +732,7 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
                          f"| {x['ephys_gb']} | {x['video_gb']} |")
         lines.append("")
     lines.append("_Readable per-file listing: **drive_scan_inventory.md** · "
-                 "spreadsheets: drive_scan_inventory.csv (per session) / drive_scan_files.csv (every file)_")
+                 "every table as a sheet: **drive_scan.xlsx**_")
     lines.append("")
 
     for c in order:
@@ -510,8 +761,7 @@ def _write_report(root, sessions, n_ephys, n_videos, bad_videos, issues, did_vid
             print(f"  {c:15s}: {len(by_cat[c])}")
     print(f"Report:    {md_path}")
     print(f"Inventory: {root / 'drive_scan_inventory.md'}  (readable file listing)")
-    print(f"Issues:    {csv_path}")
-    print(f"CSVs:      drive_scan_inventory.csv (per session) / drive_scan_files.csv (every file)")
+    print(f"Excel:     {root / 'drive_scan.xlsx'}  (inventory / issues / files + one sheet per animal)")
     print("=" * 56)
 
 
@@ -524,10 +774,13 @@ if __name__ == "__main__":
     ap.add_argument("--deep", action="store_true", help="fully decode each video (slow) instead of a header check.")
     ap.add_argument("--workers", type=int, default=8, help="parallel video checks (default 8).")
     ap.add_argument("--ffprobe", default=None, help="path to ffprobe (else FFPROBE_CMD / FFMPEG_CMD sibling / PATH).")
+    ap.add_argument("--no-per-rat", dest="paste_per_rat", action="store_false",
+                    help="skip the per-animal sheets in the workbook.")
     args = ap.parse_args()
     try:
         run(args.root, do_videos=args.videos, deep=args.deep, workers=args.workers,
-            rat_filter=args.rat, ffprobe_cmd=args.ffprobe)
+            rat_filter=args.rat, ffprobe_cmd=args.ffprobe,
+            paste_per_rat=args.paste_per_rat)
     except Exception as e:
         import traceback
         print(f"[scan-drive] Failed: {e}")

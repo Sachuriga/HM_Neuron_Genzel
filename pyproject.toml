@@ -34,6 +34,9 @@ gpu = [
     "deeplabcut",
     "spikeinterface[full]", "kilosort", "neuroconv", "ephyviewer",
     "probeinterface", "pynwb", "neo", "numba", "mountainsort4",
+    # NOTE: mountainsort4 needs isosplit5, a C++ extension. On Windows you MUST
+    # install "Microsoft C++ Build Tools" (Desktop development with C++) first,
+    # or the isosplit5 wheel build fails with "Microsoft Visual C++ 14.0 required".
     "numpy<2", "scipy", "pandas", "matplotlib", "networkx", "shapely", "polars",
     "h5py", "zarr<3", "numcodecs<0.13", "faiss-cpu", "scikit-learn", "openpyxl",
     "huggingface_hub", "tqdm", "requests", "PyYAML", "rich",
