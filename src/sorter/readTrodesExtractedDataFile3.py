@@ -7,6 +7,43 @@ import numpy as np
 import re
 from sys import argv
 # Main function
+def trodesBinaryLayout(filename):
+    """Where the samples start and how they are laid out, without reading any.
+
+    Trodes writes an ASCII settings header followed by plain interleaved samples,
+    so the payload can be handed straight to a file-backed reader instead of being
+    loaded. Returns dict(offset, dtype, n_channels, n_samples), or None when the
+    record is not a single interleaved field — the caller should then fall back to
+    the structured reader.
+    """
+    with open(filename, 'rb') as f:
+        if f.readline().decode('ascii').strip() != '<Start settings>':
+            raise Exception("Settings format not supported")
+        fieldsText = {}
+        for line in f:
+            line = line.decode('ascii').strip()
+            if line == '<End settings>':
+                break
+            vals = line.split(': ')
+            fieldsText.update({vals[0].lower(): vals[1]})
+        dt = parseFields(fieldsText['fields'])
+        offset = f.tell()
+
+    # Only a lone "<voltage N*int16>" record is a plain interleaved block. Anything
+    # else (a time field, mixed types) has gaps a flat reader would misinterpret.
+    if dt.names is None or len(dt.names) != 1:
+        return None
+    sub, sub_offset = dt.fields[dt.names[0]][0], dt.fields[dt.names[0]][1]
+    if sub_offset != 0 or sub.subdtype is None:
+        return None
+    base, shape = sub.subdtype
+    if len(shape) != 1:
+        return None
+    n_bytes = os.path.getsize(filename) - offset
+    return {'offset': offset, 'dtype': base, 'n_channels': int(shape[0]),
+            'n_samples': int(n_bytes // dt.itemsize)}
+
+
 def readTrodesExtractedDataFile(filename, memmap=False):
     """Read a Trodes extracted .dat file.
 

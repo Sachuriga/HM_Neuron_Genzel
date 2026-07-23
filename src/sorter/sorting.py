@@ -305,7 +305,7 @@ import argparse
 
 # Ensure the Trodes extractor is available
 try:
-    from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile
+    from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
 except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 
@@ -429,26 +429,42 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
 
     # 2. LOAD DATA (concatenate split parts of the phase, in acquisition order)
     #
-    # Memory-mapped, never read whole: 128 channels of int16 at 30 kHz is ~27 GiB
-    # an hour, so np.fromfile + np.concatenate needed the sum of the parts PLUS a
-    # copy, and simply failed to allocate. The samples stay on disk and the sorter
-    # streams them chunk by chunk.
-    print("Memory-mapping data..." if len(paths) == 1
-          else f"Memory-mapping {len(paths)} split parts of this phase:")
-    parts = []
-    for p in paths:
-        v = readTrodesExtractedDataFile(str(p), memmap=True)['data']['voltage']
-        if len(paths) > 1:
-            print(f"  + {p.parent.name}  ({v.shape[0]} samples)")
-        parts.append(v)
+    # Read straight from the files, never into RAM: 128 channels of int16 at 30 kHz
+    # is ~27 GiB an hour, and a 5.5 h phase is ~144 GiB, so np.fromfile +
+    # np.concatenate could not allocate.
+    #
+    # It has to be a file-backed extractor rather than NumpyRecording wrapping a
+    # memmap. NumpyRecording keeps the array in its _kwargs, and SpikeInterface
+    # clones a recording (set_probe, preprocessing, ...) with deepcopy of those
+    # kwargs — which reads the whole memmap back into memory. BinaryRecording
+    # stores only the path and offset, so cloning stays free.
+    print("Opening data..." if len(paths) == 1
+          else f"Opening {len(paths)} split parts of this phase:")
+    layouts = [trodesBinaryLayout(str(p)) for p in paths]
 
-    total_samples = sum(v.shape[0] for v in parts)
+    recs = []
+    for p, lay in zip(paths, layouts):
+        if lay is None:
+            # Unexpected record layout: fall back to the structured reader. Costly
+            # in memory, but correct for files this code cannot map flatly.
+            v = readTrodesExtractedDataFile(str(p), memmap=True)['data']['voltage']
+            n_samp, n_ch = v.shape[0], v.shape[1]
+            recs.append(si.NumpyRecording(traces_list=[v], sampling_frequency=fs))
+        else:
+            n_samp, n_ch = lay['n_samples'], lay['n_channels']
+            recs.append(si.read_binary(
+                str(p), sampling_frequency=fs, dtype=lay['dtype'],
+                num_channels=n_ch, file_offset=lay['offset'], time_axis=0))
+        if len(paths) > 1:
+            print(f"  + {p.parent.name}  ({n_samp} samples)")
+
+    total_samples = sum(r.get_num_samples() for r in recs)
+    n_ch = recs[0].get_num_channels()
     print(f"  = {total_samples} samples total ({total_samples / fs / 60:.1f} min, "
-          f"{total_samples * parts[0].shape[1] * 2 / 2**30:.1f} GiB on disk)")
+          f"{total_samples * n_ch * 2 / 2**30:.1f} GiB on disk)")
 
     # 3. CREATE SPIKEINTERFACE RECORDING
     print("Creating recording object...")
-    recs = [si.NumpyRecording(traces_list=[v], sampling_frequency=fs) for v in parts]
     # Lazy time-concatenation: one continuous segment spanning the parts, without
     # ever materialising them. Equivalent to the old np.concatenate, minus the RAM.
     rec = recs[0] if len(recs) == 1 else si.concatenate_recordings(recs)
