@@ -254,7 +254,7 @@ def _tool(var):
 
 
 def pick_vcodec(size=(1920, 1080)):
-    """(codec, args) for compression: GPU when any GPU path works, else CPU."""
+    """Encoder for compression: GPU when any GPU path works, else CPU."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
     from tools import vcodec
     return vcodec.select(mode="quality", size=size)
@@ -494,10 +494,13 @@ def compress_all_op_videos(op_dirs):
     # out now than after re-encoding half the folder.
     sizes = [s for _, vids in todo for s in map(_video_size, vids) if s]
     probe_size = max(sizes, key=lambda s: s[0] * s[1]) if sizes else (1920, 1080)
-    vcodec, vargs = pick_vcodec(size=probe_size)
+    enc = pick_vcodec(size=probe_size)
+    # VAAPI encodes from a hardware surface: device before the input, frames
+    # uploaded by a filter. Everything else takes ordinary software frames.
+    vf_args = ["-vf", enc.filter_chain] if enc.filter_chain else []
 
     print("\n" + "=" * 56)
-    print(f"[MASTER] STEP 6 — Compression (codec: {vcodec} {' '.join(vargs)}, probed at "
+    print(f"[MASTER] STEP 6 — Compression (codec: {enc.codec} {' '.join(enc.args)}, probed at "
           f"{probe_size[0]}x{probe_size[1]}) over {len(op_dirs)} op folder(s), all videos, "
           f"running LAST...")
     print("=" * 56)
@@ -512,14 +515,14 @@ def compress_all_op_videos(op_dirs):
                 temp_file.unlink()
             print(f"\n[COMPRESS] {op.name}/{video.name} ...")
             rc = run([ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-                      "-stats", "-i", video, "-c:v", vcodec, *vargs,
-                      "-c:a", "copy", temp_file])
+                      "-stats", *enc.global_args, "-i", video, *vf_args,
+                      "-c:v", enc.codec, *enc.args, "-c:a", "copy", temp_file])
             if rc == 0:
                 shutil.move(str(temp_file), str(video))
                 print(f"[SUCCESS] Compressed: {video}")
                 n_ok += 1
             else:
-                print(f"[ERROR] FFmpeg failed for {video} (codec '{vcodec}'). "
+                print(f"[ERROR] FFmpeg failed for {video} (codec '{enc.codec}'). "
                       f"Set FFMPEG_VCODEC to force another encoder, e.g. libx264.")
                 if temp_file.exists():
                     temp_file.unlink()

@@ -32,7 +32,7 @@ def ffmpeg(cmd):
 
 
 def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False, glob=GLOB_STR_NEW, n_videos=None,
-                 encoder=None):
+                 encoder=None, hwaccel=None):
     path = Path(path).resolve()
     if not path.exists():
         print("Can't find requested path! [{}]!".format(path), file=sys.stderr)
@@ -59,24 +59,35 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
     cw = frame_width - 2 * crop_x
     ch = frame_height - cy
 
+    # align to 16px block
+    canvas_w = math.ceil(cw * num_cols / 16) * 16
+    canvas_h = math.ceil(ch * num_rows / 16) * 16
+
+    # Probe at the real canvas size: an old GPU can manage 1080p and still refuse
+    # something this wide.
+    if encoder is None:
+        encoder = vcodec.select(mode='bitrate', size=(canvas_w, canvas_h))
+
     cmd = ''
-    cmd += 'ffmpeg -y ' #'ffmpeg -y ' #'ffmpeg -y -hwaccel nvdec '
+    cmd += f'{os.environ.get("FFMPEG_CMD", "ffmpeg")} -y '
+    # VAAPI needs its device opened before the inputs.
+    if encoder.global_args:
+        cmd += ' '.join(encoder.global_args) + ' '
 
     if quiet:
         cmd += '-hide_banner -loglevel info '
     if no_stats:
         cmd += '-nostats '
 
-
-    # inputs
-    cmd += ' '.join([f'-r 30 -i {vp.as_posix()}' for vp in videos])
+    # inputs — decoding 12 h264 streams is a big share of the CPU load, so offload
+    # it too when the hardware can take all of them at once.
+    hw = ' '.join(vcodec.select_decoder(videos)) if hwaccel is None else ' '.join(hwaccel)
+    hw = hw + ' ' if hw else ''
+    cmd += ' '.join([f'{hw}-r 30 -i {vp.as_posix()}' for vp in videos])
 
     # canvas
     cmd += ' -filter_complex "'
 
-    # align to 16px block
-    canvas_w = math.ceil(cw * num_cols / 16) * 16
-    canvas_h = math.ceil(ch * num_rows / 16) * 16
     cmd += f'nullsrc=size={canvas_w}x{canvas_h} [canvas0];'
 
     # position_assignment
@@ -96,15 +107,19 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
             s += f'[canvas{n + 1}];'
         cmd += s
 
+    # VAAPI encodes from a hardware surface, so the finished canvas has to be
+    # uploaded at the end of the graph.
+    if encoder.filter_chain:
+        cmd = cmd.rstrip() + ',' + encoder.filter_chain
+
     cmd += '" '
 
     cmd += f'-t {dur}' if dur else ''
 
-    # encoding settings — probe at the real canvas size, since an old GPU may encode
-    # 1080p fine and still refuse something this wide.
-    if encoder is None:
-        encoder = vcodec.select(mode='bitrate', size=(canvas_w, canvas_h))
-    cmd += '-c:v {} {} -pix_fmt yuv420p -r 30 '.format(encoder[0], ' '.join(encoder[1]))
+    # encoding settings. -pix_fmt would fight the hwupload chain, so it is only for
+    # the software-surface encoders.
+    pix = '' if encoder.filter_chain else '-pix_fmt yuv420p '
+    cmd += '-c:v {} {} {}-r 30 '.format(encoder.codec, ' '.join(encoder.args), pix)
 
     outpath = videos[0].parent / 'stitched.mp4'
     cmd += f'{outpath}'
@@ -114,7 +129,7 @@ def _main(cli_args):
     paths = [Path(p) for p in cli_args.paths]
     # An explicit -c skips probing entirely; otherwise make_command probes once and
     # the result is cached in tools.vcodec for the remaining paths.
-    encoder = (cli_args.vcodec, ['-b:v', '4000k']) if cli_args.vcodec else None
+    encoder = vcodec.Encoder(cli_args.vcodec, ['-b:v', '4000k'], [], '') if cli_args.vcodec else None
     for path in paths:
         print('Joining "{}"'.format(str(path)))
         command = make_command(path, crop_x=104, crop_y=91, quiet=True, glob=cli_args.glob, n_videos=cli_args.n_videos,
