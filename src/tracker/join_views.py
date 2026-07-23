@@ -13,6 +13,7 @@ import argparse
 from pathlib import Path
 import math
 import shlex
+import subprocess as sp
 
 GLOB_STR_OLD = '*_eye??.mp4'
 GLOB_STR_NEW = 'eye??_*.mp4'
@@ -26,9 +27,13 @@ from tools import vcodec
 
 
 def ffmpeg(cmd):
-    return os.system(cmd)
-    # p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
-    # p.wait()
+    """Run ffmpeg from an argument list (no shell), returning its exit code."""
+    return sp.run([str(c) for c in cmd]).returncode
+
+
+def show(cmd):
+    """The command as you would type it, for logs and --dry_run."""
+    return sp.list2cmdline(cmd) if os.name == 'nt' else shlex.join(str(c) for c in cmd)
 
 
 def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False, glob=GLOB_STR_NEW, n_videos=None,
@@ -68,27 +73,27 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
     if encoder is None:
         encoder = vcodec.select(mode='bitrate', size=(canvas_w, canvas_h))
 
-    cmd = ''
-    cmd += f'{os.environ.get("FFMPEG_CMD", "ffmpeg")} -y '
+    # An argument list, never a shell string: FFMPEG_CMD is routinely a Windows
+    # path with spaces ("C:\Users\Genzel Lab\..."), and the command also contains
+    # its own quotes around the filter graph, so cmd.exe strips the wrong pair and
+    # the whole thing falls apart. A list sidesteps quoting on both platforms.
+    cmd = [os.environ.get('FFMPEG_CMD', 'ffmpeg'), '-y']
     # VAAPI needs its device opened before the inputs.
-    if encoder.global_args:
-        cmd += ' '.join(encoder.global_args) + ' '
+    cmd += list(encoder.global_args)
 
     if quiet:
-        cmd += '-hide_banner -loglevel info '
+        cmd += ['-hide_banner', '-loglevel', 'info']
     if no_stats:
-        cmd += '-nostats '
+        cmd += ['-nostats']
 
     # inputs — decoding 12 h264 streams is a big share of the CPU load, so offload
     # it too when the hardware can take all of them at once.
-    hw = ' '.join(vcodec.select_decoder(videos)) if hwaccel is None else ' '.join(hwaccel)
-    hw = hw + ' ' if hw else ''
-    cmd += ' '.join([f'{hw}-r 30 -i {vp.as_posix()}' for vp in videos])
+    hw = list(vcodec.select_decoder(videos) if hwaccel is None else hwaccel)
+    for vp in videos:
+        cmd += hw + ['-r', '30', '-i', vp.as_posix()]
 
     # canvas
-    cmd += ' -filter_complex "'
-
-    cmd += f'nullsrc=size={canvas_w}x{canvas_h} [canvas0];'
+    filt = f'nullsrc=size={canvas_w}x{canvas_h} [canvas0];'
 
     # position_assignment
     for n in range(len(videos)):
@@ -96,7 +101,7 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
         flips = ',hflip,vflip' if n >= num_cols else ''
 
         crop_str = f',crop=w={cw}:h={ch}:x={cx}:y={cy if n >= num_cols else 0}' if do_crop else ''
-        cmd += f'[{n}:v] setpts=PTS-STARTPTS{flips}{crop_str} [r{n // num_cols}c{n % num_cols}];'
+        filt += f'[{n}:v] setpts=PTS-STARTPTS{flips}{crop_str} [r{n // num_cols}c{n % num_cols}];'
 
     # pasting
     for n in range(len(videos)):
@@ -105,25 +110,28 @@ def make_command(path, crop_x=0, crop_y=0, dur=None, quiet=True, no_stats=False,
         s = f'[canvas{n}][r{row}c{col}] overlay=shortest=1:x={col * cw}:y={row * ch} '
         if n < len(videos) - 1:
             s += f'[canvas{n + 1}];'
-        cmd += s
+        filt += s
 
     # VAAPI encodes from a hardware surface, so the finished canvas has to be
     # uploaded at the end of the graph.
     if encoder.filter_chain:
-        cmd = cmd.rstrip() + ',' + encoder.filter_chain
+        filt = filt.rstrip() + ',' + encoder.filter_chain
 
-    cmd += '" '
+    cmd += ['-filter_complex', filt]
 
-    cmd += f'-t {dur}' if dur else ''
+    if dur:
+        cmd += ['-t', str(dur)]
 
     # encoding settings. -pix_fmt would fight the hwupload chain, so it is only for
     # the software-surface encoders.
-    pix = '' if encoder.filter_chain else '-pix_fmt yuv420p '
-    cmd += '-c:v {} {} {}-r 30 '.format(encoder.codec, ' '.join(encoder.args), pix)
+    cmd += ['-c:v', encoder.codec] + list(encoder.args)
+    if not encoder.filter_chain:
+        cmd += ['-pix_fmt', 'yuv420p']
+    cmd += ['-r', '30']
 
-    outpath = videos[0].parent / 'stitched.mp4'
-    cmd += f'{outpath}'
+    cmd += [str(videos[0].parent / 'stitched.mp4')]
     return cmd
+
 
 def _main(cli_args):
     paths = [Path(p) for p in cli_args.paths]
@@ -139,11 +147,9 @@ def _main(cli_args):
             print('Command generation for video set "{}" encountered error, stopping.'.format(path), file=sys.stderr)
             return 1
 
-        print(command)
-        if cli_args.dry_run:
-            print(command)
-        else:
-            if ffmpeg(command):  # shlex.split(command)
+        print(show(command))
+        if not cli_args.dry_run:
+            if ffmpeg(command):
                 print('ffmpeg failed for video set "{}", stopping.'.format(path), file=sys.stderr)
                 return 1
 

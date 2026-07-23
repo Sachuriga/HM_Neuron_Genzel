@@ -469,9 +469,27 @@ def sequential_targets(root, ops):
     return [(op, op) for op in seen.values()]
 
 
+def _ffprobe_cmd():
+    """ffprobe path: FFPROBE_CMD, else next to FFMPEG_CMD, else bare 'ffprobe'.
+
+    Setting FFMPEG_CMD to a full path usually means that install is NOT on PATH,
+    so bare 'ffprobe' would not resolve either — and a silent miss here downgrades
+    the encoder probe to a guessed frame size."""
+    explicit = os.environ.get("FFPROBE_CMD", "")
+    if explicit:
+        return explicit
+    ffmpeg = os.environ.get("FFMPEG_CMD", "")
+    if ffmpeg:
+        p = Path(ffmpeg)
+        sibling = p.with_name("ffprobe" + p.suffix)
+        if sibling.exists():
+            return str(sibling)
+    return "ffprobe"
+
+
 def _video_size(video):
     """(w, h) of `video` via ffprobe, or None if it cannot be read."""
-    ffprobe = os.environ.get("FFPROBE_CMD", "ffprobe")
+    ffprobe = _ffprobe_cmd()
     try:
         p = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(video)],
