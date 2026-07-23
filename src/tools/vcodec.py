@@ -31,7 +31,9 @@ Environment overrides:
                      build whose nvenc matches an older driver)
     FFPROBE_CMD      path to ffprobe
     FFMPEG_VCODEC    force an encoder, e.g. h264_nvenc / libx264
-    FFMPEG_HWACCEL   force decode accel ('none' disables, or cuda/d3d11va/...)
+    FFMPEG_HWACCEL   decode accel. Default is software decode, which measured
+                     faster on these small eye frames; 'auto' probes the
+                     accelerators, or name one (cuda/d3d11va/vaapi/...) to force it
 """
 import os
 import sys
@@ -291,24 +293,33 @@ def probe_decode(videos, args):
 
 
 def select_decoder(videos, verbose=True):
-    """['-hwaccel', 'cuda'] to prepend to each input, or [] for software decode.
+    """Input args for decoding: [] for software (the default), or ['-hwaccel', ...].
 
-    Twelve concurrent h264 decodes are a large part of why the CPU sits at 100%
-    during a stitch, and unlike the encoder this stays true even when nvenc works."""
-    forced = os.environ.get('FFMPEG_HWACCEL', '')
-    if forced.lower() in ('none', 'no', '0', 'off'):
+    Software decode is the default because it measured FASTER on the real job. On a
+    GTX 1660 SUPER stitching twelve 600x800 streams: 1.23x software vs 0.991x with
+    '-hwaccel cuda -threads 4'. The eye frames are small, so nvdec plus the GPU->CPU
+    readback of every frame costs more than libavcodec spends decoding them. Encode
+    is a different story — the 2352x1424 output is big, and nvenc is a clear win.
+
+    Set FFMPEG_HWACCEL=auto to probe the accelerators anyway (worthwhile if the
+    frame size ever grows), or name one to force it. Measure before trusting either:
+        join_views.py -d 60 <folder>            # whatever is configured
+        FFMPEG_HWACCEL=cuda join_views.py -d 60 <folder>
+    and compare ffmpeg's "speed=" figure."""
+    forced = os.environ.get('FFMPEG_HWACCEL', '').strip()
+    if not forced or forced.lower() in ('none', 'no', '0', 'off'):
         return []
     key = ('dec', tuple(str(v) for v in videos), forced)
     if key in _cache:
         return _cache[key]
 
-    if forced:
-        # Keep the thread ladder for a forced accel; the surface cap applies just
-        # the same, and the point of forcing is to get that accel to work.
+    if forced.lower() == 'auto':
+        ladder = _decode_ladder()
+    else:
+        # Keep the thread ladder for a named accel; the nvdec surface cap applies
+        # just the same, and the point of naming one is to get it working.
         ladder = [['-hwaccel', forced]] + [['-hwaccel', forced, '-threads', n]
                                            for n in ('4', '2', '1')]
-    else:
-        ladder = _decode_ladder()
     for args in ladder:
         if probe_decode(videos, args):
             if verbose:

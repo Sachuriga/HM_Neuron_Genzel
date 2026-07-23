@@ -13,6 +13,7 @@ import argparse
 from pathlib import Path
 import math
 import shlex
+import contextlib
 import subprocess as sp
 
 GLOB_STR_OLD = '*_eye??.mp4'
@@ -23,12 +24,19 @@ GLOB_STR_NEW = 'eye??_*.mp4'
 _SRC_DIR = str(Path(__file__).resolve().parent.parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
-from tools import vcodec
+from tools import vcodec, gpuslot
 
 
 def ffmpeg(cmd):
-    """Run ffmpeg from an argument list (no shell), returning its exit code."""
-    return sp.run([str(c) for c in cmd]).returncode
+    """Run ffmpeg from an argument list (no shell), returning its exit code.
+
+    Ctrl-C reaches ffmpeg too, so report it as an interrupt rather than letting a
+    KeyboardInterrupt traceback out of subprocess.wait()."""
+    try:
+        return sp.run([str(c) for c in cmd]).returncode
+    except KeyboardInterrupt:
+        print('\nInterrupted.', file=sys.stderr)
+        return 130
 
 
 def show(cmd):
@@ -143,18 +151,25 @@ def _main(cli_args):
     encoder = vcodec.Encoder(cli_args.vcodec, ['-b:v', '4000k'], [], '') if cli_args.vcodec else None
     for path in paths:
         print('Joining "{}"'.format(str(path)))
-        command = make_command(path, crop_x=104, crop_y=91, dur=cli_args.duration, quiet=True, glob=cli_args.glob,
-                               n_videos=cli_args.n_videos, encoder=encoder)
+        # Hold a GPU encode slot across the probe AND the encode. The card allows
+        # only a few NVENC sessions, and with one worker per folder the losers used
+        # to give up and spend the whole run on the CPU — then sit there slow while
+        # the winners finished and left sessions idle. --dry_run takes no slot.
+        keeper = contextlib.nullcontext(True) if cli_args.dry_run else gpuslot.hold()
+        with keeper:
+            command = make_command(path, crop_x=104, crop_y=91, dur=cli_args.duration, quiet=True,
+                                   glob=cli_args.glob, n_videos=cli_args.n_videos, encoder=encoder)
 
-        if not command:
-            print('Command generation for video set "{}" encountered error, stopping.'.format(path), file=sys.stderr)
-            return 1
-
-        print(show(command))
-        if not cli_args.dry_run:
-            if ffmpeg(command):
-                print('ffmpeg failed for video set "{}", stopping.'.format(path), file=sys.stderr)
+            if not command:
+                print('Command generation for video set "{}" encountered error, stopping.'.format(path),
+                      file=sys.stderr)
                 return 1
+
+            print(show(command))
+            if not cli_args.dry_run:
+                if ffmpeg(command):
+                    print('ffmpeg failed for video set "{}", stopping.'.format(path), file=sys.stderr)
+                    return 1
 
 
 if __name__ == '__main__':
