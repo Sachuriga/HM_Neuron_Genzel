@@ -245,7 +245,12 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
         compute_pc_features=True,
         compute_amplitudes=True,
         remove_if_exists=True,
-        copy_binary=True, # CHANGED TO TRUE: Necessary so we can delete the intermediate binary folder
+        # copy_binary=False: do NOT duplicate the recording into phy_export. The
+        # preprocessed data is already ~27 GiB/hour (a multi-hour phase is >100 GiB),
+        # so copying it here doubled the on-disk footprint and hit "No space left".
+        # Phy's params.py dat_path instead points at the existing processed_binary,
+        # which the cleanup step below deliberately keeps so the raw-trace view works.
+        copy_binary=False,
         **job_kwargs
     )
 
@@ -273,8 +278,13 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
     # 10. CLEANUP INTERMEDIATE FILES
     if cleanup:
         print("\nCleaning up intermediate files...")
+        # processed_binary is KEPT on purpose: with copy_binary=False above, Phy's
+        # dat_path references it for the raw-trace view. Deleting it would leave Phy
+        # pointing at a missing file. It is the preprocessed data, not a duplicate,
+        # so this is the minimum kept to make Phy fully usable.
+        keep = {"phy_export", "processed_binary"}
         for item in output_dir.iterdir():
-            if item.name != "phy_export":
+            if item.name not in keep:
                 try:
                     if item.is_dir():
                         shutil.rmtree(item)
@@ -282,7 +292,8 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
                         item.unlink()
                 except Exception as e:
                     print(f"Could not delete {item.name}: {e}")
-        print(f"Cleanup complete! Only phy_export remains.")
+        print("Cleanup complete! Kept: phy_export and processed_binary "
+              "(the latter backs Phy's raw-trace view).")
 
     print(f"Done processing {file_stem}!")
     print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
