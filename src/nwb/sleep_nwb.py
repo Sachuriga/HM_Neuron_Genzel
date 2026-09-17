@@ -58,7 +58,8 @@ STATES_PREFIX = "states_"
 EVENTS_PREFIX = "events_"
 
 # HM state codes, shared with the editor (1 WAKE / 3 NREM / 5 REM; 0 unscored).
-STATE_NAMES = {0: "none", 1: "awake", 3: "NREM", 5: "REM"}
+STATE_NAMES = {0: "none", 1: "awake", 3: "NREM", 4: "intermediate",
+               5: "REM"}   # 4 = the NREM->REM transition, scored by hand
 
 
 def _slug(name: str) -> str:
