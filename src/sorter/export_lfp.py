@@ -337,10 +337,11 @@ def compute_awakeness(lfp_array, emg_1d, fs, best_ch_idx, epoch_s=1):
 
 STEPS = [
     "Find & load LFP .dat files",
-    "Convert to .npy (per channel + combined)",
+    "Assemble the LFP matrix",
     "Select EMG channel",
     "Select cleanest EEG channels",
     "Compute awakeness",
+    "Package into the session NWB",
 ]
 
 
@@ -377,9 +378,23 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
     op = Path(output_folder)
     # The phase postfix comes from the RECORDING name (ip side) — op folders are
     # named op1/op6 and carry none.
-    nwb_path = snwb.find_session_nwb(op) or (
-        op / snwb.session_nwb_name(pfx, session_name or (
-            boundaries[0]["name"] if boundaries else None)))
+    expected = snwb.session_nwb_name(pfx, session_name or (
+        boundaries[0]["name"] if boundaries else None))
+    nwb_path = snwb.find_session_nwb(op)
+    if nwb_path is not None and nwb_path.name != expected:
+        # An NWB left by an earlier run, named before the phase postfix was part
+        # of the name. Its contents are this session's, so bring the name in
+        # line rather than leaving a stale one behind. Nothing refers to it by
+        # name (everything locates it by glob), so this is safe.
+        target = op / expected
+        if target.exists():
+            tqdm.write(f"  ⚠ both {nwb_path.name} and {expected} exist — "
+                       f"using {nwb_path.name}; delete the stale one.")
+        else:
+            nwb_path = nwb_path.rename(target)
+            tqdm.write(f"  ↻ renamed to {expected} (phase postfix from the recording)")
+    if nwb_path is None:
+        nwb_path = op / expected
 
     # every session's span on the shared clock, in samples AND seconds
     bounds = [{"name": b["name"], "start_sample": int(b["start"]),
@@ -473,7 +488,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         # ── 1. FIND & LOAD LFP .dat FILES ───────────────────────────────────
         tqdm.write(f"\n{'─'*60}")
         tqdm.write(f"▶  Input: {base_path}")
-        tqdm.write("Step 1/5 — Finding Trodes-exported LFP .dat files")
+        tqdm.write("Step 1/6 — Finding Trodes-exported LFP .dat files")
 
         sessions = find_lfp_sessions(input_folder)
         if not sessions:
@@ -504,7 +519,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         advance(1)
 
         # ── 2. SAVE PER-CHANNEL .npy + COMBINED ARRAY ───────────────────────
-        tqdm.write("Step 2/5 — Converting to .npy files")
+        tqdm.write("Step 2/6 — Assembling the LFP matrix")
 
         # rat_sessiondate_ prefix for every generated file (from the recording).
         pfx = session_prefix(sessions[0]['name'])
@@ -567,8 +582,9 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         sc = {}
         try:
             from sorting import load_sorting_config, resolve_sleep_channels
-            sc = resolve_sleep_channels(sessions[0]['name'],
-                                        load_sorting_config(config_path)) or {}
+            sc = resolve_sleep_channels(
+                sessions[0]['name'],
+                load_sorting_config(config_path, quiet=True)) or {}
             if sc:
                 if keep_npy:
                     np.save(output_dir / f"{pfx}sleep_channels.npy", sc)
@@ -583,7 +599,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         advance(2)
 
         # ── 3. SELECT EMG CHANNEL ───────────────────────────────────────────
-        tqdm.write("Step 3/5 — Selecting EMG channel")
+        tqdm.write("Step 3/6 — Selecting EMG channel")
         emg_ch = select_emg_channel(lfp_array, fs)
         emg_1d = lfp_array[:, emg_ch].copy()
 
@@ -596,7 +612,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         advance(3)
 
         # ── 4. SELECT CLEANEST EEG CHANNELS ─────────────────────────────────
-        tqdm.write("Step 4/5 — Selecting cleanest EEG channels")
+        tqdm.write("Step 4/6 — Selecting cleanest EEG channels")
         best_ch_idx, scores = select_cleanest_channels(lfp_array, fs, n_best=3)
         if keep_npy:
             np.save(output_dir / f"{pfx}cleanest_channel_indices.npy", best_ch_idx)
@@ -604,7 +620,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         advance(4)
 
         # ── 5. COMPUTE AWAKENESS ────────────────────────────────────────────
-        tqdm.write("Step 5/5 — Computing awakeness score")
+        tqdm.write("Step 5/6 — Computing awakeness score")
         awakeness, emg_rms, theta_delta = compute_awakeness(
             lfp_array, emg_1d, fs, best_ch_idx,
         )

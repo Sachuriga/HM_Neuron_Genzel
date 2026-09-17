@@ -181,7 +181,7 @@ def resolve_sleep_channels(file_stem, config):
     return {}
 
 
-def load_sorting_config(config_path):
+def load_sorting_config(config_path, quiet=False):
     """
     Read per-rat sorting settings from an hm_tracker_paths.txt style file.
 
@@ -251,13 +251,17 @@ def load_sorting_config(config_path):
                 rat = key[len("SLEEP_CHANNELS_"):].lower()
                 _entry(rat)["sleep_channels"] = _parse_sleep_channels(value)
 
+    # `quiet` for callers that only want the per-rat channel settings (the LFP
+    # and EMG exports); announcing the sorter and its params there is noise,
+    # since nothing is being sorted.
     rats = [k for k in config if not k.startswith("__")]
-    if rats:
-        print(f"Loaded sorting config for rats: {', '.join(sorted(rats))}")
-    if SORTER_CONFIG_KEY in config:
-        print(f"Sorter selected in config: {config[SORTER_CONFIG_KEY]}")
-    if SORTING_PARAMS_KEY in config:
-        print(f"Sorting params from config: {config[SORTING_PARAMS_KEY]}")
+    if not quiet:
+        if rats:
+            print(f"Loaded sorting config for rats: {', '.join(sorted(rats))}")
+        if SORTER_CONFIG_KEY in config:
+            print(f"Sorter selected in config: {config[SORTER_CONFIG_KEY]}")
+        if SORTING_PARAMS_KEY in config:
+            print(f"Sorting params from config: {config[SORTING_PARAMS_KEY]}")
     return config
 
 

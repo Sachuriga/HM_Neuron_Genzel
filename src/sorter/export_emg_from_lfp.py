@@ -530,7 +530,7 @@ def _load_config(config_path):
         return None
     try:
         from sorting import load_sorting_config
-        return load_sorting_config(config_path)
+        return load_sorting_config(config_path, quiet=True)
     except Exception as exc:
         print(f"Warning: could not load config {config_path}: {exc}")
         return None
