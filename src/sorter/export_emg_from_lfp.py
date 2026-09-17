@@ -82,28 +82,129 @@ def spread_channels(n_channels, n_pick=N_PICK, ch_per_tetrode=CH_PER_TETRODE):
 # PRIMARY PATH: EMG from the 1500 Hz LFP export (numpy only, no SpikeInterface)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _lfp_sampling_rate(lfp_dir):
-    """LFP sampling rate (Hz) from lfp_timestamps.npy, else None."""
-    ts_file = find_output(lfp_dir, "lfp_timestamps.npy")   # prefixed or not
+def _write_emg_to_nwb(lfp_dir, emg, timestamps, emg_fs):
+    """Add the 5 Hz EMG-from-LFP to the session NWB (skipped when already there)."""
+    nwb_path = _session_nwb(lfp_dir)
+    if nwb_path is None:
+        print("  ⚠  no session .nwb found — run the step-8 LFP export first; "
+              "only the .npy EMG was written.")
+        return None
+    import sleep_nwb as snwb
+    from pynwb import NWBHDF5IO
+
+    io = NWBHDF5IO(str(nwb_path), mode="r+")
+    try:
+        nwbfile = io.read()
+        added = snwb.add_sleep_inputs(nwbfile, emg=emg, emg_timestamps=timestamps)
+        if added:
+            io.write(nwbfile)
+            print(f"  ✓ {nwb_path.name}: acquisition/emg_from_lfp "
+                  f"({emg.size} @ {emg_fs} Hz)")
+        else:
+            print(f"  = {nwb_path.name} already has acquisition/emg_from_lfp")
+    finally:
+        io.close()
+    return nwb_path
+
+
+def _session_nwb(lfp_dir):
+    """The session NWB for an LFP_Output folder, or None."""
+    # append, never insert(0): src/nwb has its own session_prefix.py that would
+    # otherwise shadow this package's
+    import sys
+    nwb_dir = str(Path(__file__).resolve().parent.parent / "nwb")
+    if nwb_dir not in sys.path:
+        sys.path.append(nwb_dir)
+    try:
+        import sleep_nwb as snwb
+        return snwb.find_session_nwb(lfp_dir)
+    except Exception as exc:
+        print(f"   (could not look for a session NWB: {exc})")
+        return None
+
+
+def _open_lfp(lfp_dir):
+    """Open the session LFP: returns ``(data, fs, close)``.
+
+    ``data`` is ``(n_samples, n_channels)`` and sliced by column only, so the
+    NWB path reads just the columns asked for straight out of HDF5 rather than
+    loading the session. Prefers the NWB written by the LFP export and falls
+    back to ``lfp_data.npy`` + ``lfp_timestamps.npy`` for older sessions.
+    """
+    nwb_path = _session_nwb(lfp_dir)
+    if nwb_path is not None:
+        from pynwb import NWBHDF5IO
+        io = NWBHDF5IO(str(nwb_path), mode="r")
+        try:
+            series = io.read().get_acquisition("lfp")
+        except Exception:
+            io.close()
+        else:
+            fs = float(series.rate) if getattr(series, "rate", None) else None
+            if fs is None and series.timestamps is not None:
+                ts = np.asarray(series.timestamps[:1000]).ravel()
+                dt = float(np.median(np.diff(ts))) if ts.size > 1 else 0.0
+                fs = 1.0 / dt if dt > 0 else None
+            if fs:
+                print(f"   LFP from {nwb_path.name} ({series.data.shape} @ {fs:.0f} Hz)")
+                return series.data, fs, io.close
+            io.close()
+
+    data_file = find_output(lfp_dir, "lfp_data.npy")       # prefixed or not
+    if data_file is None:
+        raise FileNotFoundError(
+            "no LFP found: neither acquisition/lfp in the session .nwb nor "
+            "lfp_data.npy in LFP_Output")
+    ts_file = find_output(lfp_dir, "lfp_timestamps.npy")
     if ts_file is None:
-        return None
+        raise FileNotFoundError("no lfp_timestamps.npy in LFP_Output")
     ts = np.asarray(np.load(ts_file, mmap_mode="r")).ravel()
-    if ts.size < 2:
-        return None
-    span = float(ts[-1]) - float(ts[0])
-    return (ts.size - 1) / span if span > 0 else None
+    span = float(ts[-1]) - float(ts[0]) if ts.size >= 2 else 0.0
+    fs = (ts.size - 1) / span if span > 0 else None
+    return np.load(data_file, mmap_mode="r"), fs, (lambda: None)
+
+
+_INFO_CACHE = {}
+
+
+def _session_info(lfp_dir):
+    """``processing/sleep/session_info`` from the session NWB, else ``{}``.
+
+    Holds the channel map, session boundaries, EMG channel and SNR scores that
+    used to live in LFP_Output as small ``.npy``. Cached per folder.
+    """
+    key = str(lfp_dir)
+    if key in _INFO_CACHE:
+        return _INFO_CACHE[key]
+    info = {}
+    nwb_path = _session_nwb(lfp_dir)
+    if nwb_path is not None:
+        import sleep_nwb as snwb
+        inputs = None
+        try:
+            inputs = snwb.read_sleep_inputs(nwb_path)
+            info = inputs.get("session_info") or {}
+        except Exception as exc:
+            print(f"   (could not read session_info from {nwb_path.name}: {exc})")
+        finally:
+            snwb.close_inputs(inputs)
+    _INFO_CACHE[key] = info
+    return info
 
 
 def _hw_to_lfp_columns(lfp_dir, hw_channels):
-    """Map hardware channel ids -> lfp_data.npy column indices via channel_map.npy.
+    """Map hardware channel ids -> LFP column indices via the channel map.
 
-    channel_map.npy holds per-column {index, ntrode, channel, ...}; the hardware
+    The channel map holds per-column {index, ntrode, channel, ...}; the hardware
     id of a column is (ntrode-1)*4 + (channel-1). Returns the columns present.
+    Read from the session NWB, falling back to ``channel_map.npy``.
     """
-    cmap_file = find_output(lfp_dir, "channel_map.npy")   # prefixed or not
-    if cmap_file is None:
-        return None
-    cmap = np.load(cmap_file, allow_pickle=True)
+    cmap = _session_info(lfp_dir).get("channel_map")
+    if not cmap:
+        cmap_file = find_output(lfp_dir, "channel_map.npy")   # prefixed or not
+        if cmap_file is None:
+            return None
+        cmap = np.load(cmap_file, allow_pickle=True)
     hw_of_col = {}
     for entry in cmap:
         nt, ch = entry.get("ntrode"), entry.get("channel")
@@ -128,9 +229,10 @@ def _bad_lfp_columns(lfp_dir, n_cols, snr_frac=SNR_FRAC, config=None, stem=None,
     """
     bad, reasons = set(), {}
     scores = None
-    snr_file = find_output(lfp_dir, "channel_snr_scores.npy")   # prefixed or not
-    if snr_file is not None:
-        scores = np.asarray(np.load(snr_file)).ravel()
+    scores = _session_info(lfp_dir).get("channel_snr_scores")
+    snr_file = None if scores else find_output(lfp_dir, "channel_snr_scores.npy")
+    if scores or snr_file is not None:
+        scores = np.asarray(scores if scores else np.load(snr_file)).ravel()
         finite = np.isfinite(scores)
         if scores.size == n_cols and finite.any():
             thr = snr_frac * float(np.median(scores[finite]))
@@ -182,43 +284,45 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
     channel dilutes every pairwise correlation.
     """
     lfp_dir = Path(lfp_dir)
-    fs = _lfp_sampling_rate(lfp_dir)
-    if fs is None:
-        raise FileNotFoundError("no lfp_timestamps.npy in LFP_Output")
-    if fs / 2.0 <= 600.0:
-        raise ValueError(
-            f"LFP fs={fs:.0f} Hz (Nyquist {fs/2:.0f}) is below the 300–600 Hz EMG "
-            f"band. Re-export LFP at 1500 Hz / -lfplowpass 700.")
+    data, fs, close = _open_lfp(lfp_dir)
+    try:
+        if fs is None:
+            raise FileNotFoundError("could not determine the LFP sampling rate")
+        if fs / 2.0 <= 600.0:
+            raise ValueError(
+                f"LFP fs={fs:.0f} Hz (Nyquist {fs/2:.0f}) is below the 300–600 Hz EMG "
+                f"band. Re-export LFP at 1500 Hz / -lfplowpass 700.")
 
-    data_file = find_output(lfp_dir, "lfp_data.npy")       # prefixed or not
-    if data_file is None:
-        raise FileNotFoundError("no lfp_data.npy in LFP_Output")
-    data = np.load(data_file, mmap_mode="r")               # (n_samples, n_channels)
+        cols, origin = None, None
+        if channels:
+            mapped = _hw_to_lfp_columns(lfp_dir, [int(c) for c in channels])
+            if mapped and len(mapped) >= 2:
+                cols, origin = sorted(set(mapped)), f"EEG channels -> LFP cols {sorted(set(mapped))}"
+            else:
+                print("   (requested EEG channels not all in the LFP export; "
+                      "using all LFP channels instead)")
+        if cols is None:
+            cols = list(range(data.shape[1]))
+            origin = f"all {data.shape[1]} LFP channels (one per tetrode)"
 
-    cols, origin = None, None
-    if channels:
-        mapped = _hw_to_lfp_columns(lfp_dir, [int(c) for c in channels])
-        if mapped and len(mapped) >= 2:
-            cols, origin = sorted(set(mapped)), f"EEG channels -> LFP cols {sorted(set(mapped))}"
-        else:
-            print("   (requested EEG channels not all in the LFP export; "
-                  "using all LFP channels instead)")
-    if cols is None:
-        cols = list(range(data.shape[1]))
-        origin = f"all {data.shape[1]} LFP channels (one per tetrode)"
+        if exclude_bad:
+            bad = _bad_lfp_columns(lfp_dir, data.shape[1], snr_frac=snr_frac,
+                                   config=config, stem=stem,
+                                   extra_exclude_hw=extra_exclude_hw)
+            kept = [c for c in cols if c not in bad]
+            dropped = sorted(c for c in cols if c in bad)
+            if dropped and len(kept) >= 2:
+                cols, origin = kept, origin + f" minus {dropped} (bad/EEG)"
 
-    if exclude_bad:
-        bad = _bad_lfp_columns(lfp_dir, data.shape[1], snr_frac=snr_frac,
-                               config=config, stem=stem,
-                               extra_exclude_hw=extra_exclude_hw)
-        kept = [c for c in cols if c not in bad]
-        dropped = sorted(c for c in cols if c in bad)
-        if dropped and len(kept) >= 2:
-            cols, origin = kept, origin + f" minus {dropped} (bad/EEG)"
+        # h5py fancy indexing needs strictly increasing columns
+        cols = sorted(set(int(c) for c in cols))
+        sel = np.asarray(data[:, cols], dtype=np.float64)
+        n_samples = data.shape[0]
+    finally:
+        close()
 
-    sel = np.asarray(data[:, cols], dtype=np.float64)
     res = emg_from_lfp(sel, fs, emg_fs=emg_fs, smooth_window_s=SMOOTH_S)
-    res["duration_s"] = data.shape[0] / fs
+    res["duration_s"] = n_samples / fs
     res["picks"] = cols
     res["origin"] = origin
     res["fs"] = fs
@@ -343,9 +447,12 @@ def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
 
 
 def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-        config=None, eeg_channels=None, exclude_bad=False, snr_frac=SNR_FRAC):
+        config=None, eeg_channels=None, exclude_bad=False, snr_frac=SNR_FRAC,
+        keep_npy=False):
+    # LFP_Output only exists for the .npy files; the NWB is the default home.
     output_dir = Path(output_folder) / "LFP_Output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if keep_npy:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'─' * 60}")
     print(f"▶  EMG-from-LFP (Buzsáki cross-channel correlation)")
@@ -385,23 +492,26 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     emg_5hz_norm = ((emg_5hz - emg_5hz.min()) / (rng + 1e-12)).astype("float32")
 
     pfx = session_prefix(_session_stem(input_folder))    # rat_sessiondate_ prefix
-    np.save(output_dir / f"{pfx}emg_from_lfp_5hz.npy", emg_5hz_norm)
-    np.save(output_dir / f"{pfx}emg_from_lfp_timestamps.npy", ts_5hz)
-    print(f"  ✓ {pfx}emg_from_lfp_5hz.npy  ({emg_5hz_norm.size}) @ {emg_fs} Hz")
+    if keep_npy:
+        np.save(output_dir / f"{pfx}emg_from_lfp_5hz.npy", emg_5hz_norm)
+        np.save(output_dir / f"{pfx}emg_from_lfp_timestamps.npy", ts_5hz)
+        print(f"  ✓ {pfx}emg_from_lfp_5hz.npy  ({emg_5hz_norm.size}) @ {emg_fs} Hz")
 
-    # Upsample to the LFP rate (1500 Hz) so it matches emg_rms.npy / lfp_data.npy
-    # per-sample. Prefer the real LFP time axis when present.
+    # Into the session NWB, on its own 5 Hz timebase — this is what the sleep
+    # scorer reads. The per-sample upsampled copy is derivable from it, so it is
+    # no longer written for NWB-era sessions.
+    _write_emg_to_nwb(output_dir, emg_5hz_norm, ts_5hz, emg_fs)
+
+    # Legacy sessions (those still carrying lfp_timestamps.npy) also get the
+    # upsampled emg_from_lfp.npy, so anything reading it keeps working.
     lfp_ts_file = find_output(output_dir, "lfp_timestamps.npy")
     if lfp_ts_file is not None:
         lfp_ts = np.load(lfp_ts_file).astype("float64")
         emg_up = np.interp(lfp_ts, ts_5hz, emg_5hz_norm).astype("float32")
         np.save(output_dir / f"{pfx}emg_from_lfp.npy", emg_up)
         print(f"  ✓ {pfx}emg_from_lfp.npy  ({emg_up.size}) upsampled to LFP time axis")
-    else:
-        print("  ⚠  lfp_timestamps.npy not found — saved only the 5 Hz EMG. "
-              "Run step-8 LFP export first to also get the pipeline-rate emg_from_lfp.npy.")
 
-    if len(boundaries) > 1:
+    if len(boundaries) > 1 and keep_npy:
         np.save(output_dir / f"{pfx}emg_from_lfp_boundaries.npy", boundaries)
         for b in boundaries:
             print(f"    {b['name']}: t0={b['start_s']:.1f}s  dur={b['duration_s']:.1f}s")
@@ -465,10 +575,13 @@ if __name__ == "__main__":
                              "cross-channel mean is insensitive to channel choice "
                              "(~identical correlation); useful only when several "
                              "channels are bad.")
+    parser.add_argument("--keep-npy", dest="keep_npy", action="store_true",
+                        help="Also write the EMG .npy files into LFP_Output/. "
+                             "They duplicate what the NWB holds; off by default.")
     parser.add_argument("--snr_frac", type=float, default=SNR_FRAC,
                         help=f"With --exclude_bad, drop channels with SNR < "
                              f"snr_frac*median (default {SNR_FRAC}).")
     args = parser.parse_args()
     run(args.input_folder, args.output_folder, work_fs=args.work_fs, n_pick=args.n_pick,
         config=_load_config(args.config), eeg_channels=_parse_eeg_arg(args.eeg_channels),
-        exclude_bad=args.exclude_bad, snr_frac=args.snr_frac)
+        exclude_bad=args.exclude_bad, snr_frac=args.snr_frac, keep_npy=args.keep_npy)

@@ -241,10 +241,30 @@ def add_timeseries(ts_name):
 # creates a behavior module to add data such as spatial_series/position
 # takes global arguments behavior_*
 def create_behavior_module():
+    """The session's behaviour module, reused when the NWB already has one.
+
+    Step 8 creates the session NWB and step w appends into it, so on a re-run
+    the module can already be there — creating it a second time would raise.
+    """
+    existing = nwbfile.processing.get(behavior_name)
+    if existing is not None:
+        print(f"Reusing the existing '{behavior_name}' processing module.")
+        return existing
     return nwbfile.create_processing_module(
         name=behavior_name,
         description=behavior_description
     )
+
+# adds a container to the behavior module unless that name is already present,
+# so appending to an already-populated NWB never duplicates (or raises)
+def behavior_add(module, obj):
+    if obj is None:
+        return False
+    if obj.name in module.data_interfaces:
+        print(f"'{obj.name}' is already in {module.name} — keeping the existing one.")
+        return False
+    module.add(obj)
+    return True
 
 # splits the labels of positional data in loaded dataframe
 # e.g. "Rat_X" -> X
@@ -811,9 +831,48 @@ if __name__ == "__main__":
         # --- END METADATA --- #
 
 
-        # create nwb file
-        nwbfile = create_nwb_file()
-        print(f"Created nwb file for session {nwb_session_id}.")
+        # The nwbfile lives IN the op folder itself, named <rat>_<session>.nwb
+        # (e.g. Rat6_20260629.nwb). Both the folder and the rat/session tokens
+        # are taken from the session's own coordinate file, whose name is
+        # "<date>_<Rat#>_Coordinates_Full...": its parent IS the op folder, and
+        # its stem prefix gives the date + rat. Fall back to the discovered
+        # session folder / its name if the coordinate file can't be located.
+        coord_path = (resolve_path('Coordinates_Full_with_frames', paths.csv_paths)
+                      or resolve_path('Coordinates_Full', paths.csv_paths))
+        if coord_path is not None:
+            op_dir = coord_path.parent
+            stem_parts = coord_path.stem.split("_")
+        else:
+            op_dir = Path(root + output_folder) / session_folders[session_i].name
+            stem_parts = session_folders[session_i].name.split("_")
+
+        # The session folder's phase postfix (…_post) goes into the name, so
+        # same-day sessions never collide. Derived through sleep_nwb so step 8
+        # and this step always agree on the filename.
+        import sleep_nwb as _snwb
+        postfix = _snwb.folder_postfix(op_dir)
+        if (len(stem_parts) >= 2 and stem_parts[0].isdigit()
+                and stem_parts[1].lower().startswith("rat")):
+            stem = f"{stem_parts[1]}_{stem_parts[0]}"              # Rat6_20260629
+        else:
+            stem = session_folders[session_i].name
+        output_name = f"{stem}_{postfix}.nwb" if postfix else f"{stem}.nwb"
+
+        output_path = str(op_dir / output_name)
+
+        # open the session nwb file
+        # Step 8 (export_sleep_nwb.py) creates this file with the LFP / EMG /
+        # motion the sleep scorer reads, and a scorer's result may already be
+        # stored in it, so an existing file is APPENDED to in place and never
+        # rewritten — a rewrite would throw that work away.
+        nwb_io = None
+        if Path(output_path).is_file():
+            nwb_io = NWBHDF5IO(output_path, mode="r+")
+            nwbfile = nwb_io.read()
+            print(f"Appending to the existing nwb file {output_path}.")
+        else:
+            nwbfile = create_nwb_file()
+            print(f"Created nwb file for session {nwb_session_id}.")
 
         # add subject to nwb
         subject = add_subject()
@@ -834,7 +893,7 @@ if __name__ == "__main__":
         position_obj = create_position_obj(position_name, df)
 
         # add position object to behavior module
-        behavior_module.add(position_obj)
+        behavior_add(behavior_module, position_obj)
 
         # create dlc position object (head-centered bodypart coordinates)
         dlc_position_obj = create_dlc_position_obj(dlc_position_name, df)
@@ -842,7 +901,7 @@ if __name__ == "__main__":
         # add dlc position object to behavior module (skip when this session
         # has no DLC bodypart data, i.e. create_dlc_position_obj returned None)
         if dlc_position_obj is not None:
-            behavior_module.add(dlc_position_obj)
+            behavior_add(behavior_module, dlc_position_obj)
         else:
             print("No DLC bodypart (_x/_y) columns found — skipping DLC_Position.")
 
@@ -852,7 +911,7 @@ if __name__ == "__main__":
         metrics_obj = create_metrics_object(metric_timeseries_list, "Metrics")
 
         # add metrics object to behavior module
-        behavior_module.add(metrics_obj)
+        behavior_add(behavior_module, metrics_obj)
 
         # create trials table from txt data
         if df_txt is not None:
@@ -872,48 +931,39 @@ if __name__ == "__main__":
 
         # add trials table to behavior module
         if df_txt is not None:
-            behavior_module.add(trials_table)
+            behavior_add(behavior_module, trials_table)
 
-        # save nwbfile INTO the op folder itself, named <rat>_<session>.nwb
-        # (e.g. Rat6_20260629.nwb). Both the folder and the rat/session tokens
-        # are taken from the session's own coordinate file, whose name is
-        # "<date>_<Rat#>_Coordinates_Full...": its parent IS the op folder, and
-        # its stem prefix gives the date + rat. Fall back to the discovered
-        # session folder / its name if the coordinate file can't be located.
-        coord_path = (resolve_path('Coordinates_Full_with_frames', paths.csv_paths)
-                      or resolve_path('Coordinates_Full', paths.csv_paths))
-        if coord_path is not None:
-            op_dir = coord_path.parent
-            stem_parts = coord_path.stem.split("_")
-        else:
-            op_dir = Path(root + output_folder) / session_folders[session_i].name
-            stem_parts = session_folders[session_i].name.split("_")
-
-        if (len(stem_parts) >= 2 and stem_parts[0].isdigit()
-                and stem_parts[1].lower().startswith("rat")):
-            output_name = f"{stem_parts[1]}_{stem_parts[0]}.nwb"   # Rat6_20260629.nwb
-        else:
-            output_name = f"{session_folders[session_i].name}.nwb"
-
-        output_path = str(op_dir / output_name)
-        # Write to a temp file *next to* the target first, then atomically
-        # replace. This way a failed/interrupted write (common on network
-        # mounts) never truncates or corrupts a previously-good .nwb file,
-        # since NWBHDF5IO("w") zeroes the target the instant it opens.
-        # Keep the '.nwb' suffix on the temp file too (insert '.tmp' before it)
-        # so pynwb/HDF5 don't warn about a non-.nwb extension.
-        tmp_path = str(op_dir / (Path(output_name).stem + ".tmp.nwb"))
-        try:
-            with NWBHDF5IO(tmp_path, "w") as io:
-                io.write(nwbfile)
-            os.replace(tmp_path, output_path)
-            print(f"Saved to {output_path}!")
-        except Exception as e:
-            # Clean up the partial temp file so it doesn't linger.
+        # save the nwbfile (its path was resolved before the file was opened)
+        if nwb_io is not None:
+            # Appending in place: the file already holds step 8's LFP/EMG/motion
+            # and possibly a scorer's result, so it is added to, never rewritten.
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {output_path} failed: "
-                  f"{type(e).__name__}: {e}{Style.RESET_ALL}")
+                nwb_io.write(nwbfile)
+                print(f"Appended to {output_path}!")
+            except Exception as e:
+                print(f"{Fore.RED} ---[ERROR]--- Appending to NWB file {output_path} "
+                      f"failed: {type(e).__name__}: {e}{Style.RESET_ALL}")
+            finally:
+                nwb_io.close()
+        else:
+            # Fresh file: write to a temp file *next to* the target first, then
+            # atomically replace. This way a failed/interrupted write (common on
+            # network mounts) never truncates or corrupts a previously-good .nwb
+            # file, since NWBHDF5IO("w") zeroes the target the instant it opens.
+            # Keep the '.nwb' suffix on the temp file too (insert '.tmp' before
+            # it) so pynwb/HDF5 don't warn about a non-.nwb extension.
+            tmp_path = str(op_dir / (Path(output_name).stem + ".tmp.nwb"))
+            try:
+                with NWBHDF5IO(tmp_path, "w") as io:
+                    io.write(nwbfile)
+                os.replace(tmp_path, output_path)
+                print(f"Saved to {output_path}!")
+            except Exception as e:
+                # Clean up the partial temp file so it doesn't linger.
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                print(f"{Fore.RED} ---[ERROR]--- Saving NWB file to {output_path} failed: "
+                      f"{type(e).__name__}: {e}{Style.RESET_ALL}")

@@ -62,12 +62,12 @@ MENU = [
     ("7", "Sorting"),
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
-    ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP"),
+    ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
     ("f", "Fix .txt unix timestamps (repair re-tracked sessions; framewise ts<->seconds mapping)"),
     ("n", "Node Analysis"),
-    ("w", "nwblfp (NWB / LFP package)"),
+    ("w", "nwblfp (behaviour/trials — appends to the NWB from step 8)"),
     ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
     ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
@@ -361,20 +361,31 @@ def run_worker(ip, op, steps, out):
 
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
+        # Per-sample data goes into the session NWB. Set HM_KEEP_NPY=1 to also
+        # write the old LFP_Output/*.npy alongside it.
+        keep_npy = ["--keep-npy"] if os.environ.get("HM_KEEP_NPY") else []
         if Path("./src/sorter/export_lfp.py").exists():
             log(out, "[STEP 8] Running LFP Extraction...")
             run([PYTHON, "-u", "./src/sorter/export_lfp.py",
                  "--input_folder", ip, "--output_folder", op,
-                 "--output_rate", "1500"], out=out)
+                 "--output_rate", "1500"] + keep_npy, out=out)
         # EMG-from-LFP needs the raw wideband (300-600 Hz); runs after the LFP
         # export so it can upsample onto lfp_timestamps.npy. Needs step 1 (-raw).
         if Path("./src/sorter/export_emg_from_lfp.py").exists():
             log(out, "[STEP 8] Running EMG-from-LFP (raw wideband, Buzsáki)...")
             run([PYTHON, "-u", "./src/sorter/export_emg_from_lfp.py",
-                 "--input_folder", ip, "--output_folder", op], out=out)
+                 "--input_folder", ip, "--output_folder", op] + keep_npy, out=out)
         if Path("./src/sorter/export_motion.py").exists():
             log(out, "[STEP 8] Running Motion (IMU Accel) Extraction...")
             run([PYTHON, "-u", "./src/sorter/export_motion.py",
+                 "--input_folder", ip, "--output_folder", op] + keep_npy, out=out)
+        # Package LFP + EMG + motion into the session NWB last, once all three
+        # exports above have produced their .npy files. This CREATES the session
+        # NWB that steps w and u later append to, and is what the sleep-scoring
+        # GUI reads (and writes each scorer's result back into).
+        if Path("./src/nwb/export_sleep_nwb.py").exists():
+            log(out, "[STEP 8] Packaging sleep-scoring inputs into the session NWB...")
+            run([PYTHON, "-u", "./src/nwb/export_sleep_nwb.py",
                  "--input_folder", ip, "--output_folder", op], out=out)
 
     # --- STEP d: DeepLabCut export + inference (extract frames -> run DLC -> write) ---

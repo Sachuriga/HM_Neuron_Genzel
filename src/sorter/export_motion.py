@@ -169,11 +169,52 @@ def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run(input_folder, output_folder):
+def _write_motion_to_nwb(lfp_dir, movement, fs):
+    """Add the movement trace to the session NWB (skipped when already there).
+
+    Stored with a ``rate``, i.e. the same zero-referenced seconds axis the LFP
+    uses, so motion and LFP line up sample-for-second without a stored time
+    array.
+    """
+    # append, never insert(0): src/nwb has its own session_prefix.py that would
+    # otherwise shadow this package's
+    import sys
+    nwb_dir = str(Path(__file__).resolve().parent.parent / "nwb")
+    if nwb_dir not in sys.path:
+        sys.path.append(nwb_dir)
+    try:
+        import sleep_nwb as snwb
+        from pynwb import NWBHDF5IO
+    except Exception as exc:
+        print(f"  ⚠  could not import the NWB writer: {exc}")
+        return None
+
+    nwb_path = snwb.find_session_nwb(lfp_dir)
+    if nwb_path is None:
+        print("  ⚠  no session .nwb found — run the step-8 LFP export first.")
+        return None
+    io = NWBHDF5IO(str(nwb_path), mode="r+")
+    try:
+        nwbfile = io.read()
+        added = snwb.add_sleep_inputs(nwbfile, motion=movement, motion_rate=float(fs))
+        if added:
+            io.write(nwbfile)
+            print(f"  ✓ {nwb_path.name}: acquisition/motion "
+                  f"({movement.size} @ {fs} Hz)")
+        else:
+            print(f"  = {nwb_path.name} already has acquisition/motion")
+    finally:
+        io.close()
+    return nwb_path
+
+
+def run(input_folder, output_folder, keep_npy=False):
     base_path = Path(input_folder)
     # Save alongside the LFP outputs so motion and LFP share one folder.
+    # LFP_Output only exists for the .npy files; the NWB is the default home.
     output_dir = Path(output_folder) / "LFP_Output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if keep_npy:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'─' * 60}")
     print(f"▶  Motion (IMU) extraction")
@@ -248,26 +289,28 @@ def run(input_folder, output_folder):
 
     pfx = session_prefix(sessions_data[0]['name'])   # rat_sessiondate_ prefix
 
-    out_file = output_dir / f"{pfx}motion.npy"
-    np.save(out_file, motion)
-    print(f"  ✓ {pfx}motion.npy  {motion.shape}  columns={found_axes} @ {TARGET_FS} Hz")
-
-    # Time axis at the downsampled rate, zero-referenced (seconds).
-    ts_seconds = (np.arange(n_down) / TARGET_FS).astype('float64')
-    np.save(output_dir / f"{pfx}motion_timestamps.npy", ts_seconds)
-    print(f"  ✓ {pfx}motion_timestamps.npy  ({n_down}) @ {TARGET_FS} Hz")
-
     # Derived movement signal (accelerometer -> single motion trace), using the
     # same algorithm the sleep scorer applies to accelerometer channels. Kept at
-    # TARGET_FS so every step-8 signal shares one rate and time axis
-    # (motion_timestamps.npy); the scorer averages it into 1 s bins at load time
-    # (MotionType='File'), reproducing the original per-second motion.
+    # TARGET_FS so every step-8 signal shares one rate and the same zero-
+    # referenced seconds axis (t[i] = i/TARGET_FS); the scorer averages it into
+    # 1 s bins at load time, reproducing the original per-second motion.
     movement = accel_to_movement(motion, TARGET_FS)      # (n_down,) @ TARGET_FS
-    np.save(output_dir / f"{pfx}motion_accel.npy", movement)
-    print(f"  ✓ {pfx}motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
-          f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass)")
 
-    np.save(output_dir / f"{pfx}motion_session_boundaries.npy", boundaries)
+    # The per-sample arrays live in the session NWB; only the small boundaries
+    # record stays on disk as .npy.
+    _write_motion_to_nwb(output_dir, movement, TARGET_FS)
+
+    if keep_npy:
+        np.save(output_dir / f"{pfx}motion.npy", motion)
+        print(f"  ✓ {pfx}motion.npy  {motion.shape}  columns={found_axes} @ {TARGET_FS} Hz")
+        ts_seconds = (np.arange(n_down) / TARGET_FS).astype('float64')
+        np.save(output_dir / f"{pfx}motion_timestamps.npy", ts_seconds)
+        np.save(output_dir / f"{pfx}motion_accel.npy", movement)
+        print(f"  ✓ {pfx}motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
+              f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass)")
+
+    if keep_npy:
+        np.save(output_dir / f"{pfx}motion_session_boundaries.npy", boundaries)
     if len(boundaries) > 1:
         for b in boundaries:
             print(f"    {b['name']}: samples {b['start']}.."
@@ -287,7 +330,11 @@ if __name__ == "__main__":
     parser.add_argument('--input_folder', required=True,
                         help="Folder containing Trodes analogio export "
                              "(*.analog/*Accel*.dat)")
+    parser.add_argument('--keep-npy', dest='keep_npy', action='store_true',
+                        help="Also write the per-sample motion .npy files "
+                             "(motion, motion_timestamps, motion_accel). They "
+                             "duplicate what the NWB holds; off by default.")
     parser.add_argument('--output_folder', required=True,
                         help="Destination for motion.npy.")
     args = parser.parse_args()
-    run(args.input_folder, args.output_folder)
+    run(args.input_folder, args.output_folder, keep_npy=args.keep_npy)

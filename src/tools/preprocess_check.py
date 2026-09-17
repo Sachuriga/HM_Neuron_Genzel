@@ -40,7 +40,7 @@ STEP_SIGNATURES = {
     "4": ["*_Coordinates_Full.csv"],         # Tracker
     "5": ["*_analysis_final.pdf"],           # Plotting
     "7": ["*_sorting_output"],               # Spike sorting
-    "8": ["LFP_Output"],                     # LFP + motion/EMG
+    "8": ["*.nwb", "LFP_Output"],            # LFP + motion/EMG (NWB; .npy only with --keep-npy)
     "d": ["collected_framesDLC_*.h5", "collected_framesDLC_*.csv"],  # DeepLabCut
 }
 # Intermediates cleaned up: done once the step that consumes them is done.
