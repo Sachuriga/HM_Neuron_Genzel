@@ -851,7 +851,7 @@ if __name__ == "__main__":
         # file rather than recomputing the name — the op folder is called op1 /
         # op6 and has no postfix to derive it from, so recomputing here would
         # invent a second file. Only when there is none do we name a fresh one.
-        import sleep_nwb as _snwb
+        import sleep_nwb_writer as _snwb
         existing = _snwb.find_session_nwb(op_dir)
         if existing is not None:
             output_name = existing.name

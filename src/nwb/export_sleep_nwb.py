@@ -38,7 +38,7 @@ from uuid import uuid4
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import sleep_nwb as snwb                                    # noqa: E402
+import sleep_nwb_writer as snwb                                    # noqa: E402
 
 LFP_ROWS_PER_CHUNK = 250_000        # ~1 s of writing per chunk at 1500 Hz x 64 ch
 

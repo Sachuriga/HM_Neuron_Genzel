@@ -89,7 +89,7 @@ def _write_emg_to_nwb(lfp_dir, emg, timestamps, emg_fs):
         print("  ⚠  no session .nwb found — run the step-8 LFP export first; "
               "only the .npy EMG was written.")
         return None
-    import sleep_nwb as snwb
+    import sleep_nwb_writer as snwb
     from pynwb import NWBHDF5IO
 
     io = NWBHDF5IO(str(nwb_path), mode="r+")
@@ -116,7 +116,7 @@ def _session_nwb(lfp_dir):
     if nwb_dir not in sys.path:
         sys.path.append(nwb_dir)
     try:
-        import sleep_nwb as snwb
+        import sleep_nwb_writer as snwb
         return snwb.find_session_nwb(lfp_dir)
     except Exception as exc:
         print(f"   (could not look for a session NWB: {exc})")
@@ -179,7 +179,7 @@ def _session_info(lfp_dir):
     info = {}
     nwb_path = _session_nwb(lfp_dir)
     if nwb_path is not None:
-        import sleep_nwb as snwb
+        import sleep_nwb_writer as snwb
         inputs = None
         try:
             inputs = snwb.read_sleep_inputs(nwb_path)

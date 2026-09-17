@@ -90,6 +90,28 @@ def _int_env(name, default):
         return default
 
 
+def _str_env(*names, default=""):
+    """First non-empty value among ``names``, whitespace-stripped.
+
+    Values come from hm_tracker_paths.txt via load_config(), which keeps
+    whatever followed the '=' verbatim — so "KEY = 1500" arrives as " 1500".
+    """
+    for name in names:
+        val = os.environ.get(name, "").strip()
+        if val:
+            return val
+    return default
+
+
+def _flag_env(*names):
+    """A yes/no setting from the config. Off unless it reads as true.
+
+    Written out because "KEEP_NPY=0" is a non-empty string and would otherwise
+    be truthy — i.e. switching the setting off would switch it on.
+    """
+    return _str_env(*names).lower() in ("1", "true", "yes", "on")
+
+
 MAX_CPU = _int_env("MAX_CPU", 90)
 MAX_GPU = _int_env("MAX_GPU", 90)
 MAX_MEM = _int_env("MAX_MEM", 65)
@@ -361,14 +383,15 @@ def run_worker(ip, op, steps, out):
 
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
-        # Per-sample data goes into the session NWB. Set HM_KEEP_NPY=1 to also
-        # write the old LFP_Output/*.npy alongside it.
-        keep_npy = ["--keep-npy"] if os.environ.get("HM_KEEP_NPY") else []
+        # Per-sample data goes into the session NWB. KEEP_NPY=1 in
+        # hm_tracker_paths.txt also writes the old LFP_Output/*.npy alongside it.
+        keep_npy = ["--keep-npy"] if _flag_env("KEEP_NPY", "HM_KEEP_NPY") else []
+        lfp_rate = _str_env("LFP_OUTPUT_RATE", default="1500")
         if Path("./src/sorter/export_lfp.py").exists():
             log(out, "[STEP 8] Running LFP Extraction...")
             run([PYTHON, "-u", "./src/sorter/export_lfp.py",
                  "--input_folder", ip, "--output_folder", op,
-                 "--output_rate", "1500"] + keep_npy, out=out)
+                 "--output_rate", lfp_rate] + keep_npy, out=out)
         # EMG-from-LFP needs the raw wideband (300-600 Hz); runs after the LFP
         # export so it can upsample onto lfp_timestamps.npy. Needs step 1 (-raw).
         if Path("./src/sorter/export_emg_from_lfp.py").exists():

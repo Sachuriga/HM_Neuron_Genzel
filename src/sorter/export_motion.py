@@ -183,7 +183,7 @@ def _write_motion_to_nwb(lfp_dir, movement, fs):
     if nwb_dir not in sys.path:
         sys.path.append(nwb_dir)
     try:
-        import sleep_nwb as snwb
+        import sleep_nwb_writer as snwb
         from pynwb import NWBHDF5IO
     except Exception as exc:
         print(f"  ⚠  could not import the NWB writer: {exc}")

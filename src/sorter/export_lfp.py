@@ -370,7 +370,7 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
     _nwb_dir = str(Path(__file__).resolve().parent.parent / "nwb")
     if _nwb_dir not in _sys.path:
         _sys.path.append(_nwb_dir)
-    import sleep_nwb as snwb
+    import sleep_nwb_writer as snwb
     from pynwb import NWBHDF5IO, NWBFile
     from uuid import uuid4
     from datetime import datetime, timezone as _tz
