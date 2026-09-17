@@ -346,7 +346,7 @@ STEPS = [
 
 def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
                       sleep_channels, emg_channel, cleanest, snr,
-                      awakeness, emg_rms, theta_delta):
+                      awakeness, emg_rms, theta_delta, session_name=None):
     """Write the per-sample arrays into ``<op>/<Rat>_<YYYYMMDD>.nwb``.
 
     THE TIME AXIS is unchanged from the ``lfp_timestamps.npy`` this replaces.
@@ -375,7 +375,11 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
     from datetime import datetime, timezone as _tz
 
     op = Path(output_folder)
-    nwb_path = snwb.find_session_nwb(op) or (op / snwb.session_nwb_name(pfx, op))
+    # The phase postfix comes from the RECORDING name (ip side) — op folders are
+    # named op1/op6 and carry none.
+    nwb_path = snwb.find_session_nwb(op) or (
+        op / snwb.session_nwb_name(pfx, session_name or (
+            boundaries[0]["name"] if boundaries else None)))
 
     # every session's span on the shared clock, in samples AND seconds
     bounds = [{"name": b["name"], "start_sample": int(b["start"]),
@@ -619,7 +623,8 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
             output_folder, pfx, fs=fs, lfp=lfp_array, boundaries=boundaries,
             channel_map=ch_info_list, sleep_channels=sc, emg_channel=emg_ch,
             cleanest=best_ch_idx, snr=scores,
-            awakeness=awakeness, emg_rms=emg_rms, theta_delta=theta_delta)
+            awakeness=awakeness, emg_rms=emg_rms, theta_delta=theta_delta,
+            session_name=sessions[0]['name'])
 
         del lfp_array, emg_1d
         gc.collect()

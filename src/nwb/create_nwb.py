@@ -846,17 +846,20 @@ if __name__ == "__main__":
             op_dir = Path(root + output_folder) / session_folders[session_i].name
             stem_parts = session_folders[session_i].name.split("_")
 
-        # The session folder's phase postfix (…_post) goes into the name, so
-        # same-day sessions never collide. Derived through sleep_nwb so step 8
-        # and this step always agree on the filename.
+        # Step 8 already wrote this session's NWB (its name carries the
+        # recording's phase postfix, e.g. Rat5_20260807_post.nwb). Find that
+        # file rather than recomputing the name — the op folder is called op1 /
+        # op6 and has no postfix to derive it from, so recomputing here would
+        # invent a second file. Only when there is none do we name a fresh one.
         import sleep_nwb as _snwb
-        postfix = _snwb.folder_postfix(op_dir)
-        if (len(stem_parts) >= 2 and stem_parts[0].isdigit()
+        existing = _snwb.find_session_nwb(op_dir)
+        if existing is not None:
+            output_name = existing.name
+        elif (len(stem_parts) >= 2 and stem_parts[0].isdigit()
                 and stem_parts[1].lower().startswith("rat")):
-            stem = f"{stem_parts[1]}_{stem_parts[0]}"              # Rat6_20260629
+            output_name = f"{stem_parts[1]}_{stem_parts[0]}.nwb"   # Rat6_20260629.nwb
         else:
-            stem = session_folders[session_i].name
-        output_name = f"{stem}_{postfix}.nwb" if postfix else f"{stem}.nwb"
+            output_name = f"{session_folders[session_i].name}.nwb"
 
         output_path = str(op_dir / output_name)
 

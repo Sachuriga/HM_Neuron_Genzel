@@ -457,7 +457,7 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     print(f"\n{'─' * 60}")
     print(f"▶  EMG-from-LFP (Buzsáki cross-channel correlation)")
     print(f"   Input:  {input_folder}")
-    print(f"   Output: {output_dir}")
+    print(f"   Output: {output_dir if keep_npy else 'the session NWB'}")
 
     stem = _session_stem(input_folder)
     chans = _resolve_eeg_channels(stem, config, eeg_channels)
@@ -500,7 +500,7 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     # Into the session NWB, on its own 5 Hz timebase — this is what the sleep
     # scorer reads. The per-sample upsampled copy is derivable from it, so it is
     # no longer written for NWB-era sessions.
-    _write_emg_to_nwb(output_dir, emg_5hz_norm, ts_5hz, emg_fs)
+    nwb_path = _write_emg_to_nwb(output_dir, emg_5hz_norm, ts_5hz, emg_fs)
 
     # Legacy sessions (those still carrying lfp_timestamps.npy) also get the
     # upsampled emg_from_lfp.npy, so anything reading it keeps working.
@@ -517,7 +517,7 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
             print(f"    {b['name']}: t0={b['start_s']:.1f}s  dur={b['duration_s']:.1f}s")
 
     print(f"{'=' * 60}")
-    print(f"✅  EMG-from-LFP → {output_dir}")
+    print(f"✅  EMG-from-LFP → {nwb_path.name if nwb_path is not None else output_dir}")
 
 
 def _load_config(config_path):

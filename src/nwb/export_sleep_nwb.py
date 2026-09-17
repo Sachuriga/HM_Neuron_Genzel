@@ -138,13 +138,11 @@ def run(output_folder, rat_nr=None):
 
     op = Path(output_folder)
     lfp_dir = op / "LFP_Output"
-    if not lfp_dir.is_dir():
-        print(f"[sleep-nwb] No LFP_Output in {op} — run the LFP export first. Skipping.")
-        return 0
 
     # The LFP export writes the NWB itself now; this script is the backfill for
-    # legacy sessions that only ever produced .npy. Nothing to do when the
-    # session NWB already carries the LFP.
+    # legacy sessions that only ever produced .npy. Check the NWB FIRST — a
+    # freshly exported session has no LFP_Output at all, and that is the normal
+    # case, not a failure.
     existing = snwb.find_session_nwb(op)
     if existing is not None:
         inputs = None
@@ -159,6 +157,11 @@ def run(output_folder, rat_nr=None):
             print(f"[sleep-nwb] Could not inspect {existing.name}: {exc}")
         finally:
             snwb.close_inputs(inputs)
+
+    if not lfp_dir.is_dir():
+        print(f"[sleep-nwb] No LFP_Output in {op} and no LFP in the session NWB "
+              f"— run the LFP export first. Skipping.")
+        return 0
 
     prefix = output_prefix(lfp_dir)
     if not prefix:

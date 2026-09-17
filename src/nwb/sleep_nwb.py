@@ -70,34 +70,41 @@ def _slug(name: str) -> str:
 # ---------------------------------------------------------------------------- #
 #  Locating the session NWB
 # ---------------------------------------------------------------------------- #
-def folder_postfix(folder) -> str:
-    """The phase token trailing a session folder's name, e.g. ``'post'``.
+def folder_postfix(name_or_path) -> str:
+    """The phase token trailing a **recording name**, e.g. ``'post'``.
 
-    Session folders are ``<Rat>_<label>_<YYYYMMDD>_<HHMMSS>`` with an optional
-    phase suffix, so ``Rat1_HM_Neurons_20260212_105706_post`` gives ``'post'``
-    and ``Rat1_HM_Neurons_20260211_104846`` gives ``''``. Sessions recorded on
-    the same day are told apart by this token, which is why it belongs in the
-    NWB's name.
+    Recordings are named ``<Rat>_<label>_<YYYYMMDD>_<HHMMSS>`` with an optional
+    phase suffix, so ``Rat5_HM_Neurons_20260807_123703_post`` gives ``'post'``
+    and ``Rat1_HM_Neurons_20260211_104846`` gives ``''``.
+
+    Take this from the recording (the ``.LFP`` folder / session name found in
+    the **ip** folder), never from the op folder — op folders are named ``op1``,
+    ``op6`` … and carry no phase. Sessions recorded on the same day are told
+    apart by this token, which is why it belongs in the NWB's name.
     """
-    if not folder:
+    if not name_or_path:
         return ""
-    m = re.search(r"_\d{8}_\d{6}[_-]*(.*)$", Path(folder).name)
+    m = re.search(r"_\d{8}_\d{6}[_-]*(.*)$", Path(str(name_or_path)).name)
     if not m:
         return ""
     return re.sub(r"[^A-Za-z0-9]+", "_", m.group(1)).strip("_")
 
 
-def session_nwb_name(prefix: str, folder=None) -> str:
+def session_nwb_name(prefix: str, session_name=None) -> str:
     """The session NWB's filename: ``Rat6_20260629.nwb``, or
-    ``Rat6_20260212_post.nwb`` when the session folder carries a phase postfix.
+    ``Rat5_20260807_post.nwb`` when the recording carries a phase postfix.
 
     ``prefix`` is a step-8 file prefix (``Rat6_20260629_143022_``) and
-    ``folder`` the session folder, whose postfix is appended. Both step 8 and
-    step w derive the name through here, so they always land on one file.
+    ``session_name`` the recording's name (from the ip folder), whose postfix
+    is appended.
+
+    Step w does not recompute this: it looks for the file step 8 already wrote
+    (:func:`find_session_nwb`) and only falls back to a name of its own when
+    there is none — so the two can never disagree.
     """
     m = re.match(r"^([A-Za-z]+\d+)_(\d{8})", str(prefix or ""))
     base = f"{m.group(1)}_{m.group(2)}" if m else "session"
-    post = folder_postfix(folder)
+    post = folder_postfix(session_name)
     return f"{base}_{post}.nwb" if post else f"{base}.nwb"
 
 

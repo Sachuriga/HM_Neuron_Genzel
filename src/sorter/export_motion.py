@@ -219,7 +219,7 @@ def run(input_folder, output_folder, keep_npy=False):
     print(f"\n{'─' * 60}")
     print(f"▶  Motion (IMU) extraction")
     print(f"   Input:  {base_path}")
-    print(f"   Output: {output_dir}")
+    print(f"   Output: {output_dir if keep_npy else 'the session NWB'}")
 
     # Each .rec is a separate recording session with its own analog export
     # folder. Load + downsample every session, then concatenate them in
@@ -296,9 +296,8 @@ def run(input_folder, output_folder, keep_npy=False):
     # 1 s bins at load time, reproducing the original per-second motion.
     movement = accel_to_movement(motion, TARGET_FS)      # (n_down,) @ TARGET_FS
 
-    # The per-sample arrays live in the session NWB; only the small boundaries
-    # record stays on disk as .npy.
-    _write_motion_to_nwb(output_dir, movement, TARGET_FS)
+    # The per-sample arrays live in the session NWB.
+    nwb_path = _write_motion_to_nwb(output_dir, movement, TARGET_FS)
 
     if keep_npy:
         np.save(output_dir / f"{pfx}motion.npy", motion)
@@ -308,16 +307,16 @@ def run(input_folder, output_folder, keep_npy=False):
         np.save(output_dir / f"{pfx}motion_accel.npy", movement)
         print(f"  ✓ {pfx}motion_accel.npy  ({movement.size}) @ {TARGET_FS} Hz  "
               f"(|z|-sum of {len(found_axes)} axes, 0.1-1 Hz band-pass)")
-
-    if keep_npy:
         np.save(output_dir / f"{pfx}motion_session_boundaries.npy", boundaries)
+
     if len(boundaries) > 1:
         for b in boundaries:
             print(f"    {b['name']}: samples {b['start']}.."
                   f"{b['start'] + b['n']}  (t0={b['start'] / TARGET_FS:.2f}s)")
 
     print(f"{'=' * 60}")
-    print(f"✅  Motion data → {out_file}")
+    dest = nwb_path.name if nwb_path is not None else str(output_dir)
+    print(f"✅  Motion data → {dest}")
 
 
 if __name__ == "__main__":
