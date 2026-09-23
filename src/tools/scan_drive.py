@@ -370,6 +370,30 @@ def list_drive_roots(include_system=False, include_network=False):
     return roots
 
 
+def volume_root(p) -> Path:
+    """The root of the drive a path lives on: ``F:\\`` on Windows, the mount point
+    (e.g. ``/Volumes/HM_A``) on POSIX."""
+    q = Path(p)
+    try:
+        q = q.resolve()
+    except OSError:
+        pass
+    if sys.platform.startswith("win"):
+        return Path(q.anchor) if q.anchor else q
+    while q.parent != q and not os.path.ismount(q):
+        q = q.parent
+    return q
+
+
+def is_system_volume(root) -> bool:
+    """True for the OS drive — C:\\ on Windows, / on POSIX."""
+    root = Path(root)
+    if sys.platform.startswith("win"):
+        sysdrive = os.environ.get("SystemDrive", "C:")[0].upper()
+        return str(root.drive or root.anchor)[:1].upper() == sysdrive
+    return root.parent == root
+
+
 def find_sessions_deep(root, max_depth=6, on_dir=None, should_stop=None):
     """Find every ``<Rat folder>/<YYYYMMDD>`` session under `root`, at any depth
     up to `max_depth` — unlike find_sessions(), which only looks one or two

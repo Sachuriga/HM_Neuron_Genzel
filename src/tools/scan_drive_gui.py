@@ -22,11 +22,12 @@ Workflow:
      data is present and which is MISSING.
 
   4. Press *Find scattered data* when something comes back MISSING. Step 3 only
-     looks directly under the chosen drive folders; this walks those same folders
-     to a chosen depth, so it finds sessions filed somewhere odd inside them (a
-     backup folder, a per-experimenter folder, a nested copy). It reports data
-     found *nowhere* in them, folders on disk the sheet never asked for
-     (*orphans*), and unfiled camera videos.
+     looks directly under the chosen drive folders; this walks the WHOLE drive
+     each of them lives on, to a chosen depth, so it finds sessions filed
+     somewhere odd anywhere on that drive (a backup folder, a per-experimenter
+     folder, a nested copy). It reports data found *nowhere* on those drives,
+     folders on disk the sheet never asked for (*orphans*), and unfiled camera
+     videos.
 
 Launch with:  python scan_drive_gui.py
 """
@@ -395,14 +396,14 @@ def flag_short_phases(res: dict, medians: dict) -> None:
 # ------------------------------------------------------------------
 def search_all_drives(roots_selected: list[str], max_depth: int = 6,
                       on_dir=None, should_stop=None) -> dict:
-    """Hunt for Rat<N>/<YYYYMMDD> session folders WITHIN the selected drive folders,
-    at any depth (not just the structured 2-level layout the main scan reads). The
-    search is confined to the folders the user added — it does NOT walk other mounted
-    volumes.
+    """Hunt for Rat<N>/<YYYYMMDD> session folders WITHIN the given roots, at any
+    depth (not just the structured 2-level layout the main scan reads). The GUI
+    passes the whole drive each listed folder lives on (see _search_roots); drives
+    with no listed folder on them are NOT walked.
 
-    Returns (rat_no, date8) -> list of dicts with the path, the drive folder it lives
+    Returns (rat_no, date8) -> list of dicts with the path, the root it lives
     under, and what it contains. Use it to surface sessions filed somewhere odd
-    inside the drives, plus on-disk folders the sheet never asked for (orphans)."""
+    on the drives, plus on-disk folders the sheet never asked for (orphans)."""
     selected = []
     for r in roots_selected:
         if r:
@@ -412,7 +413,7 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
                 pass
 
     idx: dict = {}
-    for vol in selected:                       # only the drive folders the user added
+    for vol in selected:                       # only the roots passed in
         if should_stop is not None and should_stop():
             break
         for sess in sd.find_sessions_deep(vol, max_depth=max_depth,
@@ -433,10 +434,10 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
 def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
     """Turn a search_all_drives() index + the roster into reviewable rows.
 
-    Two kinds of row, the two ways the drive folders and the sheet can disagree
-    (the search covers only the selected drive folders, so every hit is under
-    one of them):
-      not-found  — an expected session found in none of the selected folders
+    Two kinds of row, the two ways the drives and the sheet can disagree
+    (the search covers only the drives the selected folders live on, so every
+    hit is on one of them):
+      not-found  — an expected session found on none of the searched drives
       orphan     — a session folder on disk that the sheet never asked for
                    (a typo'd folder, a stray copy, an unlogged recording)
 
@@ -681,7 +682,7 @@ class SearchWorker(QObject):
             # the other half of "find all the data".
             have_video = {k for k, hits in found.items()
                           if any(h.get("n_video", 0) for h in hits)}
-            vols = [r for r in self.roots if r]    # only the selected drive folders
+            vols = [r for r in self.roots if r]    # the same roots as the session search
             # include_filed=True: already-sorted camera folders are not re-filed,
             # but assign_videos needs them to hold their slot in the by-time
             # ordering so a still-loose folder gets the right session number.
@@ -804,7 +805,7 @@ _SCATTER_COLS = ["Kind", "Rat", "Date", "day", "session", "repeat",
                  "pre GB", "task GB", "post GB", "Video", "Missing", "Split",
                  "Volume(s)", "Path", "Detail"]
 _KIND_COLOR = {
-    "not-found": QColor(250, 214, 214),      # in none of the selected drive folders
+    "not-found": QColor(250, 214, 214),      # on none of the searched drives
     "orphan":    QColor(222, 233, 250),      # on disk, absent from the sheet
     "video":     QColor(214, 234, 250),      # unfiled camera video, matched to a rat
 }
@@ -885,7 +886,7 @@ class ScatterDialog(QDialog):
         v.addWidget(self.table, 1)
 
         v.addWidget(QLabel(
-            "red = in none of the selected drive folders · blue = on disk but not in the "
+            "red = on none of the searched drives · blue = on disk but not in the "
             "sheet.  For an implanted rat one "
             "row holds the whole session: pre/task/post GB (✗ = absent, red ⚠ = short vs the "
             "rat's median) and Video (count, 'dump' = in the acquisition dump, ✗ = none); "
@@ -1935,11 +1936,11 @@ class ScanDriveGUI(QMainWindow):
 
         m_fix = mb.addMenu("Fix / &Prepare")
         self.organize_btn = QAction("Organize drive…", self)
-        self.organize_btn.setToolTip("File the roster sessions on ONE of your listed drive "
-                                     "folders into that drive's HM_neurons archive — moves "
-                                     "(renames) within that drive only; data on other drives "
-                                     "is listed but never copied or touched. Shows the full "
-                                     "plan before writing anything.")
+        self.organize_btn.setToolTip("File the roster sessions found anywhere on the drive of "
+                                     "ONE of your listed folders into that drive's HM_neurons "
+                                     "archive — moves (renames) within that drive only; data "
+                                     "on other drives is listed but never copied or touched. "
+                                     "Shows the full plan before writing anything.")
         self.organize_btn.triggered.connect(self._organize)
         self.organize_btn.setEnabled(False)
         m_fix.addAction(self.organize_btn)
@@ -1964,7 +1965,8 @@ class ScanDriveGUI(QMainWindow):
         m_rep = mb.addMenu("&Reports")
         self.summary_btn = QAction("Summary figure…", self)
         self.summary_btn.setToolTip("One-look status figure per rat/repeat: pre/task/post/video "
-                                    "presence, size, and location. Searches the drive folders first.")
+                                    "presence, size, and location. Searches the whole drive(s) "
+                                    "the listed folders are on first.")
         self.summary_btn.triggered.connect(self._summary)
         self.summary_btn.setEnabled(False)
         m_rep.addAction(self.summary_btn)
@@ -1990,8 +1992,10 @@ class ScanDriveGUI(QMainWindow):
         self.act_sysdrive.setCheckable(True)
         self.act_sysdrive.setToolTip("Also sweep C:\\ in Preprocess progress, and in Fix video "
                                      "names when no drive folder is selected. Find scattered / "
-                                     "Organize / Summary / RecordingMeta only ever search the "
-                                     "drive folders above.")
+                                     "Organize / Summary search the whole drive each listed "
+                                     "folder is on — a folder on C:\\ is searched whole only "
+                                     "with this on. RecordingMeta searches just the listed "
+                                     "folders.")
         m_opt.addAction(self.act_sysdrive)
         m_opt.addSeparator()
         self.depth_spin = QSpinBox()
@@ -2014,8 +2018,9 @@ class ScanDriveGUI(QMainWindow):
         act.addWidget(self.scan_btn)
         self.search_btn = QPushButton("Find scattered data…")
         self.search_btn.setToolTip(
-            "Deep-search the drive folders above (at any depth, up to Options ▸ Search "
-            "depth) for Rat<N>/<YYYYMMDD> folders filed somewhere odd inside them.")
+            "Deep-search the WHOLE drive each folder above lives on (from the drive root, "
+            "up to Options ▸ Search depth) for Rat<N>/<YYYYMMDD> folders filed somewhere "
+            "odd on it.")
         self.search_btn.clicked.connect(self._search_all)
         self.search_btn.setEnabled(False)
         act.addWidget(self.search_btn)
@@ -2120,6 +2125,31 @@ class ScanDriveGUI(QMainWindow):
                 for i in range(self.drive_list.count())
                 if self.drive_list.item(i).text().strip()]
 
+    def _search_roots(self) -> list:
+        """What Find scattered / Organize / Summary walk: the WHOLE drive each listed
+        folder lives on, not just the folder — scattered data sits anywhere on the
+        drive (a backup folder, a stray copy at the root). Two folders on one drive
+        give one root; drives with no listed folder are never walked.
+
+        A folder on the system drive stays as listed unless Options ▸ Include system
+        drive is on — and always on POSIX, where / also holds every other mounted
+        volume (/Volumes, /media), so walking it would sweep them all."""
+        out = []
+        for d in self._drive_paths():
+            vr = sd.volume_root(d)
+            if sd.is_system_volume(vr) and not (os.name == "nt"
+                                                and self.act_sysdrive.isChecked()):
+                vr = Path(d)
+            out.append(str(vr))
+        keep: list = []                            # (normalised, as shown)
+        for r in out:
+            nr = self._norm_path(r)
+            if any(nk == nr or self._is_under(nr, nk) for nk, _ in keep):
+                continue
+            keep = [(nk, k) for nk, k in keep if not self._is_under(nk, nr)]
+            keep.append((nr, r))
+        return [k for _, k in keep]
+
     # -- roster ------------------------------------------------------------
     def _load_roster(self):
         if self._running(self.thread) or self._search_busy():
@@ -2190,14 +2220,17 @@ class ScanDriveGUI(QMainWindow):
             t.wait(2000)
         self._refresh_actions()
 
-    def _start_search(self, status: str, on_failed, on_index=None, on_rows=None) -> bool:
-        """Start the one shared SearchWorker; refuse if one is already running."""
+    def _start_search(self, status: str, on_failed, on_index=None, on_rows=None,
+                      roots=None) -> bool:
+        """Start the one shared SearchWorker; refuse if one is already running.
+        `roots` defaults to the listed drive folders themselves."""
         if self._busy_note() or self._closing:
             return False
         if self.search_thread is not None:
             self.search_thread.wait(2000)        # previous one has finished; let it exit
         self.search_thread = QThread()
-        self.search_worker = SearchWorker(self.roster, self._drive_paths(),
+        self.search_worker = SearchWorker(self.roster,
+                                          self._drive_paths() if roots is None else roots,
                                           self.depth_spin.value(),
                                           want_rows=on_rows is not None)
         self.search_worker.moveToThread(self.search_thread)
@@ -2337,27 +2370,28 @@ class ScanDriveGUI(QMainWindow):
     def _search_all(self):
         if not self.roster or self._busy_note():
             return
-        roots = self._drive_paths()
-        if not roots:
+        if not self._drive_paths():
             QMessageBox.warning(self, "No drive folders",
                                 "Add at least one drive folder above first.")
             return
+        roots = self._search_roots()
         if QMessageBox.question(
                 self, "Find scattered data",
-                f"Deep-search these {len(roots)} drive folder(s), "
-                f"{self.depth_spin.value()} levels down, for Rat<N>/<YYYYMMDD> folders:\n\n  "
+                f"Deep-search the whole drive of each listed folder — {len(roots)} root(s), "
+                f"{self.depth_spin.value()} levels down — for Rat<N>/<YYYYMMDD> folders:\n\n  "
                 + "\n  ".join(roots) + "\n\nThis may take a few minutes.") \
                 != QMessageBox.StandardButton.Yes:
             return
-        self.status_lbl.setText("Searching the drive folders…")
-        self._start_search("Searching…", self._search_failed, on_rows=self._search_done)
+        self.status_lbl.setText("Searching the drives…")
+        self._start_search("Searching…", self._search_failed, on_rows=self._search_done,
+                           roots=roots)
 
     def _search_done(self, rows: list, n_found: int):
-        self.status_lbl.setText(f"Search done — {n_found} session folder(s) in the drive folders.")
+        self.status_lbl.setText(f"Search done — {n_found} session folder(s) on the drives.")
         if not rows:
             QMessageBox.information(
                 self, "Nothing scattered",
-                f"Found {n_found} session folder(s) in the selected drive folders.\n\n"
+                f"Found {n_found} session folder(s) on the searched drives.\n\n"
                 "Every expected session was found, and every folder on disk is "
                 "accounted for in the spreadsheet.")
             return
@@ -2371,8 +2405,9 @@ class ScanDriveGUI(QMainWindow):
     def _organize(self):
         if not self.roster or self._busy_note():
             return
-        # Organize works on ONE of the listed drive folders and only moves data
-        # already on that drive — never a free-picked folder, never a copy.
+        # Organize files into ONE of the listed drive folders and only moves data
+        # already on that drive — never a free-picked folder, never a copy. The
+        # search covers the whole drive, so data anywhere on it is gathered in.
         roots = self._drive_paths()
         if not roots:
             QMessageBox.information(
@@ -2385,7 +2420,8 @@ class ScanDriveGUI(QMainWindow):
             picked, ok = QInputDialog.getItem(
                 self, "Organize drive",
                 "Which drive folder should be organized?\n"
-                "(only data already on that drive is moved; other drives are not touched)",
+                "(data from anywhere on that drive is moved into it; other drives are "
+                "not touched)",
                 roots, 0, False)
             if not ok or not picked:
                 return
@@ -2401,7 +2437,8 @@ class ScanDriveGUI(QMainWindow):
         # from a stale picture is how data goes missing.
         self.status_lbl.setText("Looking at the drives…")
         self._start_search("Looking…", self._organize_failed,
-                           on_index=lambda combined: self._plan_organize(combined, dest))
+                           on_index=lambda combined: self._plan_organize(combined, dest),
+                           roots=self._search_roots())
 
     def _organize_failed(self, msg: str):
         QMessageBox.critical(self, "Organize: search failed", msg)
@@ -2552,8 +2589,9 @@ class ScanDriveGUI(QMainWindow):
     def _summary(self):
         if not self.roster or self._busy_note():
             return
-        self.status_lbl.setText("Searching the drive folders for the summary…")
-        self._start_search("Looking…", self._summary_failed, on_index=self._render_summary)
+        self.status_lbl.setText("Searching the drives for the summary…")
+        self._start_search("Looking…", self._summary_failed, on_index=self._render_summary,
+                           roots=self._search_roots())
 
     def _render_summary(self, combined: dict):
         if self._closing:
@@ -2700,7 +2738,7 @@ class ScanDriveGUI(QMainWindow):
         if paths:
             _reveal(paths[0])
         elif self.results[r].get("status") in ("MISSING", "PARTIAL"):
-            # nothing found by the scan — offer the deep search of the drive folders
+            # nothing found by the scan — offer the deep search of the whole drives
             self._search_all()
 
     def _export(self):
