@@ -38,7 +38,7 @@ PRESETS = {
     "Tracker implanted": "1e2345678d",
     "Tracker non-implanted": "23456d",
     "After manual curation": "wuvbm",
-    "Retrack": "346d",
+    "Retrack": "3456d",
     "Full pipeline": "1e234567c89wuvnbmt",
     "Trodes export (DIO/raw/analog + LFP)": "1e",
     "Sync + stitch + track": "234",
