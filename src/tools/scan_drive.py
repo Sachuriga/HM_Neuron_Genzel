@@ -295,7 +295,13 @@ def find_sessions(root):
         return [root]
     out = []
     try:
-        for child in sorted(root.iterdir()):
+        children = sorted(root.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        # Per-child guard: one unreadable folder at a drive root (e.g. Windows'
+        # "System Volume Information") must not hide every folder sorted after it.
+        try:
             if not child.is_dir():
                 continue
             if _DATE_RE.match(child.name):
@@ -304,8 +310,8 @@ def find_sessions(root):
                 for g in sorted(child.iterdir()):     # root/Rat*/date
                     if g.is_dir() and _DATE_RE.match(g.name):
                         out.append(g)
-    except OSError:
-        pass
+        except OSError:
+            continue
     if out:
         return out
     # nothing directly under root — bare drive? locate the HM_neurons / Rat container.

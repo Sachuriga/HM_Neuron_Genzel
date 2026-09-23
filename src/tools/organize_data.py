@@ -14,9 +14,10 @@ drives), ``plan_organize`` works out what would have to be copied where, and
 Two properties matter more than anything else here, because the inputs are the
 only copies of months of irreplaceable recordings:
 
-  * **It only ever copies.** Nothing is deleted, moved, or overwritten — not
-    sources, not existing files at the destination. Freeing up the redundant
-    copies afterwards is a decision left to a human with the plan in hand.
+  * **Nothing is deleted or overwritten.** Within one drive an entry is moved
+    by an atomic rename; across drives it is copied and the source kept. Existing
+    files at the destination are never touched. Freeing up the redundant copies
+    afterwards is a decision left to a human with the plan in hand.
   * **Planning is separate from doing.** ``plan_organize`` touches nothing and
     returns a reviewable list of actions. Nothing is written until someone looks
     at that plan and calls ``execute_plan``.
@@ -51,6 +52,7 @@ SKIP_ARCHIVED = "skip-archived"  # already filed under an HM_neuron archive — 
 DUPLICATE = "duplicate"        # identical to a chosen source on another drive
 CONFLICT = "conflict"          # same name, different content — needs a human
 UNREADABLE = "unreadable"      # could not be read — drive disconnected?
+SKIP_OTHER_DRIVE = "skip-other-drive"  # on another drive — move-only plans never touch it
 
 
 ARCHIVE_NAME = "HM_neurons"     # the canonical archive folder to consolidate into
@@ -212,7 +214,8 @@ def volume_of(p: Path) -> str:
 
 def plan_organize(roster: list[dict], found: dict, dest: str,
                   videos: list[dict] | None = None,
-                  on_progress=None, should_stop=None) -> list[dict]:
+                  on_progress=None, should_stop=None,
+                  move_only: bool = False) -> list[dict]:
     """Work out what it would take to assemble every roster session under `dest`.
 
     `found` is the (rat_no, date8) -> [hit] index from search_all_drives(), and
@@ -224,7 +227,11 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
     Whether an entry moves or copies is decided by the volume it is already on:
     within one drive a move is a rename — instant, needing no extra space, and
     leaving the bytes exactly where they are. Across drives that is impossible,
-    so the data is copied and the source left untouched."""
+    so the data is copied and the source left untouched.
+
+    With ``move_only`` (what the GUI uses) the plan is confined to the
+    destination's own drive: only data already on that drive is filed, by rename;
+    anything on another drive is listed as SKIP_OTHER_DRIVE and never copied."""
     dest_root = Path(dest)
     dest_vol = volume_of(dest_root)
     plan: list[dict] = []
@@ -236,12 +243,18 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
             names.setdefault(rat_no, []).append(Path(h["path"]).parent.name)
     rat_dir = {r: canonical_rat_dirname(r, n) for r, n in names.items()}
 
+    # A rat can run several sessions in one day, and all of them live in the same
+    # Rat<N>/<date> folder — so plan per (rat, date), once, or every entry would be
+    # planned (and its bytes counted against free space) once per session.
+    by_key: dict = {}
     for e in roster:
+        if e["date8"]:
+            by_key.setdefault((e["rat_no"], e["date8"]), []).append(e)
+
+    for key, ents in by_key.items():
         if should_stop is not None and should_stop():
             break
-        if not e["date8"]:
-            continue
-        key = (e["rat_no"], e["date8"])
+        e = ents[0]
         hits = found.get(key, [])
         if not hits:
             continue                       # nothing on any drive; nothing to plan
@@ -251,7 +264,9 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
         rdir = rat_dir.get(e["rat_no"], f"Rat{e['rat_no']}")
         target_sess = dest_root / rdir / e["date8"]
         base_sess = dict(rat=e["rat"], rat_no=e["rat_no"], date8=e["date8"],
-                         day=e["day"], session=e["session"], repeat=e["repeat"])
+                         day=e["day"],
+                         session="+".join(str(x["session"]) for x in ents),
+                         repeat=e["repeat"])
 
         # name -> [(source path, signature, hit)] across every drive. An entry
         # that is already the destination is not a source for itself — the
@@ -260,6 +275,12 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
         by_name: dict[str, list[tuple[Path, tuple, dict]]] = {}
         for h in hits:
             src_sess = Path(h["path"])
+            if move_only and volume_of(src_sess) != dest_vol:
+                plan.append(dict(base_sess, entry="(whole session)", src=str(src_sess),
+                                 dst="", action=SKIP_OTHER_DRIVE, n_files=0, bytes=0,
+                                 reason="on another drive — Organize only moves data "
+                                        "within the drive being organized"))
+                continue
             try:
                 raw = is_raw_session(src_sess)
             except OSError as exc:
@@ -337,6 +358,11 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
             # entry into a rename instead of a cross-drive transfer of 60+ GB.
             chosen = _prefer(cands, dest_vol)
             same_vol = volume_of(chosen[0]) == dest_vol
+            if move_only and not same_vol:        # safety net: never copy
+                plan.append(dict(base, src=str(chosen[0]), action=SKIP_OTHER_DRIVE,
+                                 n_files=sig[0], bytes=sig[1],
+                                 reason="on another drive — not copied"))
+                continue
             plan.append(dict(base, src=str(chosen[0]),
                              action=MOVE if same_vol else COPY,
                              n_files=sig[0], bytes=sig[1],
@@ -349,11 +375,13 @@ def plan_organize(roster: list[dict], found: dict, dest: str,
                                  reason=f"identical copy of '{name}' — "
                                         f"using {chosen[0]}, leaving this one"))
 
-    _plan_videos(videos or [], roster, found, rat_dir, dest_root, dest_vol, plan)
+    _plan_videos(videos or [], roster, found, rat_dir, dest_root, dest_vol, plan,
+                 move_only=move_only)
     return plan
 
 
-def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
+def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan,
+                 move_only=False):
     """Add filing actions for the loose camera folders assign_videos() matched.
 
     Each matched folder is filed as a timestamp subfolder of its session —
@@ -389,6 +417,13 @@ def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
         e = roster_by.get((rat_no, date8))
         rdir = rat_dir.get(rat_no, f"Rat{rat_no}")
         src = Path(v["path"])
+        if move_only and volume_of(src) != dest_vol:
+            plan.append(dict(rat=v.get("rat") or f"Rat{rat_no}", rat_no=rat_no,
+                             date8=date8, day="", session="", repeat=None,
+                             entry=src.name, src=str(src), dst="",
+                             action=SKIP_OTHER_DRIVE, n_files=0, bytes=v.get("total", 0),
+                             reason="video on another drive — not moved"))
+            continue
         dst = dest_root / rdir / date8 / src.name
         # Prefer the per-folder day/session assign_videos resolved (correct even
         # when a rat has several sessions in a day); fall back to the roster entry.
@@ -425,13 +460,12 @@ def _plan_videos(videos, roster, found, rat_dir, dest_root, dest_vol, plan):
 
 def _prefer(cands: list[tuple[Path, tuple, dict]], dest_vol: str):
     """Of several identical copies, pick the one to take: prefer one already on
-    the destination volume (a rename beats a transfer), then a drive the user
-    selected, then a folder named with the implant id, then the shortest path.
-    Deterministic, so a re-plan makes the same choice."""
+    the destination volume (a rename beats a transfer), then a folder named with
+    the implant id, then the shortest path. Deterministic, so a re-plan makes the
+    same choice."""
     def rank(c):
-        path, _sig, h = c
+        path, _sig, _h = c
         return (0 if volume_of(path) == dest_vol else 1,
-                0 if h.get("in_selected") else 1,
                 0 if _RAT_IMPLANT_RE.match(path.parent.name) else 1,
                 len(str(path)), str(path))
     return min(cands, key=rank)
@@ -456,6 +490,7 @@ def plan_totals(plan: list[dict]) -> dict:
         n_duplicate=sum(1 for p in plan if p["action"] == DUPLICATE),
         n_conflict=sum(1 for p in plan if p["action"] == CONFLICT),
         n_unreadable=sum(1 for p in plan if p["action"] == UNREADABLE),
+        n_other_drive=sum(1 for p in plan if p["action"] == SKIP_OTHER_DRIVE),
         sessions=len({(p["rat"], p["date8"]) for p in mv + cp}),
     )
 
@@ -523,6 +558,35 @@ def _copy_file(src: Path, dst: Path, on_bytes=None, should_stop=None) -> None:
     os.replace(tmp, dst)
 
 
+def _copy_tree(src: Path, dst: Path, on_bytes=None, should_stop=None) -> None:
+    """Copy a folder into ``<dst>.partial`` and rename it into place only once
+    every file is in and the tree matches the source's (files, bytes) signature.
+
+    The folder-level twin of _copy_file's temp name: a stopped or failed copy never
+    leaves a half-filled folder under the real name (which every later plan would
+    report as a different-size CONFLICT and never finish). The temp folder is ours,
+    so it is cleared on failure and before a retry."""
+    tmp = dst.with_name(dst.name + ".partial")
+    if tmp.exists():
+        shutil.rmtree(tmp)                    # leftover of an earlier interrupted run
+    try:
+        tmp.mkdir(parents=True)
+        for f in sorted(src.rglob("*")):
+            if not f.is_file():
+                continue
+            _copy_file(f, tmp / f.relative_to(src),
+                       on_bytes=on_bytes, should_stop=should_stop)
+        want, got = entry_signature(src), entry_signature(tmp)
+        if want is None or want != got:
+            raise OSError(f"folder copy incomplete: {got} != {want}")
+        if dst.exists():
+            raise OSError(f"destination appeared during copy: {dst}")
+        os.rename(tmp, dst)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
 def _move_entry(src: Path, dst: Path) -> None:
     """Relocate `src` to `dst` within one volume, by rename.
 
@@ -572,11 +636,7 @@ def execute_plan(plan: list[dict], on_progress=None, on_bytes=None,
             elif src.is_file():
                 _copy_file(src, dst, on_bytes=on_bytes, should_stop=should_stop)
             else:
-                for f in sorted(src.rglob("*")):
-                    if not f.is_file():
-                        continue
-                    _copy_file(f, dst / f.relative_to(src),
-                               on_bytes=on_bytes, should_stop=should_stop)
+                _copy_tree(src, dst, on_bytes=on_bytes, should_stop=should_stop)
             results.append(dict(item, result="ok", detail=""))
         except InterruptedError:
             results.append(dict(item, result="cancelled", detail="cancelled mid-copy"))

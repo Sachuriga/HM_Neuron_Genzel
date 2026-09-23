@@ -22,18 +22,18 @@ Workflow:
      data is present and which is MISSING.
 
   4. Press *Find scattered data* when something comes back MISSING. Step 3 only
-     looks directly under the 4 chosen roots; this walks *every* mounted volume
-     to a chosen depth, so it finds sessions that were filed somewhere else
-     entirely (a backup folder, a per-experimenter folder, a nested copy). It
-     reports three ways the drives and the sheet can disagree: data found
-     *elsewhere*, data found *nowhere*, and folders on disk the sheet never
-     asked for (*orphans*).
+     looks directly under the chosen drive folders; this walks those same folders
+     to a chosen depth, so it finds sessions filed somewhere odd inside them (a
+     backup folder, a per-experimenter folder, a nested copy). It reports data
+     found *nowhere* in them, folders on disk the sheet never asked for
+     (*orphans*), and unfiled camera videos.
 
 Launch with:  python scan_drive_gui.py
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import datetime
 import subprocess
@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QComboBox, QDialog, QCheckBox,
-    QSpinBox, QProgressBar, QScrollArea, QListWidget, QWidgetAction,
+    QSpinBox, QProgressBar, QScrollArea, QListWidget, QWidgetAction, QInputDialog,
 )
 
 # Reuse the drive-scanning helpers from the sibling module.
@@ -115,8 +115,13 @@ def parse_date8(val) -> str | None:
     """Normalise a spreadsheet Date cell to a ``YYYYMMDD`` drive-folder name.
 
     The column mixes ``DD.MM.YYYY`` strings and real Timestamps; handle both."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
+    try:
+        # pd.NaT (a blank cell in a date-typed column) is a datetime subclass with
+        # no strftime — it must be caught here, before the Timestamp branch.
+        if val is None or pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(val, (pd.Timestamp, datetime.datetime, datetime.date)):
         return val.strftime("%Y%m%d")
     s = str(val).strip()
@@ -150,7 +155,13 @@ def build_roster(xlsx_path: str, sheet: str = "Raw") -> list[dict]:
     if missing:
         raise ValueError(f"sheet '{sheet}' is missing column(s): {', '.join(missing)}")
 
+    # a row without subject/day/session can't name a session — skip it rather
+    # than letting int(NaN) abort the whole roster
     sub = df.dropna(subset=["subject"]).copy()
+    incomplete = sub["day"].isna() | sub["session"].isna()
+    if incomplete.any():
+        print(f"  roster: skipped {int(incomplete.sum())} row(s) with a blank day/session")
+        sub = sub[~incomplete]
     sub["date8"] = sub["Date"].apply(parse_date8)
     # Row order in the sheet IS the training order: on a given date the animals
     # appear in the sequence they were run. dropna() keeps that order, so a
@@ -171,7 +182,9 @@ def build_roster(xlsx_path: str, sheet: str = "Raw") -> list[dict]:
 
     roster = []
     for _, r in grouped.iterrows():
-        implanted = int(r["Implant"]) == 1
+        # A blank Implant cell reads as NaN; treat it as "not implanted" instead of
+        # letting int(NaN) abort the whole roster.
+        implanted = (not pd.isna(r["Implant"])) and int(r["Implant"]) == 1
         rep = r["repeat"]
         # parse_date8 says None for a date it cannot read, but grouping turns
         # that None into NaN — a float, and a *truthy* one. Left as-is it defeats
@@ -281,6 +294,7 @@ def evaluate(entry: dict, idx: dict) -> dict:
     res.update(n_video=n_video, phases=phases, found_in=", ".join(sorted(set(labels))),
                n_rec=n_rec, n_merged=n_merged, n_logger=n_logger, paths=paths,
                splits=splits, split_text=_split_text(splits),
+               phase_bytes=dict(phase_bytes),
                phase_gb={p: round(phase_bytes[p] / 1e9, 1) for p in EXPECTED_PHASES})
 
     # Preliminary completeness by presence only. Whether each present phase is the
@@ -319,16 +333,34 @@ def _median(xs):
     return s[m] if n % 2 else (s[m - 1] + s[m]) / 2
 
 
+def _phase_gb_raw(r: dict, p: str) -> float:
+    """Unrounded GB of phase `p` — from raw bytes when present. The rounded
+    phase_gb (0.1 GB) turns a 40 MB truncated phase into 0.0, which would read as
+    'absent' and escape the short-phase check."""
+    pb = r.get("phase_bytes")
+    if pb:
+        return pb.get(p, 0) / 1e9
+    return (r.get("phase_gb") or {}).get(p, 0.0)
+
+
 def phase_medians(results: list) -> dict:
     """Per-rat median GB for each phase, over that rat's implanted sessions that
     actually have the phase. Only non-zero sizes count, so a missing phase never
-    drags the median down. Returns {rat_no: {phase: median_gb}}."""
+    drags the median down. Returns {rat_no: {phase: median_gb}}.
+
+    Each (rat, date) folder counts once: several sessions run on one day share one
+    folder, and counting it per session would weight that day twice."""
     by_rat: dict = {}
+    seen = set()
     for r in results:
         if not r or not r.get("implanted"):
             continue
+        key = (r["rat_no"], r.get("date8"))
+        if r.get("date8") and key in seen:
+            continue
+        seen.add(key)
         for p in EXPECTED_PHASES:
-            gb = (r.get("phase_gb") or {}).get(p, 0.0)
+            gb = _phase_gb_raw(r, p)
             if gb > 0:
                 by_rat.setdefault(r["rat_no"], {}).setdefault(p, []).append(gb)
     # Only trust a median built from enough sessions; too few and one short
@@ -347,12 +379,13 @@ def flag_short_phases(res: dict, medians: dict) -> None:
         return
     med = medians.get(res["rat_no"], {})
     for p in EXPECTED_PHASES:
-        gb = (res.get("phase_gb") or {}).get(p, 0.0)
+        gb = _phase_gb_raw(res, p)
         m = med.get(p, 0.0)
-        # only judge a phase that is present, against a median we trust
-        if gb > 0 and m > 0 and gb < SHORT_FRACTION * m:
+        # only judge a phase that is present (by presence, not by a rounded size —
+        # a near-empty phase is the most truncated of all), against a trusted median
+        if p in (res.get("phases") or set()) and m > 0 and gb < SHORT_FRACTION * m:
             res["short_phases"].append(p)
-            res["reasons"].append(f"{p} short ({gb:.0f} GB vs ~{m:.0f})")
+            res["reasons"].append(f"{p} short ({gb:.1f} GB vs ~{m:.0f})")
     if res["short_phases"] and res["status"] == "OK":
         res["status"] = "PARTIAL"
 
@@ -361,7 +394,6 @@ def flag_short_phases(res: dict, medians: dict) -> None:
 #              search every drive for scattered session data
 # ------------------------------------------------------------------
 def search_all_drives(roots_selected: list[str], max_depth: int = 6,
-                      include_system: bool = False,
                       on_dir=None, should_stop=None) -> dict:
     """Hunt for Rat<N>/<YYYYMMDD> session folders WITHIN the selected drive folders,
     at any depth (not just the structured 2-level layout the main scan reads). The
@@ -379,15 +411,6 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
             except OSError:
                 pass
 
-    def _under_selected(p: Path) -> bool:
-        for s in selected:
-            try:
-                p.relative_to(s)
-                return True
-            except ValueError:
-                continue
-        return False
-
     idx: dict = {}
     for vol in selected:                       # only the drive folders the user added
         if should_stop is not None and should_stop():
@@ -399,7 +422,7 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
                 continue
             info = inspect_session(sess)
             idx.setdefault((rat_no, sess.name), []).append(dict(
-                path=str(sess), volume=str(vol), in_selected=_under_selected(sess),
+                path=str(sess), volume=str(vol),
                 n_video=info["n_video"], phases=info["phases"], splits=info["splits"],
                 phase_bytes=info.get("phase_bytes", {}),
                 n_rec=info.get("n_rec", 0), n_merged=info.get("n_merged", 0),
@@ -410,11 +433,10 @@ def search_all_drives(roots_selected: list[str], max_depth: int = 6,
 def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
     """Turn a search_all_drives() index + the roster into reviewable rows.
 
-    Three kinds of row, which are the three ways the drives and the sheet can
-    disagree:
-      elsewhere  — an expected session that exists, but only outside the
-                   selected roots (this is the scattered data you're after)
-      not-found  — an expected session that exists on no mounted volume
+    Two kinds of row, the two ways the drive folders and the sheet can disagree
+    (the search covers only the selected drive folders, so every hit is under
+    one of them):
+      not-found  — an expected session found in none of the selected folders
       orphan     — a session folder on disk that the sheet never asked for
                    (a typo'd folder, a stray copy, an unlogged recording)
 
@@ -457,14 +479,18 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
                 merged[ph] = max(merged.get(ph, 0), k)
         return merged
 
-    def _agg_phase_gb(hits):
-        """Per-phase GB for a session, max per phase across its copies (duplicates
-        hold the same data, so max not sum)."""
+    def _agg_phase_bytes(hits):
+        """Per-phase bytes for a session, max per phase across its copies
+        (duplicates hold the same data, so max not sum)."""
         pb = {p: 0 for p in EXPECTED_PHASES}
         for h in hits:
             for ph, b in (h.get("phase_bytes") or {}).items():
                 if ph in pb:
                     pb[ph] = max(pb[ph], b)
+        return pb
+
+    def _agg_phase_gb(hits):
+        pb = _agg_phase_bytes(hits)
         return {p: round(pb[p] / 1e9, 1) for p in EXPECTED_PHASES}
 
     # Per-rat phase medians, from every session found on any drive (not just the
@@ -472,7 +498,7 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
     # phase is short against that rat's own norm — same rule as the coverage table.
     implanted_rats = {e["rat_no"] for e in roster if e["implanted"]}
     allsess = [dict(rat_no=rn, implanted=(rn in implanted_rats),
-                    phase_gb=_agg_phase_gb(hits))
+                    phase_bytes=_agg_phase_bytes(hits))
                for (rn, _d), hits in found.items()]
     medians = phase_medians(allsess)
 
@@ -510,11 +536,13 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
         n_video = sum(h.get("n_video", 0) for h in hits)
         n_rec = sum(h.get("n_rec", 0) for h in hits)
         phase_gb = _agg_phase_gb(hits)
+        raw_gb = {p: b / 1e9 for p, b in _agg_phase_bytes(hits).items()}
         short = []
         if rat_no in implanted_rats:
             med = medians.get(rat_no, {})
             for p in EXPECTED_PHASES:
-                if phase_gb[p] > 0 and med.get(p, 0) > 0 and phase_gb[p] < SHORT_FRACTION * med[p]:
+                # presence, not rounded size: a near-empty phase is the most short
+                if p in agg_phases and med.get(p, 0) > 0 and raw_gb[p] < SHORT_FRACTION * med[p]:
                     short.append(p)
         missing = _missing(rat_no, agg_phases, n_video, date8)
         vlabel, vpath = _video_where(rat_no, date8, n_video)
@@ -534,9 +562,14 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
                     phase_gb=phase_gb, short_phases=short, missing=missing, phases=agg_phases,
                     video=vlabel, video_path=vpath,
                     detail=f"{n_video} video, {n_rec} rec — {tail}{parts}{across}{shorts}{miss}{vid}")
-    for e in roster:
-        if not e["date8"]:
-            continue
+    # One row per (rat, date): a rat's several sessions on one day share a folder,
+    # so a per-session loop would repeat the same not-found row for each of them.
+    by_key: dict = {}
+    for ent in roster:
+        if ent["date8"]:
+            by_key.setdefault((ent["rat_no"], ent["date8"]), []).append(ent)
+    for ents in by_key.values():
+        e = dict(ents[0], session="+".join(str(x["session"]) for x in ents))
         hits = found.get((e["rat_no"], e["date8"]), [])
         if not hits:
             if (e["rat_no"], e["date8"]) in video_fills:
@@ -544,7 +577,7 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
                 # dump. For a video-only animal that video is the whole session, so
                 # it is not missing — the 'video' row represents it. For an
                 # implanted animal the ephys is still absent, so keep a row but say
-                # so plainly instead of the misleading 'on no mounted volume'.
+                # so plainly instead of the misleading 'in no drive folder'.
                 if not e["implanted"]:
                     continue
                 vlabel, vpath = _video_where(e["rat_no"], e["date8"], 0)
@@ -554,7 +587,7 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
                                  volume="", volumes=[], path="", paths=[],
                                  split=False, split_text="", phase_gb={}, short_phases=[],
                                  missing=miss, phases=set(), video=vlabel, video_path=vpath,
-                                 detail="ephys on no mounted volume — video found in dump"
+                                 detail="ephys in no selected drive folder — video found in dump"
                                         + (f" · MISSING: {'+'.join(miss)}" if miss else "")))
                 continue
             miss = _missing(e["rat_no"], set(), 0, e["date8"])
@@ -564,15 +597,9 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
                              split=False, split_text="", phase_gb={}, short_phases=[],
                              missing=miss, phases=set(),
                              video="✗" if e["implanted"] else "", video_path="",
-                             detail="on no mounted volume"
+                             detail="in no selected drive folder"
                                     + (f" · MISSING: {'+'.join(miss)}" if miss else "")))
             continue
-        if not any(h["in_selected"] for h in hits):
-            # The whole session lives outside the selected roots — one row for it,
-            # with every volume its (possibly split) pieces are on.
-            rows.append(_session_row("elsewhere", e["rat"], e["date8"], e["day"],
-                                     e["session"], e["repeat"], hits,
-                                     "not under a selected root", rat_no=e["rat_no"]))
 
     for (rat_no, date8), hits in sorted(found.items()):
         if (rat_no, date8) in expected or rat_no not in roster_rats:
@@ -584,7 +611,7 @@ def scatter_report(roster: list[dict], found: dict, videos=None) -> list[dict]:
         # crowd of anomalies.
         rows.append(_session_row("orphan", f"Rat{rat_no}", date8, "", "", "",
                                  hits, "not in the spreadsheet", rat_no=rat_no))
-    order = {"elsewhere": 0, "not-found": 1, "orphan": 2}
+    order = {"not-found": 0, "orphan": 1}
     rows.sort(key=lambda r: (order[r["kind"]], r["rat"], str(r["date8"])))
     return rows
 
@@ -627,10 +654,12 @@ class SearchWorker(QObject):
     raw_index = pyqtSignal(object)           # (rat_no, date8) -> [hit]
     failed = pyqtSignal(str)
 
-    def __init__(self, roster, roots, depth, include_system):
+    def __init__(self, roster, roots, depth, want_rows=True):
         super().__init__()
         self.roster, self.roots = roster, roots
-        self.depth, self.include_system = depth, include_system
+        # Organize / summary / meta only need raw_index; skip the scatter digest
+        # for them so the thread ends as soon as the index is out.
+        self.depth, self.want_rows = depth, want_rows
         self._stop = False
         self._n = 0
 
@@ -645,7 +674,6 @@ class SearchWorker(QObject):
     def run(self):
         try:
             found = search_all_drives(self.roots, max_depth=self.depth,
-                                      include_system=self.include_system,
                                       on_dir=self._tick,
                                       should_stop=lambda: self._stop)
             # Also find camera videos that were never sorted into a rat folder
@@ -663,6 +691,8 @@ class SearchWorker(QObject):
             videos = fvid.assign_videos(loose, self.roster, have_video)
 
             self.raw_index.emit({"sessions": found, "videos": videos})
+            if not self.want_rows:
+                return
             # Fold each implanted session's video into its own row (pre/task/post
             # + video together); video-only rats still get a standalone video row.
             impl = {e["rat_no"] for e in self.roster if e["implanted"]}
@@ -702,6 +732,31 @@ class PreprocessWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class MetaWorker(QObject):
+    """Plans RecordingMeta.xlsx files off the GUI thread (plan_meta walks every
+    session's folders on the externals). In `auto` mode (after a scan, no review)
+    it also writes — but only rows whose session<->camera-folder pairing is
+    unambiguous; anything with mismatched counts is left for the reviewed dialog."""
+    done = pyqtSignal(list, list, bool)       # plan, write results, auto
+    failed = pyqtSignal(str, bool)            # message, auto
+
+    def __init__(self, roster, found, raw, auto):
+        super().__init__()
+        self.roster, self.found, self.raw, self.auto = roster, found, raw, auto
+
+    def run(self):
+        try:
+            plan = pmeta.plan_meta(self.roster, self.found, self.raw)
+            results = []
+            if self.auto:
+                safe = [p for p in plan
+                        if p["action"] == pmeta.WRITE and not p.get("ambiguous")]
+                results = pmeta.write_plan(safe) if safe else []
+            self.done.emit(plan, results, self.auto)
+        except Exception as exc:  # pragma: no cover
+            self.failed.emit(str(exc), self.auto)
+
+
 # ------------------------------------------------------------------
 #                       background scan worker
 # ------------------------------------------------------------------
@@ -715,6 +770,10 @@ class ScanWorker(QObject):
         super().__init__()
         self.roster = roster
         self.roots = roots
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         try:
@@ -723,6 +782,8 @@ class ScanWorker(QObject):
             # Pass 1: measure every session (presence + per-phase sizes).
             results = []
             for i, entry in enumerate(self.roster):
+                if self._stop:                 # window closing — abandon quietly
+                    return
                 results.append(evaluate(entry, idx))
                 self.progress.emit(i + 1, total)
             # Pass 2: now that every session is measured, flag phases that are
@@ -743,8 +804,7 @@ _SCATTER_COLS = ["Kind", "Rat", "Date", "day", "session", "repeat",
                  "pre GB", "task GB", "post GB", "Video", "Missing", "Split",
                  "Volume(s)", "Path", "Detail"]
 _KIND_COLOR = {
-    "elsewhere": QColor(255, 244, 205),      # found, but filed somewhere else
-    "not-found": QColor(250, 214, 214),      # nowhere on any mounted volume
+    "not-found": QColor(250, 214, 214),      # in none of the selected drive folders
     "orphan":    QColor(222, 233, 250),      # on disk, absent from the sheet
     "video":     QColor(214, 234, 250),      # unfiled camera video, matched to a rat
 }
@@ -762,11 +822,10 @@ class ScatterDialog(QDialog):
         v = QVBoxLayout(self)
 
         n = {k: sum(1 for r in rows if r["kind"] == k)
-             for k in ("elsewhere", "not-found", "orphan", "video")}
+             for k in ("not-found", "orphan", "video")}
         n_split = sum(1 for r in rows if r.get("split"))
         head = QLabel(
-            f"<b>{n['elsewhere']}</b> session(s) found outside the selected drives · "
-            f"<b>{n['not-found']}</b> found nowhere · "
+            f"<b>{n['not-found']}</b> found in no selected drive folder · "
             f"<b>{n['orphan']}</b> folder(s) on disk not in the spreadsheet · "
             f"<b>{n['video']}</b> unfiled camera video(s) · "
             f"<b>{n_split}</b> with PC-error split recordings")
@@ -826,8 +885,8 @@ class ScatterDialog(QDialog):
         v.addWidget(self.table, 1)
 
         v.addWidget(QLabel(
-            "yellow = data exists, just not under a selected drive root · red = not on any "
-            "mounted volume · blue = on disk but not in the sheet.  For an implanted rat one "
+            "red = in none of the selected drive folders · blue = on disk but not in the "
+            "sheet.  For an implanted rat one "
             "row holds the whole session: pre/task/post GB (✗ = absent, red ⚠ = short vs the "
             "rat's median) and Video (count, 'dump' = in the acquisition dump, ✗ = none); "
             "Missing lists which of the 4 files are absent.  ⚠ Split = recorded in parts.  "
@@ -886,9 +945,20 @@ _ACTION_COLOR = {
     od.SKIP_VIDEO:   QColor(238, 238, 238),   # loose video not ours to file
     od.SKIP_ARCHIVED: QColor(210, 244, 214),  # already archived — left in place (fine)
     od.DUPLICATE:    QColor(255, 244, 205),   # redundant copy, left alone
+    od.SKIP_OTHER_DRIVE: QColor(238, 238, 238),  # other drive — not touched
     od.CONFLICT:     QColor(250, 214, 214),   # needs a human
     od.UNREADABLE:   QColor(250, 214, 214),
 }
+
+
+def _guarded_reject(self):
+    """Esc / the window's X on a run dialog. While its worker is moving or copying,
+    refuse: closing would hide a transfer that keeps going, and would let a second
+    run start over the same plan. Stop first, then close."""
+    if self.run_thread is not None and self.run_thread.isRunning():
+        self.run_lbl.setText("Still running — press Stop and let it finish before closing.")
+        return
+    QDialog.reject(self)
 
 
 class PlanWorker(QObject):
@@ -908,10 +978,12 @@ class PlanWorker(QObject):
 
     def run(self):
         try:
+            # move_only: Organize files data within the chosen drive by rename
+            # only — nothing is ever copied to or from another drive.
             self.done.emit(od.plan_organize(
                 self.roster, self.found, self.dest, videos=self.videos,
                 on_progress=lambda s: self.progress.emit(s),
-                should_stop=lambda: self._stop))
+                should_stop=lambda: self._stop, move_only=True))
         except Exception as exc:  # pragma: no cover
             self.failed.emit(str(exc))
 
@@ -949,6 +1021,8 @@ class OrganizeDialog(QDialog):
     explicitly confirmed. The plan is the product; executing it is the optional
     second step."""
 
+    reject = _guarded_reject
+
     def __init__(self, plan: list[dict], dest: str, parent=None):
         super().__init__(parent)
         self.plan, self.dest = plan, dest
@@ -969,6 +1043,7 @@ class OrganizeDialog(QDialog):
             f"already in an HM_neuron archive (left in place): {t['n_archived']} "
             f"&nbsp;·&nbsp; already there: {t['n_present']} &nbsp;·&nbsp; derived (skipped): "
             f"{t['n_derived']} &nbsp;·&nbsp; duplicates left alone: {t['n_duplicate']} "
+            f"&nbsp;·&nbsp; on other drives (not touched): {t['n_other_drive']} "
             f"&nbsp;·&nbsp; <b>conflicts: {t['n_conflict']}</b> &nbsp;·&nbsp; "
             f"<b>unreadable: {t['n_unreadable']}</b>"))
 
@@ -991,10 +1066,10 @@ class OrganizeDialog(QDialog):
         v.addWidget(self.table, 1)
 
         v.addWidget(QLabel(
-            "blue = moved by rename (same drive: instant, frees nothing, data leaves its "
-            "current path) · green = copied across drives (source kept) · yellow = "
-            "redundant duplicate, left where it is · red = conflict or unreadable, "
-            "skipped for you to resolve."))
+            "blue = moved by rename within this drive (instant, frees nothing, data "
+            "leaves its current path) · grey = nothing to do, or on another drive "
+            "(never touched) · yellow = redundant duplicate, left where it is · red = "
+            "conflict or unreadable, skipped for you to resolve."))
 
         self.bar = QProgressBar()
         self.bar.setVisible(False)
@@ -1179,6 +1254,8 @@ class ResetRunWorker(QObject):
 class ResetDialog(QDialog):
     """Review the reset plan, then run it. Nothing moves until the plan on screen
     is confirmed."""
+
+    reject = _guarded_reject
 
     def __init__(self, plan: list[dict], parent=None):
         super().__init__(parent)
@@ -1386,6 +1463,8 @@ class FixNamesRunWorker(QObject):
 
 class FixNamesDialog(QDialog):
     """Review the rename plan, then run it. Nothing is renamed until confirmed."""
+
+    reject = _guarded_reject
 
     def __init__(self, plan: list[dict], parent=None):
         super().__init__(parent)
@@ -1784,7 +1863,14 @@ class ScanDriveGUI(QMainWindow):
         self.plan_worker: PlanWorker | None = None
         self.preproc_thread: QThread | None = None
         self.preproc_worker: PreprocessWorker | None = None
+        self.meta_thread: QThread | None = None
+        self.meta_worker: MetaWorker | None = None
+        self.reset_thread: QThread | None = None
+        self.reset_worker: ResetScanWorker | None = None
+        self.fix_thread: QThread | None = None
+        self.fix_worker: FixNamesScanWorker | None = None
         self._meta_raw = None
+        self._closing = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -1848,10 +1934,12 @@ class ScanDriveGUI(QMainWindow):
         m_file.addAction(a_quit)
 
         m_fix = mb.addMenu("Fix / &Prepare")
-        self.organize_btn = QAction("Organize into folder…", self)
-        self.organize_btn.setToolTip("Assemble every roster session into one tree under a "
-                                     "folder you pick (move within a drive, copy across); "
-                                     "shows the full plan before writing anything.")
+        self.organize_btn = QAction("Organize drive…", self)
+        self.organize_btn.setToolTip("File the roster sessions on ONE of your listed drive "
+                                     "folders into that drive's HM_neurons archive — moves "
+                                     "(renames) within that drive only; data on other drives "
+                                     "is listed but never copied or touched. Shows the full "
+                                     "plan before writing anything.")
         self.organize_btn.triggered.connect(self._organize)
         self.organize_btn.setEnabled(False)
         m_fix.addAction(self.organize_btn)
@@ -1876,7 +1964,7 @@ class ScanDriveGUI(QMainWindow):
         m_rep = mb.addMenu("&Reports")
         self.summary_btn = QAction("Summary figure…", self)
         self.summary_btn.setToolTip("One-look status figure per rat/repeat: pre/task/post/video "
-                                    "presence, size, and location. Searches all drives first.")
+                                    "presence, size, and location. Searches the drive folders first.")
         self.summary_btn.triggered.connect(self._summary)
         self.summary_btn.setEnabled(False)
         m_rep.addAction(self.summary_btn)
@@ -1890,14 +1978,20 @@ class ScanDriveGUI(QMainWindow):
         m_opt = mb.addMenu("&Options")
         self.act_meta_after = QAction("Prepare RecordingMeta after scan", self)
         self.act_meta_after.setCheckable(True)
-        self.act_meta_after.setChecked(True)
+        # Off by default: it writes into the data folders with no review step.
+        self.act_meta_after.setChecked(False)
         self.act_meta_after.setToolTip("After each scan, write RecordingMeta.xlsx into any maze "
-                                       "session that lacks one (never overwrites existing files).")
+                                       "session that lacks one — only where that day's sessions "
+                                       "pair one-to-one with its camera folders; everything else "
+                                       "is left for Fix / Prepare ▸ Prepare RecordingMeta (never "
+                                       "overwrites existing files).")
         m_opt.addAction(self.act_meta_after)
         self.act_sysdrive = QAction("Include system drive (C:)", self)
         self.act_sysdrive.setCheckable(True)
-        self.act_sysdrive.setToolTip("Also search C:\\ in the deep searches (slow — raw data "
-                                     "rarely lives there).")
+        self.act_sysdrive.setToolTip("Also sweep C:\\ in Preprocess progress, and in Fix video "
+                                     "names when no drive folder is selected. Find scattered / "
+                                     "Organize / Summary / RecordingMeta only ever search the "
+                                     "drive folders above.")
         m_opt.addAction(self.act_sysdrive)
         m_opt.addSeparator()
         self.depth_spin = QSpinBox()
@@ -1920,8 +2014,8 @@ class ScanDriveGUI(QMainWindow):
         act.addWidget(self.scan_btn)
         self.search_btn = QPushButton("Find scattered data…")
         self.search_btn.setToolTip(
-            "Search every mounted drive (at any depth) for Rat<N>/<YYYYMMDD> folders, "
-            "to locate sessions that aren't under the drive folders above.")
+            "Deep-search the drive folders above (at any depth, up to Options ▸ Search "
+            "depth) for Rat<N>/<YYYYMMDD> folders filed somewhere odd inside them.")
         self.search_btn.clicked.connect(self._search_all)
         self.search_btn.setEnabled(False)
         act.addWidget(self.search_btn)
@@ -1975,11 +2069,47 @@ class ScanDriveGUI(QMainWindow):
         elif cur in names:
             self.sheet_combo.setCurrentText(cur)
 
+    @staticmethod
+    def _norm_path(p: str) -> str:
+        """Comparable form of a folder path: resolved, and case-folded on Windows,
+        so F:/HM_neurons, f:\\hm_neurons and a mapped-drive alias compare equal."""
+        try:
+            p = str(Path(p).resolve())
+        except OSError:
+            pass
+        return os.path.normcase(os.path.normpath(p))
+
+    @staticmethod
+    def _is_under(child: str, parent: str) -> bool:
+        """Both normalised. True if `child` is strictly inside `parent`."""
+        return child != parent and child.startswith(parent.rstrip(os.sep) + os.sep)
+
     def _add_drive(self):
         d = QFileDialog.getExistingDirectory(
             self, "Add a drive folder (one level above the Rat<N>_* folders)", str(Path.home()))
-        if d and d not in self._drive_paths():
-            self.drive_list.addItem(d)
+        if not d:
+            return
+        # One folder must never be listed twice (or inside another listed folder):
+        # the scan would index its sessions twice and double their counts.
+        nd = self._norm_path(d)
+        existing = [(i, self.drive_list.item(i).text().strip())
+                    for i in range(self.drive_list.count())]
+        for _i, ex in existing:
+            ne = self._norm_path(ex)
+            if ne == nd:
+                self.status_lbl.setText(f"{d} is already in the list.")
+                return
+            if self._is_under(nd, ne):
+                QMessageBox.information(self, "Already covered",
+                                        f"{d}\n\nis inside\n\n{ex}\n\nwhich is already "
+                                        f"in the list — not added.")
+                return
+        inner = [i for i, ex in existing if self._is_under(self._norm_path(ex), nd)]
+        for i in reversed(inner):                 # the new folder covers these
+            self.drive_list.takeItem(i)
+        self.drive_list.addItem(d)
+        if inner:
+            self.status_lbl.setText(f"Added {d}; removed {len(inner)} folder(s) inside it.")
 
     def _remove_drive(self):
         for it in self.drive_list.selectedItems():
@@ -1992,6 +2122,10 @@ class ScanDriveGUI(QMainWindow):
 
     # -- roster ------------------------------------------------------------
     def _load_roster(self):
+        if self._running(self.thread) or self._search_busy():
+            # the running worker writes into self.results / the table by row index
+            QMessageBox.information(self, "Busy", "Wait for the running scan/search to finish.")
+            return
         path = self.xlsx_edit.text().strip()
         if not path or not Path(path).exists():
             QMessageBox.warning(self, "No spreadsheet", "Pick a valid .xlsx file first.")
@@ -2009,11 +2143,7 @@ class ScanDriveGUI(QMainWindow):
             f"{len(self.roster)} rat-sessions · {', '.join(rats)} · "
             f"{n_imp} with ephys, {len(self.roster) - n_imp} video-only. "
             f"Now pick drives and press Scan.")
-        self.scan_btn.setEnabled(True)
-        self.search_btn.setEnabled(True)
-        self.organize_btn.setEnabled(True)
-        self.summary_btn.setEnabled(True)
-        self.meta_btn.setEnabled(True)
+        self._refresh_actions()
         self.preproc_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
 
@@ -2026,8 +2156,103 @@ class ScanDriveGUI(QMainWindow):
                 self._set(i, c, val, status="?")
 
     # -- scanning ----------------------------------------------------------
+    # -- background-task bookkeeping ----------------------------------------
+    @staticmethod
+    def _running(t) -> bool:
+        return t is not None and t.isRunning()
+
+    def _search_busy(self) -> bool:
+        """True while a drive search, organize plan or meta plan is in flight. They
+        share self.search_thread & co., and replacing a running QThread destroys it
+        — Qt then aborts the whole app."""
+        return (self._running(self.search_thread) or self._running(self.plan_thread)
+                or self._running(self.meta_thread))
+
+    def _busy_note(self) -> bool:
+        if self._search_busy():
+            self.status_lbl.setText("A drive search is still running — try again when it finishes.")
+            return True
+        return False
+
+    def _refresh_actions(self):
+        """Enable the search-triggering actions only when nothing is in flight."""
+        have = bool(self.roster)
+        busy = self._search_busy()
+        for a in (self.search_btn, self.organize_btn, self.summary_btn, self.meta_btn):
+            a.setEnabled(have and not busy)
+        self.scan_btn.setEnabled(have and not busy and not self._running(self.thread))
+
+    def _thread_ended(self):
+        # QThread.finished fires just BEFORE the thread is marked not-running; wait
+        # the last instant out so the refresh below sees it as idle.
+        t = self.sender()
+        if isinstance(t, QThread):
+            t.wait(2000)
+        self._refresh_actions()
+
+    def _start_search(self, status: str, on_failed, on_index=None, on_rows=None) -> bool:
+        """Start the one shared SearchWorker; refuse if one is already running."""
+        if self._busy_note() or self._closing:
+            return False
+        if self.search_thread is not None:
+            self.search_thread.wait(2000)        # previous one has finished; let it exit
+        self.search_thread = QThread()
+        self.search_worker = SearchWorker(self.roster, self._drive_paths(),
+                                          self.depth_spin.value(),
+                                          want_rows=on_rows is not None)
+        self.search_worker.moveToThread(self.search_thread)
+        self.search_thread.started.connect(self.search_worker.run)
+        self.search_worker.progress.connect(lambda d: self.status_lbl.setText(f"{status} {d}"))
+        if on_index is not None:
+            self.search_worker.raw_index.connect(on_index)
+        if on_rows is not None:
+            self.search_worker.done.connect(on_rows)
+            self.search_worker.done.connect(self.search_thread.quit)
+        else:
+            self.search_worker.raw_index.connect(self.search_thread.quit)
+        self.search_worker.failed.connect(on_failed)
+        self.search_worker.failed.connect(self.search_thread.quit)
+        self.search_thread.finished.connect(self._thread_ended)
+        self.search_thread.start()
+        self._refresh_actions()
+        return True
+
+    def closeEvent(self, event):
+        """Never let Qt destroy a running QThread (it aborts the process — mid-scan,
+        or mid-plan). Offer to stop the background work and wait for it."""
+        pairs = [(self.thread, self.worker), (self.search_thread, self.search_worker),
+                 (self.plan_thread, self.plan_worker), (self.meta_thread, self.meta_worker),
+                 (self.preproc_thread, self.preproc_worker),
+                 (self.reset_thread, self.reset_worker), (self.fix_thread, self.fix_worker)]
+        live = [(t, w) for t, w in pairs if self._running(t)]
+        if not live:
+            event.accept()
+            return
+        if QMessageBox.question(
+                self, "Quit?",
+                f"{len(live)} background task(s) are still running. Stop them and quit?") \
+                != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+        self._closing = True
+        for t, w in live:
+            if w is not None:
+                w.blockSignals(True)             # no follow-up steps from a half-done run
+                if hasattr(w, "stop"):
+                    w.stop()
+            t.quit()
+        for t, _w in live:
+            if not t.wait(20000):
+                self._closing = False
+                QMessageBox.warning(self, "Still busy",
+                                    "A background task did not stop in time. "
+                                    "Try closing again in a moment.")
+                event.ignore()
+                return
+        event.accept()
+
     def _scan(self):
-        if not self.roster:
+        if not self.roster or self._running(self.thread) or self._busy_note():
             return
         roots = self._drive_paths()
         if not any(roots):
@@ -2048,6 +2273,7 @@ class ScanDriveGUI(QMainWindow):
         self.worker.failed.connect(self._scan_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self._thread_ended)
         self.thread.start()
 
     def _progress(self, done: int, total: int):
@@ -2094,22 +2320,22 @@ class ScanDriveGUI(QMainWindow):
         miss = sum(1 for r in self.results if r and r["status"] == "MISSING")
         self.status_lbl.setText(f"Done — {ok} complete · {part} partial · {miss} missing "
                                 f"(of {len(self.results)}).")
-        self.scan_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
-        # Chain into writing any missing RecordingMeta.xlsx (safe: plan_meta never
-        # overwrites), so meta files are prepared as part of scanning. Off = uncheck
-        # Options ▸ "Prepare RecordingMeta after scan".
-        if self.roster and self.act_meta_after.isChecked():
+        self._refresh_actions()
+        # Optionally chain into writing missing RecordingMeta.xlsx (never overwrites;
+        # only unambiguous session<->folder pairings — see MetaWorker). Off by
+        # default: Options ▸ "Prepare RecordingMeta after scan".
+        if self.roster and self.act_meta_after.isChecked() and not self._closing:
             self._prepare_meta(auto=True)
 
     def _scan_failed(self, msg: str):
         QMessageBox.critical(self, "Scan failed", msg)
         self.status_lbl.setText("Scan failed.")
-        self.scan_btn.setEnabled(True)
+        self._refresh_actions()
 
     # -- search every drive for scattered data ------------------------------
     def _search_all(self):
-        if not self.roster:
+        if not self.roster or self._busy_note():
             return
         roots = self._drive_paths()
         if not roots:
@@ -2123,56 +2349,46 @@ class ScanDriveGUI(QMainWindow):
                 + "\n  ".join(roots) + "\n\nThis may take a few minutes.") \
                 != QMessageBox.StandardButton.Yes:
             return
-
-        self.search_btn.setEnabled(False)
-        self.scan_btn.setEnabled(False)
         self.status_lbl.setText("Searching the drive folders…")
-
-        self.search_thread = QThread()
-        self.search_worker = SearchWorker(self.roster, roots,
-                                          self.depth_spin.value(),
-                                          self.act_sysdrive.isChecked())
-        self.search_worker.moveToThread(self.search_thread)
-        self.search_thread.started.connect(self.search_worker.run)
-        self.search_worker.progress.connect(
-            lambda d: self.status_lbl.setText(f"Searching… {d}"))
-        self.search_worker.done.connect(self._search_done)
-        self.search_worker.failed.connect(self._search_failed)
-        self.search_worker.done.connect(self.search_thread.quit)
-        self.search_worker.failed.connect(self.search_thread.quit)
-        self.search_thread.start()
+        self._start_search("Searching…", self._search_failed, on_rows=self._search_done)
 
     def _search_done(self, rows: list, n_found: int):
-        self.search_btn.setEnabled(True)
-        self.scan_btn.setEnabled(True)
-        self.status_lbl.setText(f"Search done — {n_found} session folder(s) on all drives.")
+        self.status_lbl.setText(f"Search done — {n_found} session folder(s) in the drive folders.")
         if not rows:
             QMessageBox.information(
                 self, "Nothing scattered",
-                f"Found {n_found} session folder(s) across all drives.\n\n"
-                "Every expected session is under a selected drive root, and every "
-                "folder on disk is accounted for in the spreadsheet.")
+                f"Found {n_found} session folder(s) in the selected drive folders.\n\n"
+                "Every expected session was found, and every folder on disk is "
+                "accounted for in the spreadsheet.")
             return
         ScatterDialog(rows, self).exec()
 
     def _search_failed(self, msg: str):
         QMessageBox.critical(self, "Search failed", msg)
         self.status_lbl.setText("Search failed.")
-        self.search_btn.setEnabled(True)
-        self.scan_btn.setEnabled(True)
 
     # -- organize ----------------------------------------------------------
     def _organize(self):
-        if not self.roster:
+        if not self.roster or self._busy_note():
             return
-        # Default the picker to the first selected drive root (usually the main
-        # HM_neurons archive), since that is where data is consolidated.
-        start = (self._drive_paths() or [str(Path.home())])[0]
-        picked = QFileDialog.getExistingDirectory(
-            self, "Organize into which drive/folder? (data goes into its HM_neurons archive)",
-            start)
-        if not picked:
+        # Organize works on ONE of the listed drive folders and only moves data
+        # already on that drive — never a free-picked folder, never a copy.
+        roots = self._drive_paths()
+        if not roots:
+            QMessageBox.information(
+                self, "Organize",
+                "Add the drive folder you want to organize to the list above first.")
             return
+        if len(roots) == 1:
+            picked = roots[0]
+        else:
+            picked, ok = QInputDialog.getItem(
+                self, "Organize drive",
+                "Which drive folder should be organized?\n"
+                "(only data already on that drive is moved; other drives are not touched)",
+                roots, 0, False)
+            if not ok or not picked:
+                return
         # All consolidated data goes into an HM_neurons archive folder — a drive
         # root becomes <drive>\HM_neurons, an existing archive is used as-is.
         dest = od.archive_dest(picked)
@@ -2184,27 +2400,21 @@ class ScanDriveGUI(QMainWindow):
         # externals here drop off mid-session, and planning terabytes of renames
         # from a stale picture is how data goes missing.
         self.status_lbl.setText("Looking at the drives…")
-        self.organize_btn.setEnabled(False)
-        roots = self._drive_paths()
+        self._start_search("Looking…", self._organize_failed,
+                           on_index=lambda combined: self._plan_organize(combined, dest))
 
-        self.search_thread = QThread()
-        self.search_worker = SearchWorker(self.roster, roots,
-                                          self.depth_spin.value(),
-                                          self.act_sysdrive.isChecked())
-        self.search_worker.moveToThread(self.search_thread)
-        self.search_thread.started.connect(self.search_worker.run)
-        self.search_worker.progress.connect(
-            lambda d: self.status_lbl.setText(f"Looking… {d}"))
-        self.search_worker.raw_index.connect(lambda combined: self._plan_organize(combined, dest))
-        self.search_worker.failed.connect(self._search_failed)
-        self.search_worker.raw_index.connect(self.search_thread.quit)
-        self.search_worker.failed.connect(self.search_thread.quit)
-        self.search_thread.start()
+    def _organize_failed(self, msg: str):
+        QMessageBox.critical(self, "Organize: search failed", msg)
+        self.status_lbl.setText("Organize search failed.")
 
     def _plan_organize(self, combined: dict, dest: str):
+        if self._closing:
+            return
         self.status_lbl.setText("Planning…")
         found = combined.get("sessions", {})
         videos = combined.get("videos", [])
+        if self.plan_thread is not None:
+            self.plan_thread.wait(2000)
         self.plan_thread = QThread()
         self.plan_worker = PlanWorker(self.roster, found, dest, videos)
         self.plan_worker.moveToThread(self.plan_thread)
@@ -2215,10 +2425,11 @@ class ScanDriveGUI(QMainWindow):
         self.plan_worker.failed.connect(self._plan_failed)
         self.plan_worker.done.connect(self.plan_thread.quit)
         self.plan_worker.failed.connect(self.plan_thread.quit)
+        self.plan_thread.finished.connect(self._thread_ended)
         self.plan_thread.start()
+        self._refresh_actions()
 
     def _plan_done(self, plan: list, dest: str):
-        self.organize_btn.setEnabled(True)
         t = od.plan_totals(plan)
         self.status_lbl.setText(
             f"Plan: {t['n_move']} move, {t['n_copy']} copy, "
@@ -2230,18 +2441,21 @@ class ScanDriveGUI(QMainWindow):
         OrganizeDialog(plan, dest, self).exec()
 
     def _plan_failed(self, msg: str):
-        self.organize_btn.setEnabled(True)
         QMessageBox.critical(self, "Planning failed", msg)
         self.status_lbl.setText("Planning failed.")
 
     # -- reset: un-file all videos to per-drive raw/ -----------------------
     def _reset(self):
+        if self._running(self.reset_thread):
+            return
         roots = self._drive_paths()
-        if not roots:                      # nothing picked — sweep every mounted volume
-            roots = [str(r) for r in sd.list_drive_roots(
-                include_system=self.act_sysdrive.isChecked())]
         if not roots:
-            QMessageBox.information(self, "Reset", "No drives to scan.")
+            # No silent every-volume fallback here: a reset un-files EVERY camera
+            # folder it finds, and other experiments' drives are mounted too.
+            QMessageBox.information(
+                self, "Reset",
+                "Add the drive folder(s) to reset above first — reset only ever "
+                "touches the folders you list.")
             return
         if QMessageBox.question(
                 self, "Reset videos → raw?",
@@ -2263,6 +2477,7 @@ class ScanDriveGUI(QMainWindow):
         self.reset_worker.failed.connect(self._reset_failed)
         self.reset_worker.done.connect(self.reset_thread.quit)
         self.reset_worker.failed.connect(self.reset_thread.quit)
+        self.reset_thread.finished.connect(self._thread_ended)
         self.reset_thread.start()
 
     def _reset_review(self, plan: list):
@@ -2283,13 +2498,24 @@ class ScanDriveGUI(QMainWindow):
 
     # -- fix misordered video file names -----------------------------------
     def _fix_names(self):
+        if self._running(self.fix_thread):
+            return
         roots = self._drive_paths()
         if not roots:
             roots = [str(r) for r in sd.list_drive_roots(
                 include_system=self.act_sysdrive.isChecked())]
-        if not roots:
-            QMessageBox.information(self, "Fix video names", "No drives to scan.")
-            return
+            if not roots:
+                QMessageBox.information(self, "Fix video names", "No drives to scan.")
+                return
+            # The scope widened from "the listed folders" to every mounted volume —
+            # say so before sweeping them (the rename plan is still reviewed after).
+            if QMessageBox.question(
+                    self, "Fix video names — every volume?",
+                    "No drive folder is listed, so this will sweep EVERY mounted volume:\n\n  "
+                    + "\n  ".join(roots) + "\n\nfor misnamed camera videos (you review the "
+                    "rename plan before anything changes). Continue?") \
+                    != QMessageBox.StandardButton.Yes:
+                return
         self.status_lbl.setText("Scanning for misnamed videos…")
         self.fixnames_btn.setEnabled(False)
         self.fix_thread = QThread()
@@ -2302,6 +2528,7 @@ class ScanDriveGUI(QMainWindow):
         self.fix_worker.failed.connect(self._fix_failed)
         self.fix_worker.done.connect(self.fix_thread.quit)
         self.fix_worker.failed.connect(self.fix_thread.quit)
+        self.fix_thread.finished.connect(self._thread_ended)
         self.fix_thread.start()
 
     def _fix_review(self, plan: list):
@@ -2323,27 +2550,14 @@ class ScanDriveGUI(QMainWindow):
 
     # -- summary figure ----------------------------------------------------
     def _summary(self):
-        if not self.roster:
+        if not self.roster or self._busy_note():
             return
-        self.summary_btn.setEnabled(False)
-        self.status_lbl.setText("Searching all drives for the summary…")
-        roots = self._drive_paths()
-        self.search_thread = QThread()
-        self.search_worker = SearchWorker(self.roster, roots,
-                                          self.depth_spin.value(),
-                                          self.act_sysdrive.isChecked())
-        self.search_worker.moveToThread(self.search_thread)
-        self.search_thread.started.connect(self.search_worker.run)
-        self.search_worker.progress.connect(
-            lambda d: self.status_lbl.setText(f"Looking… {d}"))
-        self.search_worker.raw_index.connect(self._render_summary)
-        self.search_worker.failed.connect(self._summary_failed)
-        self.search_worker.raw_index.connect(self.search_thread.quit)
-        self.search_worker.failed.connect(self.search_thread.quit)
-        self.search_thread.start()
+        self.status_lbl.setText("Searching the drive folders for the summary…")
+        self._start_search("Looking…", self._summary_failed, on_index=self._render_summary)
 
     def _render_summary(self, combined: dict):
-        self.summary_btn.setEnabled(True)
+        if self._closing:
+            return
         try:
             summary = smz.build_summary(self.roster, combined.get("sessions", {}),
                                         combined.get("videos", []))
@@ -2357,7 +2571,6 @@ class ScanDriveGUI(QMainWindow):
         SummaryDialog(str(scratch), self).exec()
 
     def _summary_failed(self, msg: str):
-        self.summary_btn.setEnabled(True)
         QMessageBox.critical(self, "Summary failed", msg)
         self.status_lbl.setText("Summary failed.")
 
@@ -2397,65 +2610,71 @@ class ScanDriveGUI(QMainWindow):
 
     # -- prepare RecordingMeta ---------------------------------------------
     def _prepare_meta(self, auto: bool = False):
-        if not self.roster:
+        if not self.roster or self._closing:
             return
-        self._meta_auto = bool(auto)
+        if self._search_busy():
+            self.status_lbl.setText(
+                "Scan done · auto RecordingMeta skipped (a drive search is running)." if auto
+                else "A drive search is still running — try again when it finishes.")
+            return
         path = self.xlsx_edit.text().strip()
         try:
             raw = pd.read_excel(path, sheet_name=self.sheet_combo.currentText().strip() or "Raw")
             raw = raw.dropna(subset=["subject"])
         except Exception as exc:
+            if auto:
+                self.status_lbl.setText(f"Scan done · auto RecordingMeta skipped ({exc}).")
+                return
             QMessageBox.critical(self, "Could not read sheet", str(exc))
             return
         self._meta_raw = raw
-        self.meta_btn.setEnabled(False)
-        self.status_lbl.setText("Searching all drives for video folders…")
-        roots = self._drive_paths()
-        self.search_thread = QThread()
-        self.search_worker = SearchWorker(self.roster, roots,
-                                          self.depth_spin.value(),
-                                          self.act_sysdrive.isChecked())
-        self.search_worker.moveToThread(self.search_thread)
-        self.search_thread.started.connect(self.search_worker.run)
-        self.search_worker.progress.connect(
-            lambda d: self.status_lbl.setText(f"Looking… {d}"))
-        self.search_worker.raw_index.connect(self._meta_plan)
-        self.search_worker.failed.connect(self._meta_failed)
-        self.search_worker.raw_index.connect(self.search_thread.quit)
-        self.search_worker.failed.connect(self.search_thread.quit)
-        self.search_thread.start()
+        self.status_lbl.setText("Searching the drive folders for video folders…")
+        self._start_search("Looking…", lambda msg: self._meta_failed(msg, auto),
+                           on_index=lambda combined: self._meta_plan(combined, auto))
 
-    def _meta_plan(self, combined: dict):
-        self.meta_btn.setEnabled(True)
-        auto = getattr(self, "_meta_auto", False)
-        self._meta_auto = False
-        try:
-            plan = pmeta.plan_meta(self.roster, combined.get("sessions", {}), self._meta_raw)
-        except Exception as exc:  # pragma: no cover
-            if auto:
-                self.status_lbl.setText("Scan done · auto RecordingMeta step failed.")
-                return
-            QMessageBox.critical(self, "Prepare failed", str(exc))
-            self.status_lbl.setText("Prepare failed.")
+    def _meta_plan(self, combined: dict, auto: bool = False):
+        """Plan (and, in auto mode, write the unambiguous rows) off the GUI thread."""
+        if self._closing:
             return
+        if self.meta_thread is not None:
+            self.meta_thread.wait(2000)
+        self.status_lbl.setText("Planning RecordingMeta…")
+        self.meta_thread = QThread()
+        self.meta_worker = MetaWorker(self.roster, combined.get("sessions", {}),
+                                      self._meta_raw, auto)
+        self.meta_worker.moveToThread(self.meta_thread)
+        self.meta_thread.started.connect(self.meta_worker.run)
+        self.meta_worker.done.connect(self._meta_done)
+        self.meta_worker.failed.connect(self._meta_failed)
+        self.meta_worker.done.connect(self.meta_thread.quit)
+        self.meta_worker.failed.connect(self.meta_thread.quit)
+        self.meta_thread.finished.connect(self._thread_ended)
+        self.meta_thread.start()
+        self._refresh_actions()
+
+    def _meta_done(self, plan: list, results: list, auto: bool):
         n_write = sum(1 for p in plan if p["action"] == pmeta.WRITE)
         if auto:
-            # Auto mode (after scan): write straight away — plan_meta never overwrites
-            # an existing RecordingMeta.xlsx, so there is nothing to review/confirm.
-            if n_write:
-                results = pmeta.write_plan(plan)
-                nok = sum(1 for r in results if r["result"] == "written")
-                nerr = sum(1 for r in results if r["result"] == "error")
-                self.status_lbl.setText(f"Scan done · auto-wrote {nok} RecordingMeta.xlsx"
-                                        + (f" ({nerr} error)" if nerr else "") + ".")
-            else:
-                self.status_lbl.setText("Scan done · RecordingMeta already present for all sessions.")
+            # Auto mode (after scan): MetaWorker already wrote the WRITE rows whose
+            # pairing is unambiguous; the rest wait for the reviewed dialog.
+            nok = sum(1 for r in results if r["result"] == "written")
+            nerr = sum(1 for r in results if r["result"] == "error")
+            held = sum(1 for p in plan if p["action"] == pmeta.WRITE and p.get("ambiguous"))
+            msg = f"Scan done · auto-wrote {nok} RecordingMeta.xlsx"
+            if nerr:
+                msg += f" ({nerr} error)"
+            if held:
+                msg += (f" · {held} held back (session/folder counts differ — use "
+                        f"Fix / Prepare ▸ Prepare RecordingMeta to review)")
+            self.status_lbl.setText(msg + ".")
             return
         self.status_lbl.setText(f"RecordingMeta: {n_write} to write.")
         MetaDialog(plan, self).exec()
 
-    def _meta_failed(self, msg: str):
-        self.meta_btn.setEnabled(True)
+    def _meta_failed(self, msg: str, auto: bool = False):
+        if auto:
+            self.status_lbl.setText(f"Scan done · auto RecordingMeta step failed ({msg}).")
+            return
         QMessageBox.critical(self, "Prepare failed", msg)
         self.status_lbl.setText("Prepare failed.")
 
@@ -2481,7 +2700,7 @@ class ScanDriveGUI(QMainWindow):
         if paths:
             _reveal(paths[0])
         elif self.results[r].get("status") in ("MISSING", "PARTIAL"):
-            # nothing found under the selected drives — offer to locate it everywhere
+            # nothing found by the scan — offer the deep search of the drive folders
             self._search_all()
 
     def _export(self):

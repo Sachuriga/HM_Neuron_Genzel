@@ -50,8 +50,11 @@ _META_NAME = "RecordingMeta.xlsx"
 
 def _date8(val) -> str | None:
     """Normalise a Raw ``Date`` cell to YYYYMMDD (mirrors the GUI's parser)."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
+    try:
+        if val is None or pd.isna(val):        # pd.NaT too: it has no strftime
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(val, (pd.Timestamp, datetime.datetime, datetime.date)):
         return val.strftime("%Y%m%d")
     s = str(val).strip()
@@ -182,7 +185,9 @@ NO_TRIALS = "no-trials"    # no behavioural trials in the sheet for this session
 
 def plan_meta(roster: list[dict], found: dict, raw: pd.DataFrame) -> list[dict]:
     """Work out where each session's RecordingMeta.xlsx would be written. Reads
-    only; writes nothing. One row per session (mapped to its own video folder).
+    only; writes nothing. One row per session per copy of its video folder (a
+    session stored on two drives gets its meta written into both copies). Rows
+    carry ``ambiguous=True`` when that day's session and camera-folder counts differ.
 
     A rat can run several sessions in a day, each its own timestamp camera folder.
     Those folders are matched to sessions by time: within one (rat, date) the
@@ -202,10 +207,20 @@ def plan_meta(roster: list[dict], found: dict, raw: pd.DataFrame) -> list[dict]:
         # order. Zip position i to position i.
         sessions = sorted(sessions, key=lambda x: (x.get("train_order", x["session"]),
                                                    x["session"]))
-        folders = []
+        # The same session can sit on several drives (identical copies). Group the
+        # camera folders by NAME so each copy of one folder is one slot — zipping
+        # the raw list would interleave A/ts1, F/ts1, A/ts2 … and hand session 2's
+        # meta to a copy of session 1's video.
+        by_name: dict = defaultdict(set)
         for _label, sess in _iter_session_paths(found, rat_no, date8):
-            folders += find_video_folders(sess)
-        folders = sorted({str(f) for f in folders}, key=_folder_start)
+            for f in find_video_folders(sess):
+                by_name[Path(f).name].add(str(f))
+        names = sorted(by_name, key=_folder_start)
+        # Unambiguous only when every session has exactly one folder slot. If the
+        # counts differ (a lost video, an extra aborted start, a misfiled folder)
+        # the positional pairing may be off by one — flag it so it is never
+        # written unattended.
+        ambiguous = len(names) != len(sessions)
 
         for i, e in enumerate(sessions):
             df = build_meta_df(raw, e["rat_no"], e["day"], e["session"],
@@ -218,15 +233,19 @@ def plan_meta(roster: list[dict], found: dict, raw: pd.DataFrame) -> list[dict]:
                 continue
             # i keeps session<->folder aligned even when a no-trials session is
             # skipped above; a session past the last folder simply has no video.
-            if i >= len(folders):
-                plan.append(dict(base, action=NO_VIDEO, folder="",
+            if i >= len(names):
+                plan.append(dict(base, action=NO_VIDEO, folder="", ambiguous=ambiguous,
                                  detail="no video folder for this session"))
                 continue
-            f = folders[i]
-            exists = (Path(f) / _META_NAME).exists()
-            plan.append(dict(base, action=EXISTS if exists else WRITE, folder=f,
-                             df=df, detail="already present" if exists
-                             else f"{len(df)} trials"))
+            note = (f" — CHECK: {len(sessions)} session(s) vs {len(names)} camera "
+                    f"folder(s) that day, pairing by time order may be off"
+                    if ambiguous else "")
+            for f in sorted(by_name[names[i]]):      # every copy of that folder
+                exists = (Path(f) / _META_NAME).exists()
+                plan.append(dict(base, action=EXISTS if exists else WRITE, folder=f,
+                                 df=df, ambiguous=ambiguous,
+                                 detail=("already present" if exists
+                                         else f"{len(df)} trials") + note))
     return plan
 
 
