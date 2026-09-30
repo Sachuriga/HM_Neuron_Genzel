@@ -6,6 +6,7 @@
 - **Jacob van Rosmalen** — Set up the pipeline for integrating the behavioral and ephys data into `.nwb` (Neurodata Without Borders).
 - **Phan Minh** — Developed the DeepLabCut processing line for tracking the rat's keypoints.
 - **Jill Gerritsen** — Tested and validated the whole processing pipeline.
+- **Nick Abou** — Refined the DeepLabCut processing pipeline.
 
 A batch-processing pipeline for rat hexmaze neuroscience experiments — from raw multi-camera video and Trodes ephys recordings all the way to spike-sorted, NWB-packaged sessions with place-field, Bayesian-decoding, theta/gamma, phase-precession and population-UMAP analyses, plus drive-integrity QC tooling.
 

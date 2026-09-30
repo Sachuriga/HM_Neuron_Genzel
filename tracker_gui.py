@@ -42,7 +42,7 @@ PRESETS = {
     "Full pipeline": "1e234567c89wuvnbmt",
     "Trodes export (DIO/raw/analog + LFP)": "1e",
     "Sync + stitch + track": "234", 
-    "Spike sorting + Sleep (nwb)": "1e78",
+    "Spike sorting + Sleep (nwb)": "1e78", 
     "Spike sorting (+ continue)": "7c",
     "LFP + motion + EMG (sleep)": "e8",
     "NWB packaging (nwb + units + visualise)": "wuv",
