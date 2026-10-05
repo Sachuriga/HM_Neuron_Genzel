@@ -44,7 +44,7 @@ PRESETS = {
     "Sync + stitch + track": "234", 
     "Spike sorting + Sleep (nwb)": "1e78",
     "Spike sorting": "17", 
-    "LFP + motion + EMG (sleep)": "e8",
+    "Sleep (LFP + motion + EMG)": "e8",
     "Spike sorting (+ continue)": "7c",
     "NWB packaging (nwb + units + visualise)": "wuv",
     "Analysis (decode / UMAP)": "nbm",

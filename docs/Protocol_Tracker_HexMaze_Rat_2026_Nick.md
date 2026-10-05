@@ -30,7 +30,7 @@ A folder with input and (pre-)processed output files from just one day of record
 The recording files are stored on the external hard drives in the office. The pre-process spreadsheet shows the locations of specific recording sessions.
 When you copy recording files to a certain PC, please note it in the spreadsheet.
 
-They keyword here is "copy". Do NOT move files out of the external hard drives, only copy them to the office PC's drive. 
+The keyword here is "copy". Do NOT move files out of the external hard drives, only copy them to the office PC's drive. 
 Preferably using Ctrl + C & Ctrl + V.
 
 ![Example of an external hard drive folder structure](media/hard_drive_folder_structure.png)
@@ -40,6 +40,8 @@ The session folders on the external hard drives can have 4 types of folders:
 - _pre: Contains the pre-maze sleep ephys recording.
 - _maze: Contains the maze ephys recording (merged).
 - _post: Contains the post-maze sleep ephys recording.
+
+If a folder contains a .trodesconf file, include this with the .rec as input.
 
 Be aware that transferring these large files can take some time.  
 
@@ -54,9 +56,47 @@ The functionality of the GenzelTracker is divided into "steps", each having its 
 For the data root, select the root folder containing the ip and op folders.
 
 Important presets:
-- "Spike sorting + Sleep (nwb)": Prepares the data for sleep scoring and spike sorting.
+- "Spike sorting + Sleep (nwb)": Prepares the data for sleepscoring and spike sorting.
 - "Spike sorting": Prepares the data for spike sorting.
-- "LFP + Motion + EMG (sleep)": Prepares the data for sleep scoring.
+- "Sleep (LFP + Motion + EMG)": Prepares the data for sleep scoring.
+
+Note that most of these processes can take multiple hours to finish. It is therefore advisable to let the GenzelTracker run overnight.
+
+## 4. Running the analysis softwares
+
+### 4.1 Sleepscoring
+
+In an Anaconda python terminal, run:
+`conda activate sleep_score` or `conda activate sleepscore`
+`sleepscore`
+
+In the sleepscore program, choose your op folder as the data folder.
+Your op folder should contain an .nwb file after processing for sleepscoring.
+Sleepscore save data will be stored inside the .nwb file.
+
+### 4.2 Spike sorting
+
+In an Anaconda python terminal, run:
+`conda activate phy`
+Navigate to ...\phy_export in your op folder, for example: 
+`cd C:\Users\gl_pc\Desktop\data\sleep\Rat6_20260727\op1\Rat6_HM_Neurons_20260727_092437_pre.raw_group0_mountainsort4_sorting_output\phy_export`
+`phy template-gui params.py`
+
+After the initial round of spike sorting is finished, step r ("recompute metrics") of the GenzelTracker may be run.
+This will prepare the data for spike quality labelling.
+Be careful not to recompute metrics for op folders in which the spike sorting has not yet been finished.
+
+## 5. Moving the processed data to the Genzel Server
+
+
+
+
+
+
+
+
+
+
 
 
 
