@@ -9,6 +9,7 @@ from scipy.stats import zscore
 from tqdm import tqdm
 
 from session_prefix import session_prefix
+from lfp_from_raw import find_raw_sessions, build_lfp_from_raw
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -336,13 +337,42 @@ def compute_awakeness(lfp_array, emg_1d, fs, best_ch_idx, epoch_s=1):
 # ──────────────────────────────────────────────────────────────────────────────
 
 STEPS = [
-    "Find & load LFP .dat files",
+    "Find the LFP source",
     "Assemble the LFP matrix",
     "Select EMG channel",
     "Select cleanest EEG channels",
     "Compute awakeness",
     "Package into the session NWB",
 ]
+
+
+def _save_channel_npys(lfp, channel_map, npy_dir, pfx, rows=1_500_000):
+    """One ``lfp_ntNN_chCC.npy`` per column, filled in row blocks so the
+    memory-mapped matrix is read once rather than once per channel."""
+    npy_dir.mkdir(parents=True, exist_ok=True)
+    outs = [np.lib.format.open_memmap(
+                npy_dir / f"{pfx}lfp_nt{c['ntrode']:02d}_ch{c['channel']:02d}.npy",
+                mode="w+", dtype=np.float32, shape=(lfp.shape[0],))
+            for c in channel_map]
+    for s in range(0, lfp.shape[0], rows):
+        block = np.asarray(lfp[s:s + rows])
+        for k, o in enumerate(outs):
+            o[s:s + rows] = block[:, k]
+    for o in outs:
+        o.flush()
+    del outs
+    tqdm.write(f"  ✓ Saved {len(channel_map)} individual .npy files → {npy_dir}")
+
+
+def _stored_lfp_shape(nwb_path):
+    """Shape of ``acquisition/lfp`` already in ``nwb_path``, or None."""
+    import h5py
+    try:
+        with h5py.File(str(nwb_path), "r") as f:
+            d = f.get("acquisition/lfp/data")
+            return tuple(d.shape) if d is not None else None
+    except OSError:
+        return None
 
 
 def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
@@ -428,6 +458,14 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
             sleep_channels=sleep_channels, derived=derived, metadata=metadata)
 
     if nwb_path.is_file():
+        # Containers are never overwritten, so an LFP with a different channel
+        # set (an older one-per-nTrode export) has to go first — together with
+        # the column-indexed session_info and the signals derived from it.
+        old_shape = _stored_lfp_shape(nwb_path)
+        if old_shape is not None and tuple(old_shape[1:]) != tuple(lfp.shape[1:]):
+            removed = snwb.drop_lfp_outputs(nwb_path)
+            tqdm.write(f"  ↻ replacing the stored LFP {old_shape} with "
+                       f"{tuple(lfp.shape)} (removed {', '.join(removed)})")
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()
@@ -466,7 +504,23 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
 
 
 def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None,
-                 keep_npy=False):
+                 keep_npy=False, source="auto"):
+    """``source``: ``raw`` = every channel from the step-1 raw export, ``export``
+    = exportLFP's one-channel-per-nTrode .dat, ``auto`` = raw when present."""
+    scratch = []                # the all-channel LFP .npy, when it is only scratch
+    try:
+        _run_pipeline(input_folder, output_folder, output_rate, config_path,
+                      keep_npy, source, scratch)
+    finally:
+        for f in scratch:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError as exc:      # Windows: still memory-mapped after a failure
+                tqdm.write(f"  (could not delete scratch {f.name}: {exc})")
+
+
+def _run_pipeline(input_folder, output_folder, output_rate, config_path,
+                  keep_npy, source, scratch):
     base_path  = Path(input_folder)
     # LFP_Output only exists for the .npy files. Everything now goes into the
     # session NWB, so the folder is created only when those are asked for.
@@ -485,68 +539,99 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
                 sp.set_description(f"[{STEPS[i]}]")
             sp.update(1)
 
-        # ── 1. FIND & LOAD LFP .dat FILES ───────────────────────────────────
+        # ── 1. FIND THE LFP SOURCE ──────────────────────────────────────────
         tqdm.write(f"\n{'─'*60}")
         tqdm.write(f"▶  Input: {base_path}")
-        tqdm.write("Step 1/6 — Finding Trodes-exported LFP .dat files")
+        tqdm.write("Step 1/6 — Finding the LFP source")
 
-        sessions = find_lfp_sessions(input_folder)
-        if not sessions:
-            tqdm.write("❌  No LFP .dat files found! Check your input folder.")
-            tqdm.write("    Expected: <recording>.LFP/<recording>.LFP_nt*ch*.dat")
+        # Every channel comes from the step-1 raw export; exportLFP's .LFP
+        # folders hold only one channel per nTrode, so they are the fallback.
+        raw_sessions = find_raw_sessions(input_folder) if source != "export" else []
+        sessions = [] if raw_sessions else find_lfp_sessions(input_folder)
+        if source == "raw" and not raw_sessions:
+            tqdm.write("❌  No raw export found (<recording>.raw/*_group0.dat). "
+                       "Run step 1 first.")
             return
-
-        total_files = sum(len(s['lfp_files']) for s in sessions)
-        tqdm.write(f"  Found {len(sessions)} session(s), "
-                   f"{total_files} LFP channel file(s) total")
-        for s in sessions:
-            ts_name = s['ts_file'].name if s['ts_file'] else "(none)"
-            tqdm.write(f"    • {s['name']}: {len(s['lfp_files'])} ch, ts={ts_name}")
-
-        channels, fs, boundaries = load_and_concat_sessions(sessions)
-        tqdm.write(f"  Sampling rate from header: {fs} Hz")
-        # The LFP header sometimes reports the raw acquisition rate (e.g. 30 kHz)
-        # rather than the decimated exportLFP output rate. That would make every
-        # downstream timestamp (and the sleep scorer's fs) 20× off. Trust the
-        # known output rate when given, and warn on any mismatch.
-        if output_rate is not None and abs(fs - output_rate) > 1:
-            tqdm.write(f"  ⚠ Overriding header rate {fs} Hz with --output_rate "
-                       f"{output_rate} Hz (the exportLFP -outputrate).")
-            fs = float(output_rate)
-        elif fs >= 20000:
-            tqdm.write(f"  ⚠ Header rate {fs} Hz looks like the RAW rate, not LFP. "
-                       f"Pass --output_rate <lfp Hz> so timestamps are correct.")
+        if not raw_sessions and not sessions:
+            tqdm.write("❌  No LFP source found! Check your input folder.")
+            tqdm.write("    Expected: <recording>.raw/*_group0.dat (step 1), or")
+            tqdm.write("              <recording>.LFP/<recording>.LFP_nt*ch*.dat (step e)")
+            return
+        session_name = (raw_sessions or sessions)[0]['name']
+        # rat_sessiondate_ prefix for every generated file (from the recording).
+        pfx = session_prefix(session_name)
         advance(1)
 
-        # ── 2. SAVE PER-CHANNEL .npy + COMBINED ARRAY ───────────────────────
-        tqdm.write("Step 2/6 — Assembling the LFP matrix")
+        # ── 2. ASSEMBLE THE (n_samples, n_channels) LFP MATRIX ──────────────
+        if raw_sessions:
+            tqdm.write(f"Step 2/6 — All-channel LFP from {len(raw_sessions)} raw "
+                       f"export(s)")
+            # Built on disk and memory-mapped. With --keep-npy the file IS
+            # lfp_data.npy; otherwise it is scratch, deleted once in the NWB.
+            lfp_npy = (output_dir / f"{pfx}lfp_data.npy" if keep_npy
+                       else Path(output_folder) / f".{pfx}lfp_all.tmp.npy")
+            if not keep_npy:
+                scratch.append(lfp_npy)
+            lfp_array, fs, boundaries, ch_info_list = build_lfp_from_raw(
+                raw_sessions, lfp_npy, output_rate=output_rate or 1500.0,
+                log=tqdm.write)
+            n_samples, num_channels = lfp_array.shape
+            if keep_npy:
+                _save_channel_npys(lfp_array, ch_info_list, output_dir / "channels_npy", pfx)
+        else:
+            tqdm.write("  ⚠ No raw export (<recording>.raw/) — falling back to the "
+                       "exportLFP .dat, which has ONE channel per nTrode.")
+            total_files = sum(len(s['lfp_files']) for s in sessions)
+            tqdm.write(f"  Found {len(sessions)} session(s), "
+                       f"{total_files} LFP channel file(s) total")
+            for s in sessions:
+                ts_name = s['ts_file'].name if s['ts_file'] else "(none)"
+                tqdm.write(f"    • {s['name']}: {len(s['lfp_files'])} ch, ts={ts_name}")
 
-        # rat_sessiondate_ prefix for every generated file (from the recording).
-        pfx = session_prefix(sessions[0]['name'])
+            channels, fs, boundaries = load_and_concat_sessions(sessions)
+            tqdm.write(f"  Sampling rate from header: {fs} Hz")
+            # The LFP header sometimes reports the raw acquisition rate (e.g. 30 kHz)
+            # rather than the decimated exportLFP output rate. That would make every
+            # downstream timestamp (and the sleep scorer's fs) 20× off. Trust the
+            # known output rate when given, and warn on any mismatch.
+            if output_rate is not None and abs(fs - output_rate) > 1:
+                tqdm.write(f"  ⚠ Overriding header rate {fs} Hz with --output_rate "
+                           f"{output_rate} Hz (the exportLFP -outputrate).")
+                fs = float(output_rate)
+            elif fs >= 20000:
+                tqdm.write(f"  ⚠ Header rate {fs} Hz looks like the RAW rate, not LFP. "
+                           f"Pass --output_rate <lfp Hz> so timestamps are correct.")
 
-        n_samples = channels[0]['data'].shape[0]
-        num_channels = len(channels)
+            tqdm.write("Step 2/6 — Assembling the LFP matrix")
+            n_samples = channels[0]['data'].shape[0]
+            num_channels = len(channels)
 
-        # Per-channel .npy and the combined lfp_data.npy hold the SAME samples
-        # twice; both are now written only on request (--keep-npy). The session
-        # NWB below is the one home for the per-sample arrays.
-        if keep_npy:
-            npy_dir = output_dir / "channels_npy"
-            npy_dir.mkdir(exist_ok=True)
-            for i, ch_info in enumerate(channels):
-                nt = ch_info['ntrode']
-                ch = ch_info['channel']
-                if nt is not None:
-                    fname = f"{pfx}lfp_nt{nt:02d}_ch{ch:02d}.npy"
-                else:
-                    fname = f"{pfx}lfp_ch{i:03d}.npy"
-                np.save(npy_dir / fname, ch_info['data'])
-            tqdm.write(f"  ✓ Saved {num_channels} individual .npy files → {npy_dir}")
+            # Per-channel .npy and the combined lfp_data.npy hold the SAME samples
+            # twice; both are now written only on request (--keep-npy). The session
+            # NWB below is the one home for the per-sample arrays.
+            if keep_npy:
+                npy_dir = output_dir / "channels_npy"
+                npy_dir.mkdir(exist_ok=True)
+                for i, ch_info in enumerate(channels):
+                    nt = ch_info['ntrode']
+                    ch = ch_info['channel']
+                    if nt is not None:
+                        fname = f"{pfx}lfp_nt{nt:02d}_ch{ch:02d}.npy"
+                    else:
+                        fname = f"{pfx}lfp_ch{i:03d}.npy"
+                    np.save(npy_dir / fname, ch_info['data'])
+                tqdm.write(f"  ✓ Saved {num_channels} individual .npy files → {npy_dir}")
 
-        # Build combined (n_samples, n_channels) array
-        lfp_array = np.column_stack([ch['data'] for ch in channels])
-        if keep_npy:
-            np.save(output_dir / f"{pfx}lfp_data.npy", lfp_array)
+            lfp_array = np.column_stack([ch['data'] for ch in channels])
+            if keep_npy:
+                np.save(output_dir / f"{pfx}lfp_data.npy", lfp_array)
+
+            ch_info_list = [{'index': i, 'ntrode': ch['ntrode'],
+                             'channel': ch['channel'],
+                             'source_file': str(ch['file'].name)}
+                            for i, ch in enumerate(channels)]
+            del channels
+            gc.collect()
 
         # The time axis is continuous and gapless across the concatenated
         # sessions: per-session Trodes timestamps reset at each recording start,
@@ -565,15 +650,6 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
                 tqdm.write(f"    {b['name']}: samples {b['start']}.."
                            f"{b['start'] + b['n']}  (t0={b['start'] / fs:.2f}s)")
 
-        # Save channel mapping
-        ch_info_list = []
-        for i, ch in enumerate(channels):
-            ch_info_list.append({
-                'index': i,
-                'ntrode': ch['ntrode'],
-                'channel': ch['channel'],
-                'source_file': str(ch['file'].name),
-            })
         if keep_npy:
             np.save(output_dir / f"{pfx}channel_map.npy", ch_info_list)
 
@@ -583,7 +659,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
         try:
             from sorting import load_sorting_config, resolve_sleep_channels
             sc = resolve_sleep_channels(
-                sessions[0]['name'],
+                session_name,
                 load_sorting_config(config_path, quiet=True)) or {}
             if sc:
                 if keep_npy:
@@ -593,9 +669,6 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
             tqdm.write(f"  (sleep_channels not resolved: {exc})")
 
         tqdm.write(f"  ✓ LFP ({n_samples}, {num_channels}) @ {fs} Hz")
-
-        del channels
-        gc.collect()
         advance(2)
 
         # ── 3. SELECT EMG CHANNEL ───────────────────────────────────────────
@@ -640,7 +713,7 @@ def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None
             channel_map=ch_info_list, sleep_channels=sc, emg_channel=emg_ch,
             cleanest=best_ch_idx, snr=scores,
             awakeness=awakeness, emg_rms=emg_rms, theta_delta=theta_delta,
-            session_name=sessions[0]['name'])
+            session_name=session_name)
 
         del lfp_array, emg_1d
         gc.collect()
@@ -672,7 +745,8 @@ if __name__ == "__main__":
         description="Convert Trodes-exported LFP .dat files to .npy and compute awakeness."
     )
     parser.add_argument('--input_folder',  required=True,
-                        help="Folder containing Trodes LFP export (*.LFP/*.dat)")
+                        help="Recording folder: step-1 raw export (*.raw/) and/or "
+                             "exportLFP output (*.LFP/*.dat)")
     parser.add_argument('--output_folder', required=True,
                         help="Destination for all output files.")
     parser.add_argument('--output_rate', type=float, default=None,
@@ -681,6 +755,11 @@ if __name__ == "__main__":
     parser.add_argument('--config', default=None,
                         help="hm_tracker_paths.txt for per-rat SLEEP_CHANNELS_<rat> "
                              "(cortex/sr/pyr tetrodes). Default ~/Desktop/hm_tracker_paths.txt.")
+    parser.add_argument('--source', choices=('auto', 'raw', 'export'), default='auto',
+                        help="LFP source: 'raw' = all channels from the step-1 raw "
+                             "export (*.raw/*_group0.dat), 'export' = exportLFP's "
+                             "one channel per nTrode (*.LFP/), 'auto' = raw when "
+                             "present (default).")
     parser.add_argument('--keep-npy', dest='keep_npy', action='store_true',
                         help="Also write the per-sample .npy files (channels_npy/, "
                              "lfp_data, lfp_timestamps, emg_data, awakeness, emg_rms, "
@@ -692,4 +771,4 @@ if __name__ == "__main__":
         default_cfg = Path(os.path.expanduser("~")) / "Desktop" / "hm_tracker_paths.txt"
         cfg = str(default_cfg) if default_cfg.exists() else None
     run_pipeline(args.input_folder, args.output_folder, output_rate=args.output_rate,
-                 config_path=cfg, keep_npy=args.keep_npy)
+                 config_path=cfg, keep_npy=args.keep_npy, source=args.source)

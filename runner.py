@@ -386,7 +386,9 @@ def run_worker(ip, op, steps, out):
 
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
-        # Per-sample data goes into the session NWB. KEEP_NPY=1 in
+        # Per-sample data goes into the session NWB. The LFP is built for ALL
+        # channels from step 1's raw export (*.raw/*_group0.dat); without it, it
+        # falls back to step e's exportLFP (one channel per nTrode). KEEP_NPY=1 in
         # hm_tracker_paths.txt also writes the old LFP_Output/*.npy alongside it.
         keep_npy = ["--keep-npy"] if _flag_env("KEEP_NPY", "HM_KEEP_NPY") else []
         lfp_rate = _str_env("LFP_OUTPUT_RATE", default="1500")

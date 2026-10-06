@@ -49,9 +49,13 @@ The bad channels are hardcoded in `sorting.py`. If the probe has changed or a pr
 
 ## Step 8 — LFP Extraction
 
-**Error: `No LFP .dat files found`**
+**Error: `No LFP source found`**
 
-Same as Step 7 above — run Step e first to generate the LFP export.
+Step 8 builds the all-channel LFP from Step 1's raw export (`<recording>.raw/*_group0.dat`) — run Step 1 first. Without it, it falls back to Step e's `.LFP/` export, which has only one channel per nTrode.
+
+**Warning: `No raw export ... falling back to the exportLFP .dat`**
+
+The NWB will hold 32 LFP channels (one per nTrode) instead of 128. Run Step 1 (`trodesexport -raw`) and rerun Step 8 to get all channels; the stored LFP is replaced automatically.
 
 **Timestamps file missing — synthetic timestamps used**
 

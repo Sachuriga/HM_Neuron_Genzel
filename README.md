@@ -73,7 +73,7 @@ The pipeline takes raw Trodes recordings (`.rec`) and 12-camera hexmaze video, a
 **Ephys tier**
 
 - Spike sorting (MountainSort5 default / MountainSort4) via SpikeInterface, per tetrode, with automated good/mua/noise labels and Phy export for manual curation
-- LFP extraction (1500 Hz, one channel per tetrode), headstage IMU motion, sleep-scoring aids (EMG channel, awakeness index, Buzsáki EMG-from-LFP)
+- LFP extraction (1500 Hz, all 128 channels from the raw export), headstage IMU motion, sleep-scoring aids (EMG channel, awakeness index, Buzsáki EMG-from-LFP)
 
 **Integration / analysis tier (NWB)**
 
@@ -486,7 +486,9 @@ python src/sorter/export_emg_from_lfp.py --input_folder <ip> --output_folder <op
 python src/sorter/export_motion.py       --input_folder <ip> --output_folder <op>
 ```
 
-**`export_lfp.py`** — reads `<recording>.LFP/*.dat` (voltage × header `voltagescaling`, default **0.195 µV/bit**; `--output_rate 1500` overrides the sometimes-lying header fs). Multiple `.LFP` folders = sessions concatenated chronologically; only channels common to all sessions kept, sorted ntrode-then-channel. Outputs:
+**`export_lfp.py`** — builds the LFP for **every channel (128)** from step 1's raw export `<recording>.raw/*_group0.dat`: × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a raw export it falls back to step e's `<recording>.LFP/*.dat`, which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
+
+The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV, gzip, chunks of 50 s × 1 tetrode); `processing/sleep/session_info` holds the `channel_map` (column → nTrode/channel). Re-running on a session whose NWB holds an LFP with a different channel count replaces it (plus `session_info` and the awakeness signals). The `.npy` below are written only with `--keep-npy` / `KEEP_NPY=1`:
 
 | File (`{pfx}` = session prefix) | Contents |
 |---|---|

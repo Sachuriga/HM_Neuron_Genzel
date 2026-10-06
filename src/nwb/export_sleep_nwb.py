@@ -40,8 +40,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sleep_nwb_writer as snwb                                    # noqa: E402
 
-LFP_ROWS_PER_CHUNK = 250_000        # ~1 s of writing per chunk at 1500 Hz x 64 ch
-
 
 def find_output(folder, suffix):
     """The prefixed (or bare) ``<prefix><suffix>`` file in ``folder``, else None.
@@ -86,24 +84,6 @@ def _load(path, mmap=False):
     except Exception as exc:
         print(f"  [warn] could not read {Path(path).name}: {exc}")
         return None
-
-
-def _lfp_chunks(arr, buffer_gb=0.25):
-    """Stream a big ``(n_samples, n_channels)`` memmap into HDF5 block by block,
-    so a multi-GB LFP never has to sit in RAM at once."""
-    from hdmf.data_utils import GenericDataChunkIterator
-
-    class _ArrayChunks(GenericDataChunkIterator):
-        def _get_data(self, selection):
-            return np.asarray(arr[selection], dtype=np.float32)
-
-        def _get_maxshape(self):
-            return tuple(int(n) for n in arr.shape)
-
-        def _get_dtype(self):
-            return np.dtype("float32")
-
-    return _ArrayChunks(buffer_gb=buffer_gb)
 
 
 def collect_inputs(lfp_dir):
@@ -178,8 +158,8 @@ def run(output_folder, rat_nr=None):
     print(f"[sleep-nwb] Session: {prefix.rstrip('_')}")
     print(f"[sleep-nwb] Target:  {nwb_path}")
 
-    # Reconcile LFP length against its timebase HERE: once wrapped in a chunk
-    # iterator the array is opaque and can no longer be trimmed downstream.
+    # Reconcile LFP length against its timebase (add_sleep_inputs then streams
+    # the memmap into the file chunked + compressed).
     lfp = data.pop("lfp")
     ts = data["lfp_timestamps"]
     if ts is not None:
@@ -190,8 +170,7 @@ def run(output_folder, rat_nr=None):
                   f"truncating both to {n}")
             lfp, ts = lfp[:n], ts[:n]
         data["lfp_timestamps"] = ts
-    big = lfp.shape[0] > LFP_ROWS_PER_CHUNK
-    data["lfp"] = _lfp_chunks(lfp) if big else np.asarray(lfp, dtype=np.float32)
+    data["lfp"] = lfp
 
     if Path(nwb_path).is_file():
         # append into the existing session file — never rewrite it, so anything
