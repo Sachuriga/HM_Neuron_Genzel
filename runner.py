@@ -245,9 +245,12 @@ def launch_worker_window(ip, op, steps, marker, title):
             "--worker", str(ip), str(op), steps, str(marker)]
     try:
         if sys.platform.startswith("win"):
-            # start "title" cmd /k <cmd>  — new console that stays open when done.
+            # start "title" cmd /k "<cmd>"  — new console that stays open when done.
+            # The extra outer quotes are required: with >2 quotes on the line (python
+            # under "C:\Users\Genzel Lab\..." + a %TEMP% marker), cmd /k strips the first
+            # and last quote and runs 'C:\Users\Genzel'. Wrapping makes it strip ours.
             inner = subprocess.list2cmdline(args)
-            subprocess.Popen(f'start "HM Job-{title}" cmd /k {inner}',
+            subprocess.Popen(f'start "HM Job-{title}" cmd /k "{inner}"',
                              shell=True, cwd=repo)
             return True
         if sys.platform == "darwin":
