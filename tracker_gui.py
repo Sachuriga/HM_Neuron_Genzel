@@ -34,21 +34,21 @@ except Exception as exc:                      # pragma: no cover - fallback
 
 # Presets: a name -> ordered step-key string. Order follows MENU for parallel steps.
 PRESETS = {
-    "— Custom —": "",
-    "Tracker implanted": "1e2345678d",
-    "Tracker non-implanted": "23456d",
-    "After manual curation": "wuvbm",
+    "— Maze —": "",
+    "Tracker implanted (Video process + ephys)": "1e2345678d",
+    "Tracker non-implanted (Video process, no ephys)": "23456d",
     "Retrack": "3456d",
-    "Full pipeline": "1e234567c89wuvnbmt",
-    "Trodes export (DIO/raw/analog + LFP)": "1e",
-    "Sync + stitch + track": "234", 
-    "Spike sorting + Sleep (nwb)": "1e78",
-    "Spike sorting": "17", 
-    "Sleep (LFP + motion + EMG)": "e8",
-    "Spike sorting (+ continue)": "7c",
+    "LED Sync + stitch + track": "234", 
+    "After manual curation": "wuvbm",
+    "— Sleep —": "",
+    "Prepare sleep scoring and spike sorting": "1e78",
+    "Prepare sleep scoring": "e8",
+    "Prepare spike sorting": "17", 
+    "— Other —": "",
     "NWB packaging (nwb + units + visualise)": "wuv",
     "Analysis (decode / UMAP)": "nbm",
-    "Drive scan (QC)": "t",
+    "Spike sorting (+ continue)": "7c",
+    "Full pipeline": "1e234567c89wuvnbmt",
 }
 
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")

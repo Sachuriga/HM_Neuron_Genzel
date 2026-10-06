@@ -57,9 +57,11 @@ The functionality of the GenzelTracker is divided into "steps", each having its 
 For the data root, select the root folder containing the ip and op folders.
 
 Important presets:
-- "Spike sorting + Sleep (nwb)": Prepares the data for sleepscoring and spike sorting.
-- "Spike sorting": Prepares the data for spike sorting.
-- "Sleep (LFP + Motion + EMG)": Prepares the data for sleep scoring.
+- "Tracker implanted": Processes maze video and prepares data for sleep scoring and spike sorting.
+- "Tracker non-implanted": Only processes maze video.
+- "Prepare for sleep scoring and spike sorting": Prepares the data for sleep scoring and spike sorting.
+- "Prepare for spike sorting": Prepares the data for spike sorting.
+- "Prepare for sleep scoring": Prepares the data for sleep scoring.
 
 Note that most of these processes can take multiple hours to finish. It is therefore advisable to let the GenzelTracker run overnight.
 
