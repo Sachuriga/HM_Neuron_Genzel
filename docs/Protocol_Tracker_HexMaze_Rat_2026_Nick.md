@@ -65,13 +65,13 @@ Important presets:
 
 Note that most of these processes can take multiple hours to finish. It is therefore advisable to let the GenzelTracker run overnight.
 
-## 4. Running the analysis softwares
+## 4. Checking the video & Running the analysis softwares
 
 ### 4.1 Sleepscoring
 
-In an Anaconda python terminal, run:  
+In an Anaconda python terminal, run: 
 `conda activate sleep_score` or `conda activate sleepscore`  
-`sleepscore`
+And then: `sleepscore`
 
 In the sleepscore program, choose your op folder as the data folder.  
 Your op folder should contain an .nwb file after processing for sleepscoring.  
@@ -79,29 +79,50 @@ Sleepscore save data will be stored inside the .nwb file.
 
 ### 4.2 Spike sorting
 
-In an Anaconda python terminal, run:  
-`conda activate phy`  
+In an Anaconda python terminal, run: `conda activate phy`    
 Navigate to ...\phy_export in your op folder, for example:   
 `cd C:\Users\gl_pc\Desktop\data\sleep\Rat6_20260727\op1\Rat6_HM_Neurons_20260727_092437_pre.raw_group0_mountainsort4_sorting_output\phy_export`  
-`phy template-gui params.py`
+And then: `phy template-gui params.py`
 
 After the initial round of spike sorting is finished, step r ("recompute metrics") of the GenzelTracker may be run.
 This will prepare the data for spike quality labelling.  
 Be careful not to recompute metrics for op folders in which the spike sorting has not yet been finished.
 
-## 5. Finishing the data
+### 4.3 Maze video (W.I.P.)
 
-When a full sleep session (pre and post) has been sleep scored and spike sorted, all data should be compacted into a .nwb file.  
-For sleep data, use the GenzelTracker step: v  
-For maze data, use the GenzelTracker preset: "After manual curation"
+After running the Tracker implanted GenzelTracker preset, your maze op folder should look something like this: [image here]  
+It is important that you check the validity of the video. Based on the Excel sheet RecordingMeta.xlsx provided by the researchers, the GenzelTracker will have generated an automatic Trial count overlay on the video.  
+
+You should check whether the following files have the same amount of trials:
+RecordingMeta.xlsx
+yyyymmdd_rat*.mp4 (Example: 20260717_Rat5.mp4)
+yyyymmdd_rat*_analysis_final.pdf
+
+If there is a discrepancy in the trial counts between these files, you will need to troubleshoot.
+If the error can be attributed to a mistake in the RecordingMeta.xlsx file, please change it in the ip folder and then run the "Retrack" GenzelTracker preset.
+
+
+## 5. Finishing the data, preparing for storage
+
+When a maze session has been fully spike sorted and video stitched & tracked, or a full sleep session (pre and post) has been sleep scored and spike sorted, all data should be compacted into a .nwb file.  
+
+For sleep data, use the GenzelTracker preset: "After manual curation (sleep)"  
+For maze data, use the GenzelTracker preset: "After manual curation (maze)"
 
 
 ## 6. Moving the processed data to the Genzel Server
 
+The resulting op folders should be moved to the Genzel Server.  
+In the file browser, navigate to This Pc -> genzel (genzel-srv.science.ru.nl)  
+Then continue on to ...\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron  
 
+This folder contains 3 sub-folders, labelled as "post", "pre", and "task".  
+You will need to move the op folders containing your curated and processed data to these folders.  
+Inside of these folders, and then inside of the sub-folder for your specific rate, please re-name the op folder to just the session date (format: yyyymmdd).  
 
-
-
+Example: You finished the pre-sleep session for Rat 5, 20260720.  
+1. Move the op folder to  ...\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\pre\rat5_491390
+2. Re-name the op folder to "20260720".  
 
 
 
