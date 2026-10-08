@@ -1,8 +1,8 @@
 """
 Runner step [u]: add the curated spike-sorting Units table to the session NWB.
 
-Runs AFTER step [w] (create_nwb.py). For each op folder it:
-  - finds the NWB written by step w:            <op>/Rat*_*.nwb
+Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each op folder it:
+  - finds the session NWB (step 4 / step 8):    <op>/Rat*_*.nwb
   - finds the curated phy folder(s):            <op>/*_sorting_output/phy_export
   - reads, per curated unit:
       * spike times (seconds)      from spike_times.npy + spike_clusters.npy
@@ -19,15 +19,21 @@ Runs AFTER step [w] (create_nwb.py). For each op folder it:
     (trough-to-peak, peak/trough half-width), the CellExplorer ACG tau_rise and the
     putative cell_type (see spike_metrics.py) — the NWB template-metric CSVs were
     unreliable.
-  - appends an NWB Units table with spike_times, waveform_mean, one column per
+  - writes an NWB Units table with spike_times, waveform_mean, one column per
     quality/template metric, the recomputed metrics + cell_type, plus quality_label
     (manual cluster_group.tsv), auto_quality_label, phy_cluster_id, sorting_group.
+
+Waveforms are ALWAYS extracted and stored. Every run REPLACES an existing Units
+table, so re-curating in Phy and re-running u updates the NWB. If the waveforms
+cannot be extracted for any phy folder, nothing is written (the old Units table
+stays) and the step exits with an error — a Units table without waveform_mean
+is never written.
 
 Phy's own templates.npy is NOT used: it is keyed by the pre-curation cluster ids
 and goes stale after merges/splits.
 
 Usage:
-    python add_units.py --output_folder <op_folder> [--n_jobs 4] [--skip-waveforms]
+    python add_units.py --output_folder <op_folder> [--n_jobs 4]
 """
 
 import sys
@@ -72,7 +78,7 @@ def find_phy_folders(output_folder):
 
 
 def find_nwb_file(output_folder):
-    """The NWB written by step w lives directly in the op folder as Rat*_*.nwb."""
+    """The session NWB (step 4 / step 8) lives directly in the op folder as Rat*_*.nwb."""
     op = Path(output_folder)
     cands = [p for p in sorted(op.glob("*.nwb")) if not p.name.endswith(".tmp.nwb")]
     if cands:
@@ -110,7 +116,7 @@ def _load_templates(phy, n_jobs=4):
 
     ALWAYS rebuilds the analyzer from the phy recording to compute fresh curated
     rebuild the analyzer from the phy recording and compute templates. Returns
-    ({}, 0, 0) on failure (caller then writes units without waveform_mean)."""
+    ({}, 0, 0) on failure (the caller then refuses to write the session)."""
     tpl_file = phy / "curated_templates.npy"
     ids_file = phy / "curated_template_unit_ids.npy"
     # ALWAYS recompute the curated templates here (step u), rebuilding the analyzer
@@ -147,7 +153,8 @@ def _load_templates(phy, n_jobs=4):
             pass
         return by_unit, templates.shape[1], templates.shape[2]
     except Exception as e:
-        print(f"  Could not compute templates ({e}); units will have no waveform_mean.")
+        print(f"  Could not compute templates ({e}).")
+        traceback.print_exc()
         return {}, 0, 0
 
 
@@ -177,7 +184,7 @@ def _spike_times_by_unit(phy, unit_ids):
     return out
 
 
-def _collect_units(phy, n_jobs=4, skip_waveforms=False):
+def _collect_units(phy, n_jobs=4):
     """Gather every curated unit in one phy folder into a list of dicts."""
     phy = Path(phy)
     qm_file = phy / "curated_quality_metrics.csv"
@@ -191,13 +198,13 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
         print(f"  WARNING: no cluster_group.tsv in {phy}; quality_label will fall "
               f"back to the automated labels.")
 
-    templates_by_unit, _, _ = ({}, 0, 0)
-    if not skip_waveforms:
-        templates_by_unit, _, _ = _load_templates(phy, n_jobs=n_jobs)
+    templates_by_unit, _, _ = _load_templates(phy, n_jobs=n_jobs)
+    if not templates_by_unit:
+        raise RuntimeError(f"no waveforms could be extracted from {phy}")
 
-    # Canonical unit set: the metric rows (the analyzable curated units). If we
-    # have templates, keep only units that also have one so waveform_mean is
-    # present for every written unit (NWB optional columns are all-or-none).
+    # Canonical unit set: the metric rows (the analyzable curated units), kept
+    # only where a template exists so waveform_mean is present for every written
+    # unit (NWB optional columns are all-or-none).
     if not quality.empty:
         unit_ids = [int(u) for u in quality.index]
     elif templates_by_unit:
@@ -207,9 +214,11 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
         clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
         unit_ids = [int(u) for u in np.unique(clusters)]
 
-    have_wf = bool(templates_by_unit)
-    if have_wf:
-        unit_ids = [u for u in unit_ids if u in templates_by_unit]
+    missing = [u for u in unit_ids if u not in templates_by_unit]
+    if missing:
+        print(f"  WARNING: {len(missing)} unit(s) have metrics but no template and are "
+              f"left out: {missing}")
+    unit_ids = [u for u in unit_ids if u in templates_by_unit]
 
     spikes = _spike_times_by_unit(phy, unit_ids)
 
@@ -237,13 +246,12 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
             "spike_times": st,
             "_metrics": {},
         }
-        if have_wf:
-            rec["waveform_mean"] = np.asarray(templates_by_unit[u], dtype=np.float64)
+        rec["waveform_mean"] = np.asarray(templates_by_unit[u], dtype=np.float64)
 
         # --- recomputed waveform metrics + ACG tau_rise + putative cell type ---
         # (the spikeinterface template-metrics CSVs were unreliable; these are the
         #  authoritative, self-consistent values, computed the same way as step v.)
-        wm = waveform_metrics(rec["waveform_mean"], fs) if have_wf else {}
+        wm = waveform_metrics(rec["waveform_mean"], fs)
         t2p = wm.get("peak_to_trough_s", np.nan)
         tau = acg_tau_rise(st)
         fr = float(len(st)) / duration
@@ -260,7 +268,7 @@ def _collect_units(phy, n_jobs=4, skip_waveforms=False):
             rec["_metrics"][col] = _num(template.at[u, col]) if u in template.index else np.nan
         units.append(rec)
 
-    return units, q_cols, t_cols, have_wf
+    return units, q_cols, t_cols
 
 
 def _num(v):
@@ -270,62 +278,81 @@ def _num(v):
         return np.nan
 
 
-def add_units_to_nwb(output_folder, n_jobs=4, skip_waveforms=False):
-    """Attach the curated Units table(s) for one op folder to its NWB file."""
+def add_units_to_nwb(output_folder, n_jobs=4):
+    """Write the curated Units table(s) for one op folder into its NWB, replacing
+    any existing one. Returns False when the waveforms could not be extracted
+    (nothing is written then)."""
     nwb_path = find_nwb_file(output_folder)
     if nwb_path is None:
-        print(f"No .nwb file found under '{output_folder}' (run step w first). Skipping.")
-        return
+        print(f"No .nwb file found under '{output_folder}' (run step 4 or 8 first). Skipping.")
+        return True
     phys = find_phy_folders(output_folder)
     if not phys:
         print(f"No 'phy_export' folder found under '{output_folder}'. Nothing to add.")
-        return
+        return True
 
     print(f"NWB target: {nwb_path}")
     print(f"Found {len(phys)} phy folder(s).")
 
     all_units = []
     metric_cols = []
-    have_wf_all = True
+    failed = []
     for phy in phys:
         print(f"\n--- Reading units from {phy} ---")
         try:
-            units, q_cols, t_cols, have_wf = _collect_units(
-                phy, n_jobs=n_jobs, skip_waveforms=skip_waveforms)
+            units, q_cols, t_cols = _collect_units(phy, n_jobs=n_jobs)
         except Exception as e:
             print(f"  Failed to read units from {phy}: {e}")
             traceback.print_exc()
+            failed.append(phy)
             continue
-        print(f"  {len(units)} unit(s); waveforms={'yes' if have_wf else 'no'}.")
+        print(f"  {len(units)} unit(s) with waveforms.")
         all_units.extend(units)
         for c in q_cols + t_cols:
             if c not in metric_cols:
                 metric_cols.append(c)
-        have_wf_all = have_wf_all and have_wf
+
+    if failed:
+        # Writing only the folders that worked would silently drop units, so the
+        # whole session is left as it is until every folder extracts.
+        print("\n" + "*" * 70)
+        print(f"ERROR: waveforms could not be extracted for {len(failed)} phy folder(s):")
+        for phy in failed:
+            print(f"  {phy}")
+        print("Nothing was written; the NWB keeps its previous Units table (if any).")
+        print("Check that the phy recording (params.py dat_path -> processed_binary)")
+        print("exists and spikeinterface is installed, then re-run step u.")
+        print("*" * 70)
+        return False
 
     if not all_units:
         print("No units collected; nothing to write.")
-        return
+        return True
 
-    if not have_wf_all:
-        print("\n" + "*" * 70)
-        print("WARNING: no waveform_mean will be attached — the analyzer rebuild failed")
-        print("(missing phy recording.dat, or spikeinterface not available). Waveform")
-        print("metrics + cell_type will also be missing. Check the phy_export recording.")
-        print("*" * 70)
-
-    _write_units(nwb_path, all_units, metric_cols, have_wf_all)
+    _write_units(nwb_path, all_units, metric_cols)
+    return True
 
 
-def _write_units(nwb_path, all_units, metric_cols, have_wf):
-    """Append the Units table to an existing NWB file (in-place, mode='r+')."""
+def _drop_units(nwb_path):
+    """Remove an existing Units table so it can be rewritten (pynwb cannot
+    replace one in place). Nothing else in the NWB references it. HDF5 does not
+    give the freed space back (h5repack does). Returns True if one was removed."""
+    import h5py
+    with h5py.File(str(nwb_path), "r+") as f:
+        if "units" in f:
+            del f["units"]
+            return True
+    return False
+
+
+def _write_units(nwb_path, all_units, metric_cols):
+    """Write the Units table into an existing NWB file (in-place, mode='r+'),
+    replacing the one a previous run wrote."""
+    if _drop_units(nwb_path):
+        print("Replacing the existing Units table.")
     io = NWBHDF5IO(str(nwb_path), mode="r+")
     try:
         nwbfile = io.read()
-        if nwbfile.units is not None and len(nwbfile.units.id) > 0:
-            print("NWB already has a Units table — skipping to avoid duplication. "
-                  "(Delete/regenerate the NWB via step w to rebuild.)")
-            return
 
         nwbfile.add_unit_column(name="phy_cluster_id",
                                 description="Original phy cluster id of this unit.")
@@ -367,13 +394,12 @@ def _write_units(nwb_path, all_units, metric_cols, have_wf):
                 kwargs[col] = rec["_metrics"].get(col, np.nan)
             for col in extra_cols:
                 kwargs[col] = rec[col]
-            if have_wf:
-                kwargs["waveform_mean"] = rec["waveform_mean"]
+            kwargs["waveform_mean"] = rec["waveform_mean"]
             nwbfile.add_unit(**kwargs)
 
         io.write(nwbfile)
         print(f"\n[units] Wrote {len(all_units)} unit(s) to {nwb_path} "
-              f"({len(metric_cols)} metric column(s), waveforms={'yes' if have_wf else 'no'}).")
+              f"({len(metric_cols)} metric column(s), with waveform_mean).")
     finally:
         io.close()
 
@@ -386,15 +412,14 @@ if __name__ == "__main__":
     parser.add_argument("--config", required=False, default=None,
                         help="Accepted for runner consistency (unused).")
     parser.add_argument("--n_jobs", type=int, default=4,
-                        help="Parallel jobs for the template-rebuild fallback.")
-    parser.add_argument("--skip-waveforms", action="store_true",
-                        help="Write units without waveform_mean (no analyzer rebuild).")
+                        help="Parallel jobs for the waveform extraction.")
     args = parser.parse_args()
 
     try:
-        add_units_to_nwb(args.output_folder, n_jobs=args.n_jobs,
-                         skip_waveforms=args.skip_waveforms)
+        ok = add_units_to_nwb(args.output_folder, n_jobs=args.n_jobs)
     except Exception as e:
         print(f"[units] Failed: {e}")
         traceback.print_exc()
+        sys.exit(1)
+    if not ok:
         sys.exit(1)

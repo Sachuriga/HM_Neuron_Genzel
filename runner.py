@@ -56,7 +56,7 @@ MENU = [
     ("e", "Trodes Export LFP + Analog (per channel)"),
     ("2", "Sync Script"),
     ("3", "Stitching"),
-    ("4", "Tracker"),
+    ("4", "Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)"),
     ("5", "Plotting"),
     ("6", "Compression (always runs LAST, over all op folders)"),
     ("7", "Sorting"),
@@ -65,10 +65,8 @@ MENU = [
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
-    ("f", "Fix .txt unix timestamps (repair re-tracked sessions; framewise ts<->seconds mapping)"),
     ("n", "Node Analysis"),
-    ("w", "nwblfp (behaviour/trials — appends to the NWB from step 8)"),
-    ("u", "Add curated Units (metrics + waveforms) to NWB (runs after w)"),
+    ("u", "Add curated Units (metrics + waveforms) to NWB (runs after 4)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
     ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
     ("m", "Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)"),
@@ -77,7 +75,11 @@ MENU = [
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "f", "w", "u", "v", "b", "m", "t"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "u", "v", "b", "m", "t"]
+
+# Retired keys, still accepted so saved presets / HM_STEPS strings keep working:
+# both now run inside step 4. Typed alone, they refresh the NWB of every op target.
+RETIRED_STEPS = {"f": "fix .txt timestamps", "w": "NWB behaviour/trials"}
 
 
 # ------------------------------------------------------------
@@ -307,7 +309,7 @@ def session_pfx(folder):
 # ------------------------------------------------------------
 def run_worker(ip, op, steps, out):
     """Run the per-folder parallel steps for one ip/op pair, logging to `out`.
-    Sequential steps (7 c r 9 w u) are handled at master level, not here."""
+    Sequential steps (7 c r 9 u ...) are handled at master level, not here."""
     ip, op = Path(ip), Path(op)
     op.mkdir(parents=True, exist_ok=True)
     log(out, f"[INFO] Running steps [{steps}] for {ip}")
@@ -386,7 +388,9 @@ def run_worker(ip, op, steps, out):
 
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
-        # Per-sample data goes into the session NWB. KEEP_NPY=1 in
+        # Per-sample data goes into the session NWB. The LFP is built for ALL
+        # channels from step 1's raw export (*.raw/*_group0.dat); without it, it
+        # falls back to step e's exportLFP (one channel per nTrode). KEEP_NPY=1 in
         # hm_tracker_paths.txt also writes the old LFP_Output/*.npy alongside it.
         keep_npy = ["--keep-npy"] if _flag_env("KEEP_NPY", "HM_KEEP_NPY") else []
         lfp_rate = _str_env("LFP_OUTPUT_RATE", default="1500")
@@ -439,7 +443,32 @@ def run_worker(ip, op, steps, out):
         run([PYTHON, "-u", "./src/node_analysis/hex_maze_analysis.py",
              "--input_folder", ip, "--output_folder", op], out=out)
 
+    # --- STEP 4 (end): fix .txt timestamps + write/refresh the session NWB ---
+    #  Last in the worker so the NWB picks up DLC keypoints (step d) and joins
+    #  the LFP/EMG/motion step 8 just wrote, whichever of the two ran first.
+    if "4" in steps:
+        refresh_session_nwb(op, out)
+
     log(out, f"[COMPLETE] Worker finished for {ip}")
+
+
+def refresh_session_nwb(op, out=None):
+    """Former steps f + w for one op folder: convert any unix timestamps in the
+    tracker .txt to session seconds, then write the behaviour/trials into the
+    session NWB (created if absent; a re-track REPLACES the old behaviour, while
+    step 8's LFP, sleep scorings and step u's units are kept)."""
+    op = Path(op).resolve()
+    log_ = (lambda m: log(out, m)) if out else print
+    if Path("./src/tracker/fix_txt_timestamps.py").exists():
+        log_("[STEP 4] Fixing .txt timestamps (unix -> session seconds)...")
+        run([PYTHON, "-u", "./src/tracker/fix_txt_timestamps.py",
+             "--output_folder", op], out=out)
+    if Path("./src/nwb/create_nwb.py").exists():
+        rat_nr = os.environ.get("NWB_RAT_NR", "1")
+        log_(f"[STEP 4] Writing behaviour/trials into the session NWB (rat_nr={rat_nr})...")
+        run([PYTHON, "-u", "create_nwb.py", "--rat_nr", rat_nr, "--noroot",
+             "--ip", op.parent, "--op", op.parent, "--session_folder", op.name],
+            cwd=str(SCRIPT_DIR / "src" / "nwb"), out=out)
 
 
 def clean_folder(target):
@@ -624,7 +653,8 @@ def main():
     has = {k: (k in selection) for k in SEQUENTIAL_STEPS}
     do_compress = "6" in selection
     parallel_steps = "".join(c for c in selection
-                             if c not in SEQUENTIAL_STEPS and c != "6")
+                             if c not in SEQUENTIAL_STEPS and c != "6"
+                             and c not in RETIRED_STEPS)
     parallel_trim = "".join(parallel_steps.split())
 
     # Step [s] (cross-session summary) moved to the HM_Rat_Analysis repo. Without
@@ -721,21 +751,16 @@ def main():
             clean_folder(ip)
         print(f"\n[MASTER] Cleaning complete for all {len(ops)} folder(s).")
 
-    if has["f"]:
-        _run_per_op("FIX-TXT-TIMESTAMPS (unix -> seconds)", "FIXTXT",
-                    "./src/tracker/fix_txt_timestamps.py", seq_ops, config)
-
-    if has["w"]:
-        rat_nr = os.environ.get("NWB_RAT_NR", "1")
-        print("\n" + "=" * 56)
-        print(f"[MASTER] Running NWB / LFP packaging (rat_nr={rat_nr})...")
-        print("=" * 56)
-        if Path("./src/nwb/create_nwb.py").exists():
-            rc = run([PYTHON, "-u", "create_nwb.py", "--rat_nr", rat_nr,
-                      "--noroot", "--ip", root, "--op", root], cwd="./src/nwb")
-            print("[NWB] Done." if rc == 0 else "[NWB] Python exited with error.")
-        else:
-            print(f"[NWB] create_nwb.py NOT found at: {SCRIPT_DIR / 'src/nwb/create_nwb.py'}")
+    # Retired f / w: step 4 does both now. Without step 4 in the selection, run
+    # them here over every op target so old presets (e.g. "rwu") still refresh.
+    retired = [k for k in RETIRED_STEPS if k in selection]
+    if retired:
+        print(f"\n[STEPS] Step(s) {', '.join(retired)} are now part of step 4 "
+              f"({'; '.join(RETIRED_STEPS[k] for k in retired)}).")
+        if "4" not in selection:
+            for i, (_ip, op) in enumerate(seq_ops, 1):
+                print(f"\n[NWB {i}/{len(seq_ops)}] Refreshing: {op}")
+                refresh_session_nwb(op)
 
     if has["u"]:
         _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", seq_ops, config)

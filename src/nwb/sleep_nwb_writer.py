@@ -1,13 +1,16 @@
 """Writing the session NWB that the sleep scorer reads. The tracker's half.
 
 ONE FILE PER SESSION: ``<op>/<Rat>_<YYYYMMDD>[_<phase>].nwb``. **Step 8**
-creates it here and writes the per-sample data; **step w** (behaviour) and
+creates it here and writes the per-sample data; **step 4** (behaviour) and
 **step u** (units) then append to that same file in ``r+`` mode. Nothing
 rewrites it from scratch, so a scoring stored in it survives the pipeline.
 
 What step 8 writes::
 
-    acquisition/lfp             (n_samples, n_channels) uV, on a rate
+    acquisition/lfp             (n_samples, n_channels) uV, on a rate; every
+                                channel of the probe (128) — column -> nTrode/
+                                channel is session_info's channel_map. Chunked
+                                (50 s x 1 tetrode) and gzip-compressed.
     acquisition/emg_from_lfp    normalised EMG-from-LFP (~5 Hz)
     acquisition/motion          accelerometer movement magnitude
     processing/sleep/
@@ -285,7 +288,7 @@ def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
                      sleep_channels=None, derived=None, metadata=None,
                      lfp_unit="uV"):
     """Add the scorer's inputs to ``nwbfile``. Existing containers are left
-    alone, so this is safe to re-run against a session that step w already
+    alone, so this is safe to re-run against a session that step 4 already
     populated. Returns the list of names actually added.
 
     A signal on a uniform clock should be given a ``*_rate`` rather than an
@@ -300,6 +303,15 @@ def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
     from pynwb import TimeSeries
 
     added = []
+
+    # Trim the LFP to its timebase while it is still an array, then hand it to
+    # HDF5 chunked + compressed (a 128-channel session is several GB).
+    if isinstance(lfp, np.ndarray):
+        if lfp_timestamps is not None:
+            lfp_timestamps = np.asarray(lfp_timestamps).ravel()
+            n = min(lfp.shape[0], lfp_timestamps.shape[0])
+            lfp, lfp_timestamps = lfp[:n], lfp_timestamps[:n]
+        lfp = lfp_dataio(lfp)
 
     def _series(name, data, ts, rate, unit, description):
         ts = None if ts is None else np.asarray(ts).ravel()
@@ -366,6 +378,61 @@ def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
                            description=json.dumps(_jsonable(dict(metadata)))))
         added.append(SESSION_INFO_NAME)
     return added
+
+
+LFP_CHUNK_ROWS = 75_000     # 50 s at 1500 Hz
+LFP_CHUNK_COLS = 4          # one tetrode: a single channel's trace reads 1/32 of the file
+
+
+def lfp_dataio(arr, buffer_gb=0.25):
+    """Wrap an ``(n_samples, n_channels)`` array (a memmap is fine) for writing.
+
+    Streams it into HDF5 block by block, so it never has to be in RAM at once,
+    as gzip-compressed chunks of ``LFP_CHUNK_ROWS`` x one tetrode: the readers
+    (scorer, EMG, theta) pull a few channels over the whole session, and narrow
+    chunks keep that from decompressing the other channels too.
+    """
+    from hdmf.backends.hdf5 import H5DataIO
+    from hdmf.data_utils import GenericDataChunkIterator
+
+    shape = tuple(int(n) for n in arr.shape)
+    chunk = (min(LFP_CHUNK_ROWS, shape[0]),) + tuple(
+        min(LFP_CHUNK_COLS, n) for n in shape[1:])
+
+    class _ArrayChunks(GenericDataChunkIterator):
+        def _get_data(self, selection):
+            return np.asarray(arr[selection], dtype=np.float32)
+
+        def _get_maxshape(self):
+            return shape
+
+        def _get_dtype(self):
+            return np.dtype("float32")
+
+    return H5DataIO(_ArrayChunks(chunk_shape=chunk, buffer_gb=buffer_gb),
+                    compression="gzip", compression_opts=4, shuffle=True)
+
+
+def drop_lfp_outputs(nwb_path):
+    """Remove the LFP and everything computed from its columns, so a re-export
+    can write them again (``add_sleep_inputs`` never overwrites).
+
+    Drops ``acquisition/lfp`` and ``processing/sleep/{session_info, awakeness,
+    emg_rms, theta_delta_ratio}``. Scorings, sleep_channels, EMG, motion,
+    behaviour and units are untouched. HDF5 does not give the freed space back
+    (``h5repack`` does). Returns the names removed.
+    """
+    import h5py
+
+    paths = [f"acquisition/{LFP_NAME}"] + [
+        f"processing/{SLEEP_MODULE}/{n}" for n in (SESSION_INFO_NAME,) + DERIVED_NAMES]
+    removed = []
+    with h5py.File(str(nwb_path), "r+") as f:
+        for p in paths:
+            if p in f:
+                del f[p]
+                removed.append(p.rsplit("/", 1)[-1])
+    return removed
 
 
 def _jsonable(v):

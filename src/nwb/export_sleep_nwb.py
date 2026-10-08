@@ -7,7 +7,7 @@ already in place and does nothing.
 It stays in the pipeline for **legacy sessions** — those exported before the
 NWB became the primary output, which only have the loose ``.npy`` files. For
 those it creates ``<op>/<Rat>_<YYYYMMDD>.nwb`` (the same name ``create_nwb.py``
-derives, so step w and step u later append to this very file) and fills it from
+derives, so step 4 and step u later append to this very file) and fills it from
 the ``.npy`` with everything ``HM_rat_sleep_score`` needs:
 
     acquisition/lfp             from  LFP_Output/*lfp_data.npy + *lfp_timestamps.npy
@@ -19,7 +19,7 @@ The ``.npy`` files stay where they are — this only adds a packaged copy, so
 nothing downstream that still reads them breaks.
 
 Re-running is safe: containers that already exist are left untouched, and an
-NWB that step w/u already populated is appended to rather than replaced, so a
+NWB that step 4/u already populated is appended to rather than replaced, so a
 scoring stored in it is never lost.
 
 Usage:
@@ -39,8 +39,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sleep_nwb_writer as snwb                                    # noqa: E402
-
-LFP_ROWS_PER_CHUNK = 250_000        # ~1 s of writing per chunk at 1500 Hz x 64 ch
 
 
 def find_output(folder, suffix):
@@ -86,24 +84,6 @@ def _load(path, mmap=False):
     except Exception as exc:
         print(f"  [warn] could not read {Path(path).name}: {exc}")
         return None
-
-
-def _lfp_chunks(arr, buffer_gb=0.25):
-    """Stream a big ``(n_samples, n_channels)`` memmap into HDF5 block by block,
-    so a multi-GB LFP never has to sit in RAM at once."""
-    from hdmf.data_utils import GenericDataChunkIterator
-
-    class _ArrayChunks(GenericDataChunkIterator):
-        def _get_data(self, selection):
-            return np.asarray(arr[selection], dtype=np.float32)
-
-        def _get_maxshape(self):
-            return tuple(int(n) for n in arr.shape)
-
-        def _get_dtype(self):
-            return np.dtype("float32")
-
-    return _ArrayChunks(buffer_gb=buffer_gb)
 
 
 def collect_inputs(lfp_dir):
@@ -178,8 +158,8 @@ def run(output_folder, rat_nr=None):
     print(f"[sleep-nwb] Session: {prefix.rstrip('_')}")
     print(f"[sleep-nwb] Target:  {nwb_path}")
 
-    # Reconcile LFP length against its timebase HERE: once wrapped in a chunk
-    # iterator the array is opaque and can no longer be trimmed downstream.
+    # Reconcile LFP length against its timebase (add_sleep_inputs then streams
+    # the memmap into the file chunked + compressed).
     lfp = data.pop("lfp")
     ts = data["lfp_timestamps"]
     if ts is not None:
@@ -190,12 +170,11 @@ def run(output_folder, rat_nr=None):
                   f"truncating both to {n}")
             lfp, ts = lfp[:n], ts[:n]
         data["lfp_timestamps"] = ts
-    big = lfp.shape[0] > LFP_ROWS_PER_CHUNK
-    data["lfp"] = _lfp_chunks(lfp) if big else np.asarray(lfp, dtype=np.float32)
+    data["lfp"] = lfp
 
     if Path(nwb_path).is_file():
         # append into the existing session file — never rewrite it, so anything
-        # step w/u already added (and any scoring) survives
+        # step 4/u already added (and any scoring) survives
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()

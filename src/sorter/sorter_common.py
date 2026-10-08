@@ -12,7 +12,7 @@ Contents:
 """
 
 import shutil
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 import spikeinterface.full as si
@@ -338,15 +338,34 @@ def _load_curated_sorting_from_phy(phy_folder):
     raise RuntimeError("NumpySorting has no from_samples_and_labels/from_times_labels factory.")
 
 
+def _resolve_phy_dat(phy, dat_path):
+    """The recording file params.py's dat_path names, found even after the op
+    folder was moved or copied to another machine. dat_path is absolute (the
+    sorting PC's processed_binary, possibly a Windows path) or a bare
+    'recording.dat'; when it no longer exists, look for the same file name in
+    the phy folder and in the sibling processed_binary/."""
+    if isinstance(dat_path, (list, tuple)):
+        dat_path = dat_path[0]
+    raw = str(dat_path)
+    name = PureWindowsPath(raw).name if "\\" in raw else Path(raw).name
+    direct = Path(raw)
+    cands = [direct] if direct.is_absolute() else []
+    cands += [phy / name, phy.parent / "processed_binary" / name]
+    for c in cands:
+        if c.exists():
+            return c
+    raise FileNotFoundError(
+        f"phy recording '{name}' not found (params.py dat_path = {raw!r}; also looked "
+        f"in {phy} and {phy.parent / 'processed_binary'})")
+
+
 def _load_recording_from_phy(phy_folder):
     """Rebuild the (preprocessed) recording from phy's recording.dat + params.py,
     attaching the probe geometry from channel_positions.npy."""
     phy = Path(phy_folder)
     p = _read_phy_params(phy)
 
-    dat = Path(str(p["dat_path"]))
-    if not dat.is_absolute() or not dat.exists():
-        dat = phy / dat.name  # params.dat_path is usually just 'recording.dat'
+    dat = _resolve_phy_dat(phy, p["dat_path"])
 
     rec = si.read_binary(
         file_paths=[str(dat)],

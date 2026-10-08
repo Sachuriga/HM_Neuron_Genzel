@@ -39,17 +39,16 @@ PRESETS = {
     "Tracker non-implanted (Video process, no ephys)": "23456d",
     "Retrack": "3456d",
     "LED Sync + stitch + track": "234", 
-    "After manual curation (Maze)": "wuvbm",
+    "After manual curation": "uvbm",
     "— Sleep —": "",
     "Prepare sleep scoring and spike sorting": "1e78",
-    "Prepare sleep scoring only": "e8",
-    "Prepare spike sorting only": "1e7", 
-    "After manual curation (Sleep)": "wu",
+    "Prepare sleep scoring": "e8",
+    "Prepare spike sorting": "17", 
     "— Other —": "",
-    "NWB packaging (nwb + units + visualise)": "wuv",
+    "NWB units + visualise": "uv",
     "Analysis (decode / UMAP)": "nbm",
     "Spike sorting (+ continue)": "7c",
-    "Full pipeline": "1e234567c89wuvnbmt",
+    "Full pipeline": "1e234567c89uvnbmt",
 }
 
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")

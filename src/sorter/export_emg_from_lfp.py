@@ -213,6 +213,33 @@ def _hw_to_lfp_columns(lfp_dir, hw_channels):
     return [hw_of_col[c] for c in hw_channels if c in hw_of_col]
 
 
+def _one_column_per_tetrode(lfp_dir, n_cols):
+    """The lowest-numbered channel of each nTrode, as LFP column indices.
+
+    Channels of one tetrode sit within ~50 um of each other and carry nearly the
+    same signal, so feeding all four to the cross-channel correlation would
+    inflate it with near-duplicate pairs. An LFP that already holds one channel
+    per nTrode (the exportLFP layout) comes back whole.
+    """
+    cmap = _session_info(lfp_dir).get("channel_map")
+    if not cmap:
+        cmap_file = find_output(lfp_dir, "channel_map.npy")
+        cmap = np.load(cmap_file, allow_pickle=True) if cmap_file else None
+    if cmap is None or len(cmap) != n_cols:
+        # no map: assume the 4-per-tetrode hardware order when it fits
+        if n_cols >= 2 * CH_PER_TETRODE and n_cols % CH_PER_TETRODE == 0:
+            return list(range(0, n_cols, CH_PER_TETRODE))
+        return list(range(n_cols))
+    first = {}
+    for entry in cmap:
+        nt, ch = entry.get("ntrode"), entry.get("channel")
+        if nt is None or ch is None:
+            continue
+        if nt not in first or ch < first[nt][0]:
+            first[nt] = (ch, int(entry["index"]))
+    return sorted(c for _ch, c in first.values()) or list(range(n_cols))
+
+
 SNR_FRAC = 0.3          # exclude LFP cols with SNR < SNR_FRAC * median SNR
 MIN_KEEP = 8            # never drop the EMG correlation below this many channels
 
@@ -277,8 +304,8 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
 
     Channel selection:
       * ``channels`` (hardware ids) given and mappable -> use those LFP columns.
-      * otherwise -> all LFP columns (the export is one-per-tetrode, i.e. already
-        spread across the probe — ideal for the cross-channel correlation).
+      * otherwise -> one column per tetrode (spread across the probe — ideal for
+        the cross-channel correlation; see :func:`_one_column_per_tetrode`).
     With ``exclude_bad`` (default), SNR-outlier and config bad/EEG columns are
     then dropped (see :func:`_bad_lfp_columns`), since a noisy or reference
     channel dilutes every pairwise correlation.
@@ -302,8 +329,8 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
                 print("   (requested EEG channels not all in the LFP export; "
                       "using all LFP channels instead)")
         if cols is None:
-            cols = list(range(data.shape[1]))
-            origin = f"all {data.shape[1]} LFP channels (one per tetrode)"
+            cols = _one_column_per_tetrode(lfp_dir, data.shape[1])
+            origin = f"{len(cols)} LFP channels (one per tetrode)"
 
         if exclude_bad:
             bad = _bad_lfp_columns(lfp_dir, data.shape[1], snr_frac=snr_frac,
