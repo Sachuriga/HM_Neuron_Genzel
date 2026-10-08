@@ -14,7 +14,7 @@ The GenzelTracker app is a multi-functional tool that can be used for:
 The GenzelTracker app needs a specific folder structure to function properly. 
 
 The sleep data should generally be handled in: ...\Desktop\data\sleep  
-The maze data should generally be handled in: ...\Desktop\data\ephys  
+The maze data should generally be handled in: ...\Desktop\data\maze  
 
 In this folder, input and output folders should be created. Name them as "ip1" (input) and "op1" (output).  
 Pre-sleep and post-sleep recordings should be allocated to seperate input folders.  
@@ -98,8 +98,8 @@ RecordingMeta.xlsx
 yyyymmdd_rat*.mp4 (Example: 20260717_Rat5.mp4)
 yyyymmdd_rat*_analysis_final.pdf
 
-If there is a discrepancy in the trial counts between these files, you will need to troubleshoot.
-If the error can be attributed to a mistake in the RecordingMeta.xlsx file, please change it in the ip folder and then run the "Retrack" GenzelTracker preset.
+If there is a discrepancy in the trial counts between these files, you will need to troubleshoot.  
+If the error can be attributed to a mistake in the RecordingMeta.xlsx file, please change it in the ip folder (not op) and then run the "Retrack" GenzelTracker preset.
 
 
 ## 5. Finishing the data, preparing for storage
