@@ -243,7 +243,7 @@ def add_timeseries(ts_name):
 def create_behavior_module():
     """The session's behaviour module, reused when the NWB already has one.
 
-    Step 8 creates the session NWB and step w appends into it, so on a re-run
+    Step 8 creates the session NWB and step 4 appends into it, so on a re-run
     the module can already be there — creating it a second time would raise.
     """
     existing = nwbfile.processing.get(behavior_name)
@@ -265,6 +265,21 @@ def behavior_add(module, obj):
         return False
     module.add(obj)
     return True
+
+# removes behaviour containers from an existing NWB so a re-track (step 4) writes
+# fresh ones instead of behavior_add keeping the stale copies. Only the names
+# given are dropped — LFP/EMG/motion (step 8), sleep scorings and units (step u)
+# are untouched. HDF5 does not give the freed space back (h5repack does).
+def drop_behavior_outputs(nwb_path, module_name, names):
+    import h5py
+    removed = []
+    with h5py.File(str(nwb_path), "r+") as f:
+        for n in names:
+            p = f"processing/{module_name}/{n}"
+            if p in f:
+                del f[p]
+                removed.append(n)
+    return removed
 
 # splits the labels of positional data in loaded dataframe
 # e.g. "Rat_X" -> X
@@ -870,6 +885,17 @@ if __name__ == "__main__":
         # rewritten — a rewrite would throw that work away.
         nwb_io = None
         if Path(output_path).is_file():
+            # Replace (not keep) the behaviour this run is about to write, so a
+            # re-tracked session's NWB gets the new position/trials. A container
+            # whose source is missing this run (no DLC columns, no .txt) is kept.
+            replace = [position_name, "Metrics"]
+            if split_dlc_labels(df):
+                replace.append(dlc_position_name)
+            if df_txt is not None:
+                replace.append(table_name)
+            dropped = drop_behavior_outputs(output_path, behavior_name, replace)
+            if dropped:
+                print(f"Replacing existing behaviour in the NWB: {', '.join(dropped)}")
             nwb_io = NWBHDF5IO(output_path, mode="r+")
             nwbfile = nwb_io.read()
             print(f"Appending to the existing nwb file {output_path}.")

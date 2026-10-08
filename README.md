@@ -178,7 +178,7 @@ SYNC_LED=auto            # auto | red | blue
 DLC_CONFIG_PATH=         # path to the trained project's config.yaml; blank = export-only
 DLC_SHUFFLE=2
 
-# NWB (step w)
+# NWB (written at the end of step 4)
 NWB_RAT_NR=1             # fallback only — RecordingMeta.xlsx Rat_ID wins
 
 # spike sorting (step 7) — global
@@ -231,14 +231,14 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 |---|---|
 | Tracker implanted | `1e2345678d` |
 | Tracker non-implanted | `23456d` |
-| After manual curation | `wuvbm` |
+| After manual curation | `uvbm` |
 | Retrack | `346d` |
-| Full pipeline | `1e234567c89wuvnbmt` |
+| Full pipeline | `1e234567c89uvnbmt` |
 | Trodes export (DIO/raw/analog + LFP) | `1e` |
 | Sync + stitch + track | `234` |
 | Spike sorting (+ continue) | `7c` |
 | LFP + motion + EMG (sleep) | `e8` |
-| NWB packaging (nwb + units + visualise) | `wuv` |
+| NWB units + visualise | `uv` |
 | Analysis (decode / UMAP) | `nbm` |
 | Drive scan (QC) | `t` |
 
@@ -246,7 +246,7 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 
 ```bash
 python runner.py /path/to/data_root          # interactive step prompt
-HM_STEPS=wuvbm python runner.py /path/to/data_root   # non-interactive
+HM_STEPS=uvbm python runner.py /path/to/data_root   # non-interactive
 scripts/runner_unix.sh /path/to/data_root    # thin wrappers (PYTHON env picks the interpreter)
 scripts\runner_windows.bat "C:\path\to\data_root"
 ```
@@ -258,7 +258,7 @@ The interactive menu:
 [e] Trodes Export LFP + Analog (per channel)
 [2] Sync Script
 [3] Stitching
-[4] Tracker
+[4] Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)
 [5] Plotting
 [6] Compression (always runs LAST, over all op folders)
 [7] Sorting
@@ -267,10 +267,8 @@ The interactive menu:
 [8] LFP + Motion (IMU Accel) + EMG-from-LFP
 [d] deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)
 [9] Cleaning
-[f] Fix .txt unix timestamps (repair re-tracked sessions; framewise ts<->seconds mapping)
 [n] Node Analysis
-[w] nwblfp (NWB / LFP package)
-[u] Add curated Units (metrics + waveforms) to NWB (runs after w)
+[u] Add curated Units (metrics + waveforms) to NWB (runs after 4)
 [v] Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)
 [b] Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)
 [m] Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)
@@ -327,7 +325,7 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `TRODES_EXPORT_CMD` / `TRODES_EXPORT_LFP` | — | steps 1/e binaries |
 | `DLC_CONFIG_PATH` | — (inference skipped) | step d part 2 |
 | `DLC_SHUFFLE` | 2 | step d part 2 |
-| `NWB_RAT_NR` | 1 | step w fallback rat number |
+| `NWB_RAT_NR` | 1 | step 4 NWB fallback rat number |
 | `DECODE_FOLDS` | 1 | step b: visualisation-track folds |
 | `DECODE_CV_FOLDS` | 5 | step b: held-out accuracy folds |
 | `DECODE_LEADS` | `0 1 3` | step b: prediction leads (`""` disables multi-lead mode) |
@@ -419,6 +417,8 @@ Runs the full detect → classify → trial-state-machine loop on the stitched v
 | `<date>_Rat<N>_framewise_seconds.csv` / `..._framewise_ts.csv` | Both sync CSVs, session-prefixed at the end of the run |
 
 > Not headless: a live cv2 preview window opens; pressing `q` aborts the run.
+
+**At the end of the worker** (after 5/8/d/n, so DLC keypoints and step 8's LFP are already there), step 4 also runs the former steps **f** and **w** for that op folder: [fix the .txt timestamps](#step-4-end--fix-txt-unix-timestamps-former-step-f) and [write/refresh the session NWB](#step-4-end--nwb-packaging-former-step-w). The keys `f` and `w` are retired; a saved preset or `HM_STEPS` string containing them still works (without `4` in the selection it refreshes the NWB of every op target).
 
 ### Step 5 — Trial Plotting
 
@@ -522,11 +522,11 @@ Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`*
 
 Inline in `runner.py` (`clean_folder`): deletes top-level directories in each **ip** folder matching `*.DIO`, `*.raw`, `*timestampoffset*`. The `.rec` files are never touched. Irreversible; errors silently ignored — run only after steps 2/7 are verified.
 
-### Step f — Fix .txt Unix Timestamps
+### Step 4 (end) — Fix .txt Unix Timestamps (former step f)
 
 **Script:** `src/tracker/fix_txt_timestamps.py --output_folder <op> [--dry_run]`
 
-Remediation for sessions re-tracked before the sync-CSV rename fix: their `<date>_Rat<N>.txt` carries unix timestamps (~1.7e9 s) instead of session seconds. The two sync CSVs are frame-aligned, so unix → seconds is an exact per-frame mapping: the step builds it from `*framewise_ts.csv` ↔ `*framewise_seconds.csv` and rewrites the `.txt` in place (original kept once as `<name>.txt.unixbak`). Only numeric values > 1e6 in the two timestamp positions (`Trial End (Sync Seconds):` and each transition's `(t_start, t_end)`) are converted — healthy files are left byte-identical, so the step is idempotent; `N/A` and durations are untouched. Re-run `w → u` afterwards if the session's NWB `Trials_Data` should pick up the corrected values.
+Remediation for sessions re-tracked before the sync-CSV rename fix: their `<date>_Rat<N>.txt` carries unix timestamps (~1.7e9 s) instead of session seconds. The two sync CSVs are frame-aligned, so unix → seconds is an exact per-frame mapping: the step builds it from `*framewise_ts.csv` ↔ `*framewise_seconds.csv` and rewrites the `.txt` in place (original kept once as `<name>.txt.unixbak`). Only numeric values > 1e6 in the two timestamp positions (`Trial End (Sync Seconds):` and each transition's `(t_start, t_end)`) are converted — healthy files are left byte-identical, so the step is idempotent; `N/A` and durations are untouched. A CSV pair is only used if `unix − seconds` is one constant offset (the sync step writes them that way); a pair from two different sync runs is refused and the `.txt` left untouched. Same-prefix pairs are tried first. It runs right before the NWB is written, so `Trials_Data` always gets the corrected values.
 
 ### Step n — Node Analysis
 
@@ -534,15 +534,15 @@ Remediation for sessions re-tracked before the sync-CSV rename fix: their `<date
 
 Processes every `.xlsx` in ip (sheet `raw`, else the first sheet) and writes a formatting-preserving copy `<name>_results.xlsx` with behavioural metrics computed from trial node sequences. See [Node Analysis — Computed Metrics](#node-analysis--computed-metrics). Rows with unusable paths are flagged and highlighted red.
 
-### Step w — NWB Packaging
+### Step 4 (end) — NWB Packaging (former step w)
 
-**Script:** `src/nwb/create_nwb.py` — runs **once over the whole root** at master level:
+**Script:** `src/nwb/create_nwb.py` — runs **per op folder** in the step-4 worker:
 
 ```bash
-python create_nwb.py --rat_nr $NWB_RAT_NR --noroot --ip <ROOT> --op <ROOT>
+python create_nwb.py --rat_nr $NWB_RAT_NR --noroot --ip <op parent> --op <op parent> --session_folder <op name>
 ```
 
-Discovers session folders (`op*` or `YYYYMMDD`-named) and packages each into `<op>/Rat<N>_<YYYYMMDD>.nwb` (atomic write via `.tmp.nwb`). **Requires `*Coordinates_Full_with_frames.csv`** per session (skipped otherwise). Contents:
+Writes `<op>/Rat<N>_<YYYYMMDD>.nwb` (atomic write via `.tmp.nwb`) or, when step 8 already created the session NWB, appends to it. **On a re-run (e.g. Retrack) the behaviour is replaced**: `Position`, `Metrics`, and — when this run has a source for them — `DLC_Position` and `Trials_Data` are dropped and rewritten; LFP/EMG/motion, sleep scorings and Units are never touched. **Requires `*Coordinates_Full_with_frames.csv`** per session (skipped otherwise). Contents:
 
 - `session_start_time` — tz-aware (Europe/Amsterdam), anchored so that clock-zero round-trips with the unix `Timestamp` column; scalars (`Rat_ID, Date, Repeat, Day, Session, Goal_Node`) from `RecordingMeta.xlsx` row 0 (authoritative — `--rat_nr` is only a fallback).
 - `acquisition/lfp` — `TimeSeries` (µV) from `LFP_Output`'s `lfp_data.npy`/`lfp_timestamps.npy` if present.
@@ -560,7 +560,7 @@ Appends the curated Phy units into the session NWB (in place). Templates are **a
 
 **Cell-type rule** (`src/nwb/spike_metrics.py`, CellExplorer + FR gate): *interneuron* if FR > 10 Hz, OR trough-to-peak ≤ 0.425 ms (narrow), OR (trough-to-peak > 0.425 ms AND ACG τ_rise > 6 ms, wide); else *pyramidal*.
 
-> Step u **skips** an NWB that already has Units. Regeneration recipe after manual curation: **r → w → u** (`HM_STEPS=rwu python runner.py <root>`).
+> Step u **skips** an NWB that already has Units. The NWB is never regenerated from scratch any more (step 4 only replaces the behaviour, step 8 only the LFP), so to rebuild units after re-curation the existing Units table must be removed first, then run **r → u**.
 
 ### Step v — Visualize NWB Units
 
@@ -883,7 +883,7 @@ Quick pointers:
 - **Sync fails / wrong LED** — `SYNC_DEBUG=1` and inspect `sync_debug/`; pin the LED with `led_crop_override.txt` / `led_ica_override.txt`; adjust `SYNC_START_SEC`.
 - **Compression/stitching falls back to CPU** — check `python src/tools/gpuslot.py` and `python src/tools/vcodec.py 2352 1424`; force `FFMPEG_VCODEC=libx264` to rule the GPU out.
 - **Phy can't show raw traces** — `processed_binary/` was deleted; re-run step 7 (this wipes curation) or restore it.
-- **Step u "already has Units"** — by design; regenerate with `r → w → u`.
+- **Step u "already has Units"** — by design; remove the Units table from the NWB, then run `r → u`.
 - **Theta/phase pages missing in step v** — no `LFP_Output` for that session, or an unalignable multi-session LFP export (the log says which).
 - **macOS `._*` AppleDouble files on SMB shares** — harmless; every consumer in the pipeline skips them.
 

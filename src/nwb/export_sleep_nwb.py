@@ -7,7 +7,7 @@ already in place and does nothing.
 It stays in the pipeline for **legacy sessions** — those exported before the
 NWB became the primary output, which only have the loose ``.npy`` files. For
 those it creates ``<op>/<Rat>_<YYYYMMDD>.nwb`` (the same name ``create_nwb.py``
-derives, so step w and step u later append to this very file) and fills it from
+derives, so step 4 and step u later append to this very file) and fills it from
 the ``.npy`` with everything ``HM_rat_sleep_score`` needs:
 
     acquisition/lfp             from  LFP_Output/*lfp_data.npy + *lfp_timestamps.npy
@@ -19,7 +19,7 @@ The ``.npy`` files stay where they are — this only adds a packaged copy, so
 nothing downstream that still reads them breaks.
 
 Re-running is safe: containers that already exist are left untouched, and an
-NWB that step w/u already populated is appended to rather than replaced, so a
+NWB that step 4/u already populated is appended to rather than replaced, so a
 scoring stored in it is never lost.
 
 Usage:
@@ -174,7 +174,7 @@ def run(output_folder, rat_nr=None):
 
     if Path(nwb_path).is_file():
         # append into the existing session file — never rewrite it, so anything
-        # step w/u already added (and any scoring) survives
+        # step 4/u already added (and any scoring) survives
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()

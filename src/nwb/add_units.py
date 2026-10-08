@@ -1,8 +1,8 @@
 """
 Runner step [u]: add the curated spike-sorting Units table to the session NWB.
 
-Runs AFTER step [w] (create_nwb.py). For each op folder it:
-  - finds the NWB written by step w:            <op>/Rat*_*.nwb
+Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each op folder it:
+  - finds the session NWB (step 4 / step 8):    <op>/Rat*_*.nwb
   - finds the curated phy folder(s):            <op>/*_sorting_output/phy_export
   - reads, per curated unit:
       * spike times (seconds)      from spike_times.npy + spike_clusters.npy
@@ -72,7 +72,7 @@ def find_phy_folders(output_folder):
 
 
 def find_nwb_file(output_folder):
-    """The NWB written by step w lives directly in the op folder as Rat*_*.nwb."""
+    """The session NWB (step 4 / step 8) lives directly in the op folder as Rat*_*.nwb."""
     op = Path(output_folder)
     cands = [p for p in sorted(op.glob("*.nwb")) if not p.name.endswith(".tmp.nwb")]
     if cands:
@@ -274,7 +274,7 @@ def add_units_to_nwb(output_folder, n_jobs=4, skip_waveforms=False):
     """Attach the curated Units table(s) for one op folder to its NWB file."""
     nwb_path = find_nwb_file(output_folder)
     if nwb_path is None:
-        print(f"No .nwb file found under '{output_folder}' (run step w first). Skipping.")
+        print(f"No .nwb file found under '{output_folder}' (run step 4 or 8 first). Skipping.")
         return
     phys = find_phy_folders(output_folder)
     if not phys:
@@ -324,7 +324,7 @@ def _write_units(nwb_path, all_units, metric_cols, have_wf):
         nwbfile = io.read()
         if nwbfile.units is not None and len(nwbfile.units.id) > 0:
             print("NWB already has a Units table — skipping to avoid duplication. "
-                  "(Delete/regenerate the NWB via step w to rebuild.)")
+                  "(Remove the Units table from the NWB to rebuild.)")
             return
 
         nwbfile.add_unit_column(name="phy_cluster_id",

@@ -1,7 +1,7 @@
 """Writing the session NWB that the sleep scorer reads. The tracker's half.
 
 ONE FILE PER SESSION: ``<op>/<Rat>_<YYYYMMDD>[_<phase>].nwb``. **Step 8**
-creates it here and writes the per-sample data; **step w** (behaviour) and
+creates it here and writes the per-sample data; **step 4** (behaviour) and
 **step u** (units) then append to that same file in ``r+`` mode. Nothing
 rewrites it from scratch, so a scoring stored in it survives the pipeline.
 
@@ -288,7 +288,7 @@ def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
                      sleep_channels=None, derived=None, metadata=None,
                      lfp_unit="uV"):
     """Add the scorer's inputs to ``nwbfile``. Existing containers are left
-    alone, so this is safe to re-run against a session that step w already
+    alone, so this is safe to re-run against a session that step 4 already
     populated. Returns the list of names actually added.
 
     A signal on a uniform clock should be given a ``*_rate`` rather than an

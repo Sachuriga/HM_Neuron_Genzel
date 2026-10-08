@@ -40,7 +40,7 @@ STEP_SIGNATURES = {
     "4": ["*_Coordinates_Full.csv"],         # Tracker
     "5": ["*_analysis_final.pdf"],           # Plotting
     "7": ["*_sorting_output"],               # Spike sorting
-    "8": ["*.nwb", "LFP_Output"],            # LFP + motion/EMG (NWB; .npy only with --keep-npy)
+    "8": ["LFP_Output"],                     # LFP + motion/EMG (.npy only with --keep-npy; NWB: below)
     "d": ["collected_framesDLC_*.h5", "collected_framesDLC_*.csv"],  # DeepLabCut
 }
 # Intermediates cleaned up: done once the step that consumes them is done.
@@ -81,7 +81,32 @@ def _present(folder: Path, pattern: str) -> bool:
     return False
 
 
+def _nwb_has_lfp(folder: Path) -> bool:
+    """Step 8's NWB marker. Step 4 now also creates the session NWB (behaviour),
+    so a bare *.nwb no longer means step 8 ran — it must hold acquisition/lfp."""
+    try:
+        nwbs = [f for f in folder.glob("*.nwb") if not f.name.startswith("._")]
+    except OSError:
+        return False
+    if not nwbs:
+        return False
+    try:
+        import h5py
+    except ImportError:
+        return True                              # cannot look inside: trust the file
+    for f in nwbs:
+        try:
+            with h5py.File(str(f), "r") as h:
+                if "acquisition/lfp" in h:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _step_done(folder: Path, step: str) -> bool:
+    if step == "8" and _nwb_has_lfp(folder):
+        return True
     return any(_present(folder, pat) for pat in STEP_SIGNATURES.get(step, []))
 
 

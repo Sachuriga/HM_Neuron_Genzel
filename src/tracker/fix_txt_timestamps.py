@@ -1,5 +1,6 @@
 """
-Runner step [f]: repair tracker .txt files whose timestamps are unix time.
+Runs at the end of runner step 4 (former step [f]): repair tracker .txt files
+whose timestamps are unix time.
 
 An earlier tracker version renamed only stitched_framewise_ts.csv (the unix
 'Corrected Time Stamp' clock) at the end of a run and then preferred that file
@@ -17,6 +18,11 @@ Durations / lengths / velocities are untouched (the clock change is an offset,
 differences are identical on both clocks). 'N/A' and non-numeric tokens are
 left alone.
 
+The sync step writes seconds = unix - constant for the same frames, so a valid
+CSV pair has one fixed offset; a pair from two different sync runs (one file
+renamed by an older tracker, the other re-synced) does not, and is refused
+rather than used to rewrite the .txt with wrong times.
+
 Usage:
     python fix_txt_timestamps.py --output_folder <op> [--dry_run]
 """
@@ -28,25 +34,24 @@ import numpy as np
 import pandas as pd
 
 UNIX_MIN = 1e6          # anything above this is not a session-seconds value
+OFFSET_TOL = 1e-3       # s; spread of (unix - seconds) allowed for one sync run
 
 _TXT_RE = re.compile(r"^\d{8}_Rat\d+\.txt$")
 _TRIAL_END_RE = re.compile(r"(Trial End \(Sync Seconds\): )(\S+)")
 _TRANSITION_RE = re.compile(r"(\('\d+',\s*'\d+'\)\s+\()([^,]+)(,\s*)([^)]+)(\))")
 
 
-def _pick(op, pat):
-    """First file in op matching pat, skipping macOS AppleDouble sidecars."""
-    return next((p for p in sorted(Path(op).glob(pat))
-                 if not p.name.startswith("._")), None)
+def _csvs(op, pat):
+    """Files in op matching pat, skipping macOS AppleDouble sidecars."""
+    return [p for p in sorted(Path(op).glob(pat)) if not p.name.startswith("._")]
 
 
-def _load_mapping(op):
-    """(unix_array, seconds_array) sorted by unix, from the frame-aligned sync
-    CSVs (*framewise_ts.csv <-> *framewise_seconds.csv). None if unavailable."""
-    ts_p = _pick(op, "*framewise_ts.csv")
-    sec_p = _pick(op, "*framewise_seconds.csv")
-    if ts_p is None or sec_p is None:
-        return None
+def _prefix(p, suffix):
+    return p.name[:-len(suffix)]
+
+
+def _pair_mapping(ts_p, sec_p):
+    """(unix, seconds, offset_spread) for one CSV pair joined by frame index."""
     ts = pd.read_csv(ts_p, index_col=0)
     sec = pd.read_csv(sec_p, index_col=0)
     tcol = next((c for c in ts.columns if "stamp" in c.lower()), ts.columns[0])
@@ -56,9 +61,33 @@ def _load_mapping(op):
         return None
     u = j[tcol].to_numpy(float)
     s = j[scol].to_numpy(float)
+    off = u - s
     order = np.argsort(u)                       # np.interp needs ascending x
-    print(f"  mapping: {ts_p.name} <-> {sec_p.name} ({len(j)} frames)")
-    return u[order], s[order]
+    return u[order], s[order], float(off.max() - off.min())
+
+
+def _load_mapping(op):
+    """(unix_array, seconds_array) sorted by unix, from the frame-aligned sync
+    CSVs (*framewise_ts.csv <-> *framewise_seconds.csv). Pairs with the same
+    prefix (one sync run) are tried first; the first pair whose unix-seconds
+    offset is constant is used. None if no consistent pair exists."""
+    ts_all = _csvs(op, "*framewise_ts.csv")
+    sec_all = _csvs(op, "*framewise_seconds.csv")
+    pairs = sorted(((t, s) for t in ts_all for s in sec_all),
+                   key=lambda ts: _prefix(ts[0], "framewise_ts.csv")
+                   != _prefix(ts[1], "framewise_seconds.csv"))
+    for ts_p, sec_p in pairs:
+        m = _pair_mapping(ts_p, sec_p)
+        if m is None:
+            continue
+        u, s, spread = m
+        if spread > OFFSET_TOL:
+            print(f"  {ts_p.name} <-> {sec_p.name}: unix-seconds offset varies by "
+                  f"{spread:.3f} s — not from the same sync run, not used.")
+            continue
+        print(f"  mapping: {ts_p.name} <-> {sec_p.name} ({len(u)} frames)")
+        return u, s
+    return None
 
 
 def _fix_text(text, unix, secs):
@@ -110,8 +139,8 @@ def run(output_folder, dry_run=False):
         if mapping is None:
             mapping = _load_mapping(op)
             if mapping is None:
-                print(f"  {p.name}: has unix timestamps but no framewise ts+seconds "
-                      f"CSV pair in {op} — cannot convert, skipped.")
+                print(f"  {p.name}: has unix timestamps but no consistent framewise "
+                      f"ts+seconds CSV pair in {op} — cannot convert, skipped.")
                 continue
         new_text, n, oob = _fix_text(text, *mapping)
         if oob:
@@ -128,8 +157,8 @@ def run(output_folder, dry_run=False):
               f"(original kept as {bak.name}).")
         fixed += 1
     if fixed:
-        print(f"Fixed {fixed} file(s). Re-run steps w+u if this session's NWB "
-              f"should pick up the corrected Trials_Data.")
+        print(f"Fixed {fixed} file(s). Step 4 writes the NWB right after this, so "
+              f"its Trials_Data gets the corrected values.")
     return 0
 
 
