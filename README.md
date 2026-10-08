@@ -554,13 +554,13 @@ Writes `<op>/Rat<N>_<YYYYMMDD>.nwb` (atomic write via `.tmp.nwb`) or, when step 
 
 ### Step u — Add Curated Units to NWB
 
-**Script:** `src/nwb/add_units.py --output_folder <op> [--n_jobs 4] [--skip-waveforms]`
+**Script:** `src/nwb/add_units.py --output_folder <op> [--n_jobs 4]`
 
-Appends the curated Phy units into the session NWB (in place). Templates are **always recomputed** from the recording referenced by `phy_export/params.py` (`dat_path` → `processed_binary/`, since the export uses `copy_binary=False`); cached/stale template files are never trusted. Units columns: `spike_times` (seconds, position clock), `waveform_mean`, `phy_cluster_id`, `sorting_group`, **`quality_label`** (manual Phy `cluster_group.tsv` — the human truth), **`auto_quality_label`** (automated), all curated metric CSV columns, plus recomputed `firing_rate_hz`, `trough_to_peak_s`, `peak_half_width_s`, `trough_half_width_s`, `acg_tau_rise_ms`, and **`cell_type`**.
+Writes the curated Phy units into the session NWB (in place). Waveforms are **always extracted**: templates are recomputed from the recording referenced by `phy_export/params.py` (`dat_path` → `processed_binary/`, since the export uses `copy_binary=False`; if that absolute path is stale because the op folder was moved or copied from another PC, the same file is looked up in the sibling `processed_binary/`); cached/stale template files are never trusted. Units columns: `spike_times` (seconds, position clock), `waveform_mean`, `phy_cluster_id`, `sorting_group`, **`quality_label`** (manual Phy `cluster_group.tsv` — the human truth), **`auto_quality_label`** (automated), all curated metric CSV columns, plus recomputed `firing_rate_hz`, `trough_to_peak_s`, `peak_half_width_s`, `trough_half_width_s`, `acg_tau_rise_ms`, and **`cell_type`**.
 
 **Cell-type rule** (`src/nwb/spike_metrics.py`, CellExplorer + FR gate): *interneuron* if FR > 10 Hz, OR trough-to-peak ≤ 0.425 ms (narrow), OR (trough-to-peak > 0.425 ms AND ACG τ_rise > 6 ms, wide); else *pyramidal*.
 
-> Step u **skips** an NWB that already has Units. The NWB is never regenerated from scratch any more (step 4 only replaces the behaviour, step 8 only the LFP), so to rebuild units after re-curation the existing Units table must be removed first, then run **r → u**.
+> Every run of step u **replaces** the NWB's Units table, so after re-curating in Phy just run **r → u**. If the waveforms cannot be extracted for any phy folder of the session (e.g. `processed_binary/` deleted), nothing is written, the previous Units table stays, and the step exits with an error — a Units table without `waveform_mean` is never written.
 
 ### Step v — Visualize NWB Units
 
@@ -883,7 +883,7 @@ Quick pointers:
 - **Sync fails / wrong LED** — `SYNC_DEBUG=1` and inspect `sync_debug/`; pin the LED with `led_crop_override.txt` / `led_ica_override.txt`; adjust `SYNC_START_SEC`.
 - **Compression/stitching falls back to CPU** — check `python src/tools/gpuslot.py` and `python src/tools/vcodec.py 2352 1424`; force `FFMPEG_VCODEC=libx264` to rule the GPU out.
 - **Phy can't show raw traces** — `processed_binary/` was deleted; re-run step 7 (this wipes curation) or restore it.
-- **Step u "already has Units"** — by design; remove the Units table from the NWB, then run `r → u`.
+- **Step u "waveforms could not be extracted"** — the phy recording (`processed_binary/traces_cached_seg0.raw`) is missing; restore it or re-run step 7. The NWB keeps its previous Units table.
 - **Theta/phase pages missing in step v** — no `LFP_Output` for that session, or an unalignable multi-session LFP export (the log says which).
 - **macOS `._*` AppleDouble files on SMB shares** — harmless; every consumer in the pipeline skips them.
 
