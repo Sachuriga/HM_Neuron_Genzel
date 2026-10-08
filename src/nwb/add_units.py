@@ -12,16 +12,24 @@ Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each o
                                    the human good/noise truth) -> quality_label;
                                    quality_check_labels.csv (automated) is also
                                    kept as auto_quality_label for reference
-      * mean waveform template     ALWAYS recomputed here by rebuilding the analyzer
-                                   from the phy recording (reads recording.dat);
-                                   a stale curated_templates.npy is never trusted.
+      * waveforms                  ALWAYS extracted here by rebuilding the analyzer
+                                   from the phy recording (processed_binary): the mean
+                                   template, plus the individual waveforms of up to
+                                   MAX_SPIKE_WAVEFORMS spikes per unit (seeded random
+                                   sample) on the unit's own tetrode. A stale
+                                   curated_templates.npy is never trusted.
   - recomputes, from the fresh templates + spikes, authoritative waveform metrics
     (trough-to-peak, peak/trough half-width), the CellExplorer ACG tau_rise and the
     putative cell_type (see spike_metrics.py) — the NWB template-metric CSVs were
     unreliable.
   - writes an NWB Units table with spike_times, waveform_mean, one column per
     quality/template metric, the recomputed metrics + cell_type, plus quality_label
-    (manual cluster_group.tsv), auto_quality_label, phy_cluster_id, sorting_group.
+    (manual cluster_group.tsv), auto_quality_label, phy_cluster_id, sorting_group,
+    and the per-spike waveforms:
+      waveforms              units['waveforms'][i] -> (n_spikes, 4, n_samples) int16,
+                             same units as the phy recording (ADC counts)
+      waveforms_spike_index  which of the unit's spike_times each row belongs to
+      waveforms_channel_ids  the tetrode channels, in the order of axis 1
 
 Waveforms are ALWAYS extracted and stored. Every run REPLACES an existing Units
 table, so re-curating in Phy and re-running u updates the NWB. If the waveforms
@@ -50,9 +58,11 @@ from pynwb import NWBHDF5IO
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from spike_metrics import waveform_metrics, acg_tau_rise, classify_cell_type  # noqa: E402
 
-# NOTE: the spikeinterface-based phy loaders (used only for the template-rebuild
-# fallback) are imported lazily inside _load_templates, so the fast path (reading
-# curated CSVs + curated_templates.npy) does not require the heavy sorting stack.
+# NOTE: the spikeinterface-based phy loaders are imported lazily inside
+# _extract_waveforms, so importing this module does not need the sorting stack.
+
+MAX_SPIKE_WAVEFORMS = 1000   # individual waveforms stored per unit (random sample)
+WAVEFORM_SEED = 0            # fixed, so a re-run stores the same spikes
 
 
 def _read_phy_params(phy_folder):
@@ -111,20 +121,47 @@ def _read_auto_labels(phy):
     return {}
 
 
-def _load_templates(phy, n_jobs=4):
-    """Return (templates_by_unit, n_samples, n_channels).
+def _tetrode_sparsity(sorting, recording, phy, n_jobs):
+    """ChannelSparsity giving every unit the channels of its own tetrode (the phy
+    channel group of its best channel), or None when the phy folder has no
+    channel_groups.npy (the analyzer then falls back to radius sparsity)."""
+    from spikeinterface.core import ChannelSparsity, estimate_sparsity
+    groups_file = phy / "channel_groups.npy"
+    if not groups_file.exists():
+        return None
+    ch_groups = np.load(groups_file).astype(int).ravel()
+    ch_map = (np.load(phy / "channel_map.npy").astype(int).ravel()
+              if (phy / "channel_map.npy").exists() else np.arange(len(ch_groups)))
+    by_col = np.full(recording.get_num_channels(), -1)
+    by_col[ch_map] = ch_groups                      # dat column -> tetrode
+    best = estimate_sparsity(sorting, recording, method="best_channels", num_channels=1,
+                             n_jobs=n_jobs, chunk_duration="1s", progress_bar=False)
+    mask = np.zeros((len(sorting.unit_ids), recording.get_num_channels()), dtype=bool)
+    for i, u in enumerate(sorting.unit_ids):
+        g = by_col[best.unit_id_to_channel_indices[u][0]]
+        if g < 0:
+            return None
+        mask[i] = by_col == g
+    return ChannelSparsity(mask, sorting.unit_ids, recording.channel_ids)
 
-    ALWAYS rebuilds the analyzer from the phy recording to compute fresh curated
-    rebuild the analyzer from the phy recording and compute templates. Returns
-    ({}, 0, 0) on failure (the caller then refuses to write the session)."""
+
+def _extract_waveforms(phy, n_jobs=4):
+    """Return {unit_id: {...}} with, per unit:
+        template     (n_samples, n_channels) mean waveform, all dat columns (zero
+                     off the unit's tetrode) — stored as waveform_mean
+        spikes       (n_spikes, n_tetrode_channels, n_samples) individual waveforms
+                     of up to MAX_SPIKE_WAVEFORMS random spikes
+        spike_index  index of each of those spikes in the unit's sorted spike train
+        channel_ids  tetrode channel ids, in the order of spikes' axis 1
+
+    ALWAYS rebuilds the analyzer from the phy recording — a cached
+    curated_templates.npy is never trusted (it can be stale from an earlier
+    curation); the fresh templates are saved over it. Returns {} on failure (the
+    caller then refuses to write the session)."""
     tpl_file = phy / "curated_templates.npy"
     ids_file = phy / "curated_template_unit_ids.npy"
-    # ALWAYS recompute the curated templates here (step u), rebuilding the analyzer
-    # from the phy recording — never trust a cached curated_templates.npy, which can
-    # be stale from an earlier curation. The freshly computed templates are saved
-    # (overwriting the cache) and used for waveform_mean + the recomputed metrics.
-    print("  Recomputing curated templates from the phy recording "
-          "(rebuilding analyzer; this reads recording.dat)...")
+    print("  Extracting waveforms from the phy recording (rebuilding analyzer; "
+          "this reads the whole recording)...")
     try:
         import spikeinterface.full as si
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
@@ -136,26 +173,64 @@ def _load_templates(phy, n_jobs=4):
             print(f"  Direct load failed ({e}); falling back to si.read_phy.")
             sorting = si.read_phy(phy, load_all_cluster_properties=True)
         recording = _load_recording_from_phy(phy)
-        analyzer = si.create_sorting_analyzer(sorting, recording, format="memory", sparse=True)
         jk = {"n_jobs": n_jobs, "chunk_duration": "1s", "progress_bar": True}
-        analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, **jk)
+
+        sparsity = _tetrode_sparsity(sorting, recording, phy, n_jobs)
+        if sparsity is None:
+            print("  No phy channel_groups.npy — per-spike waveforms use radius "
+                  "sparsity instead of the unit's tetrode.")
+            analyzer = si.create_sorting_analyzer(sorting, recording, format="memory",
+                                                  sparse=True)
+        else:
+            analyzer = si.create_sorting_analyzer(sorting, recording, format="memory",
+                                                  sparsity=sparsity)
+        analyzer.compute("random_spikes", method="uniform",
+                         max_spikes_per_unit=MAX_SPIKE_WAVEFORMS, seed=WAVEFORM_SEED)
         analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, **jk)
         analyzer.compute("templates", **jk)
         templates = np.asarray(analyzer.get_extension("templates").get_data())
         unit_ids = np.asarray(analyzer.unit_ids)
-        by_unit = {int(u): templates[i] for i, u in enumerate(unit_ids)}
-        # Save the freshly computed templates (overwrite any stale cache).
+
+        # Which spikes the random sample took, in the order the waveforms
+        # extension returns them for each unit (spike-vector order).
+        wf_ext = analyzer.get_extension("waveforms")
+        picked = analyzer.sorting.to_spike_vector()[
+            analyzer.get_extension("random_spikes").get_data()]
+        chan_ids = np.asarray(recording.channel_ids)
+        si_ids_file = phy / "channel_map_si.npy"   # original (pre-phy) channel ids
+        si_ids = np.load(si_ids_file).ravel() if si_ids_file.exists() else None
+
+        by_unit = {}
+        for i, u in enumerate(unit_ids):
+            wf = np.asarray(wf_ext.get_waveforms_one_unit(u, force_dense=False))
+            samples = picked["sample_index"][picked["unit_index"] == i]
+            train = np.asarray(analyzer.sorting.get_unit_spike_train(u))  # sorted
+            cols = analyzer.sparsity.unit_id_to_channel_indices[u] \
+                if analyzer.sparsity is not None else np.arange(len(chan_ids))
+            # (spikes, samples, channels) -> (spikes, channels, samples): pynwb's
+            # waveforms layout. The recording is int16 with unit gain, so the values
+            # are whole numbers and int16 is lossless.
+            spikes = np.transpose(wf, (0, 2, 1))
+            if np.all(spikes == np.round(spikes)):
+                spikes = spikes.astype(np.int16)
+            by_unit[int(u)] = {
+                "template": templates[i],
+                "spikes": spikes,
+                "spike_index": np.searchsorted(train, samples).astype(np.int64),
+                "channel_ids": (si_ids[cols] if si_ids is not None
+                                else chan_ids[cols]).astype(np.int64),
+            }
         try:
             np.save(tpl_file, templates)
             np.save(ids_file, unit_ids)
             np.save(phy / "curated_template_channel_ids.npy", np.asarray(analyzer.channel_ids))
         except Exception:
             pass
-        return by_unit, templates.shape[1], templates.shape[2]
+        return by_unit
     except Exception as e:
-        print(f"  Could not compute templates ({e}).")
+        print(f"  Could not extract waveforms ({e}).")
         traceback.print_exc()
-        return {}, 0, 0
+        return {}
 
 
 def _spike_times_by_unit(phy, unit_ids):
@@ -198,7 +273,7 @@ def _collect_units(phy, n_jobs=4):
         print(f"  WARNING: no cluster_group.tsv in {phy}; quality_label will fall "
               f"back to the automated labels.")
 
-    templates_by_unit, _, _ = _load_templates(phy, n_jobs=n_jobs)
+    templates_by_unit = _extract_waveforms(phy, n_jobs=n_jobs)
     if not templates_by_unit:
         raise RuntimeError(f"no waveforms could be extracted from {phy}")
 
@@ -246,7 +321,11 @@ def _collect_units(phy, n_jobs=4):
             "spike_times": st,
             "_metrics": {},
         }
-        rec["waveform_mean"] = np.asarray(templates_by_unit[u], dtype=np.float64)
+        wf = templates_by_unit[u]
+        rec["waveform_mean"] = np.asarray(wf["template"], dtype=np.float64)
+        rec["waveforms"] = wf["spikes"]
+        rec["waveforms_spike_index"] = wf["spike_index"]
+        rec["waveforms_channel_ids"] = wf["channel_ids"]
 
         # --- recomputed waveform metrics + ACG tau_rise + putative cell type ---
         # (the spikeinterface template-metrics CSVs were unreliable; these are the
@@ -381,6 +460,15 @@ def _write_units(nwb_path, all_units, metric_cols):
             nwbfile.add_unit_column(name=col, description=f"Curated metric '{col}'.")
         for col, desc in extra_cols.items():
             nwbfile.add_unit_column(name=col, description=desc)
+        nwbfile.add_unit_column(
+            name="waveforms_spike_index", index=True,
+            description="For each row of this unit's `waveforms`, the index of that spike "
+                        "in the unit's spike_times (a seeded random sample of up to "
+                        f"{MAX_SPIKE_WAVEFORMS} spikes per unit).")
+        nwbfile.add_unit_column(
+            name="waveforms_channel_ids", index=True,
+            description="Channel ids (original sorting ids) of the unit's tetrode, in the "
+                        "order of the channel axis of `waveforms`.")
 
         for rec in all_units:
             kwargs = dict(
@@ -395,11 +483,21 @@ def _write_units(nwb_path, all_units, metric_cols):
             for col in extra_cols:
                 kwargs[col] = rec[col]
             kwargs["waveform_mean"] = rec["waveform_mean"]
+            kwargs["waveforms"] = rec["waveforms"]
+            kwargs["waveforms_spike_index"] = rec["waveforms_spike_index"]
+            kwargs["waveforms_channel_ids"] = rec["waveforms_channel_ids"]
             nwbfile.add_unit(**kwargs)
+
+        # Individual waveforms are the bulk of the table: gzip them. Per unit they
+        # read back as units['waveforms'][i] -> (n_spikes, n_channels, n_samples).
+        from hdmf.backends.hdf5 import H5DataIO
+        nwbfile.units["waveforms"].target.target.set_data_io(
+            H5DataIO, dict(compression="gzip", compression_opts=4, chunks=True))
 
         io.write(nwbfile)
         print(f"\n[units] Wrote {len(all_units)} unit(s) to {nwb_path} "
-              f"({len(metric_cols)} metric column(s), with waveform_mean).")
+              f"({len(metric_cols)} metric column(s), waveform_mean + "
+              f"{sum(len(r['waveforms']) for r in all_units)} spike waveforms).")
     finally:
         io.close()
 
