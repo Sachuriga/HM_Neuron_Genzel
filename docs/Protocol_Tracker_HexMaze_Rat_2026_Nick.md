@@ -11,9 +11,9 @@ The GenzelTracker app is a multi-functional tool that can be used for:
 
 ## 0. Before you do anything...
 
-IMPORTANT: Check the computer's free disk space before you add or process files! 
-A folder with input and (pre-)processed output files from just one day of sleep recording can take up to ~600 - 700 GB of space.
-A folder with input and output files from one session of maze recordings can take up to  ~100 GB of space.
+IMPORTANT: Check the computer's free disk space before you add or process files!  
+A folder with input and (pre-)processed output files from just one day of sleep recording can take up to ~600 - 700 GB of space.  
+A folder with input and output files from one session of maze recordings can take up to  ~100 GB of space.  
 
 ## 1. Preparing the folder structure
 
@@ -96,10 +96,10 @@ Be careful not to recompute metrics for op folders in which the spike sorting ha
 After running the Tracker implanted GenzelTracker preset, your maze op folder should look something like this: [image here]  
 It is important that you check the validity of the video. Based on the Excel sheet RecordingMeta.xlsx provided by the researchers, the GenzelTracker will have generated an automatic Trial count overlay on the video.  
 
-You should check whether the following files have the same amount of trials:
-RecordingMeta.xlsx
-yyyymmdd_rat*.mp4 (Example: 20260717_Rat5.mp4)
-yyyymmdd_rat*_analysis_final.pdf
+You should check whether the following files have the same amount of trials:  
+RecordingMeta.xlsx  
+yyyymmdd_rat*.mp4 (Example: 20260717_Rat5.mp4)  
+yyyymmdd_rat*_analysis_final.pdf  
 
 If there is a discrepancy in the trial counts between these files, you will need to troubleshoot.  
 If the error can be attributed to a mistake in the RecordingMeta.xlsx file, please change it in the ip folder (not op) and then run the "Retrack" GenzelTracker preset.
