@@ -9,6 +9,12 @@ The GenzelTracker app is a multi-functional tool that can be used for:
 - Basic video tracking
 - Data prep for sleep scoring and spike sorting  
 
+## 0. Before you do anything...
+
+IMPORTANT: Check the computer's free disk space before you add or process files! 
+A folder with input and (pre-)processed output files from just one day of sleep recording can take up to ~600 - 700 GB of space.
+A folder with input and output files from one session of maze recordings can take up to  ~100 GB of space.
+
 ## 1. Preparing the folder structure
 
 The GenzelTracker app needs a specific folder structure to function properly. 
@@ -24,9 +30,6 @@ The number in the folder names should be increased appropriately, and there shou
 ![Example of a correct folder structure](media/sleep_folders.png)
 
 ## 2. Adding the input (recording files)
-
-IMPORTANT: Check the computer's free disk space before you add or process files! 
-A folder with input and (pre-)processed output files from just one day of recording can take up to ~700 GB of space.
 
 The recording files are stored on the external hard drives in the office. The pre-process spreadsheet shows the locations of specific recording sessions.  
 When you copy recording files to a certain PC, please note it in the spreadsheet.
