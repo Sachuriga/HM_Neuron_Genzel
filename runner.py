@@ -95,8 +95,8 @@ def _int_env(name, default):
 def _str_env(*names, default=""):
     """First non-empty value among ``names``, whitespace-stripped.
 
-    Values come from hm_tracker_paths.txt via load_config(), which keeps
-    whatever followed the '=' verbatim — so "KEY = 1500" arrives as " 1500".
+    load_config() already strips the values it reads from hm_tracker_paths.txt;
+    stripping again here also covers variables set directly in the shell.
     """
     for name in names:
         val = os.environ.get(name, "").strip()
@@ -144,7 +144,10 @@ def load_config():
         key, val = line.split("=", 1)
         key = "".join(key.split())
         if key:
-            os.environ[key] = val
+            # Strip the spaces around the value: "TRODES_EXPORT_CMD = /path"
+            # must give "/path", not " /path" — a path with a leading space
+            # does not exist, so the tool was reported as "not found".
+            os.environ[key] = val.strip()
 
     # Auto-use the system ffmpeg (on PATH) when FFMPEG_CMD is unset or points to a
     # path that doesn't exist here — e.g. a Windows path in the config on Linux/Mac,

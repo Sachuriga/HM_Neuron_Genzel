@@ -30,10 +30,13 @@ def waveform_metrics(wf, fs):
         w = w[:, None]
     if w.size == 0 or not np.isfinite(w).all():
         return {}
-    ch = int(np.argmax(w.ptp(axis=0)))
+    # np.ptp() is "peak to peak" = max - min. Use the FUNCTION, not the array
+    # method w.ptp(): NumPy 2.0 removed the method, so w.ptp() crashes there.
+    peak_to_peak_per_channel = np.ptp(w, axis=0)
+    ch = int(np.argmax(peak_to_peak_per_channel))   # the channel with the biggest spike
     s = w[:, ch]
     n = s.size
-    if n < 4 or s.ptp() == 0:
+    if n < 4 or np.ptp(s) == 0:
         return {}
     dt = 1.0 / fs
     trough_i = int(np.argmin(s)); trough_v = float(s[trough_i])

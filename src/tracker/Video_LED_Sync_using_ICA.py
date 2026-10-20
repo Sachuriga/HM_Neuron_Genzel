@@ -306,6 +306,34 @@ def _load_ica_overrides(path):
     return out
 
 
+def restore_videos_without_led(input_path):
+    """Move every file in <input_path>/temp_no_led/ back into <input_path>.
+
+    get_video_files_with_metadata() parks videos whose LED it cannot find in
+    temp_no_led/ so the sync ignores them. Other steps (stitching, tracking)
+    need ALL videos in place, so they must always be moved back afterwards.
+    """
+    input_dir = Path(input_path).resolve()
+    temp_dir = input_dir / "temp_no_led"
+    if not temp_dir.exists():
+        return
+
+    print(f"Moving files back from {temp_dir} to {input_dir}...")
+    for parked_file in temp_dir.iterdir():
+        target = input_dir / parked_file.name
+        if target.exists():
+            # Never overwrite: a file with this name is already in place.
+            print(f"  {parked_file.name} already exists in {input_dir} — left in temp_no_led.")
+            continue
+        shutil.move(str(parked_file), str(target))
+
+    try:
+        temp_dir.rmdir()        # only succeeds when the folder is empty
+        print("Cleaned up and removed 'temp_no_led' folder.")
+    except OSError as e:
+        print(f"Could not remove 'temp_no_led' folder (it might not be empty): {e}")
+
+
 def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True, info=True):
     path = Path(basepath).resolve()
     all_videos = list(sorted(path.glob('*eye*.mp4')))
@@ -361,13 +389,22 @@ def get_video_files_with_metadata(basepath, led_xy_manual=True, time_stamp=True,
             videos_filepath_list.append(video_file_path)
 
     if time_stamp:
+        # The main loop pairs videos and .meta files BY POSITION
+        # (video number i <-> meta file number i). So a video without a .meta
+        # must be dropped from BOTH lists; skipping only its .meta would shift
+        # every later video onto the timestamps of the next one.
+        videos_with_meta = []
         meta_filepath_list = []
         for v in videos_filepath_list:
             meta_candidate = v.with_suffix('.meta')
             if meta_candidate.exists():
+                videos_with_meta.append(v)
                 meta_filepath_list.append(meta_candidate)
             else:
-                print(f"Warning: no .meta file for video {v}")
+                print(f"Warning: no .meta file for video {v} — this video is "
+                      f"left out of the sync (it has no frame timestamps).")
+                crop_xy_dict.pop(str(v), None)
+        videos_filepath_list = videos_with_meta
 
     dio_file_path_dict = get_dio_files(path)
 
@@ -567,22 +604,45 @@ def process_video_with_metadata(file_path, xy_coord, meta_filepath, process_fram
         print("INVALID XY COORDINATES FOUND FOR LED!!!", xy_coord[0], xy_coord[1])
         return None, None, None
     
-    rgb_frames = np.empty((frames_to_process, 16, 16, 3))
+    # One 16x16 RGB crop per frame. uint8 is what the video gives us, and it is
+    # 8x smaller than float64 (an hour of video: ~83 MB instead of ~660 MB).
+    # The crops are converted to float only when they go into the ICA below.
+    rgb_frames = np.zeros((frames_to_process, 16, 16, 3), dtype=np.uint8)
+    frames_actually_read = 0
     for i in range(frames_to_process):
         ret, frame = cap.read()
         if frame is None:
-            break
-            
+            break        # the video ended earlier than its header said
+
         start_point = (xy_coord[0]-8, xy_coord[1]-8)
         # PERFORMANCE FIX 1: Crop first, then convert color
         frame = frame[start_point[1]:start_point[1]+16, start_point[0]:start_point[0]+16]
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
+
         rgb_frames[i, :, :, :] = frame
+        frames_actually_read += 1
         if i % 1000 == 0:
             print("Processed frames:", i, " at ", datetime.now(), end='\r')
 
     cap.release()
+
+    # Keep only frames that were really read AND have a timestamp in the .meta
+    # file. The header frame count (CAP_PROP_FRAME_COUNT) is only an estimate:
+    # when the video is shorter, the rows after the last real frame were never
+    # filled, and must not reach the ICA. Frames past the end of the .meta have
+    # no timestamp, so they cannot be used either.
+    usable_frames = min(frames_actually_read, meta_frames)
+    if usable_frames < frames_to_process:
+        print(f"[frames] {Path(file_path).name}: using {usable_frames} frames "
+              f"(header said {frames_to_process}, read {frames_actually_read}, "
+              f"meta has {meta_frames}).")
+    rgb_frames = rgb_frames[:usable_frames]
+    if usable_frames < 100:
+        # Not enough frames for the ICA to find a blinking LED. Skip this video
+        # the same way as one with an invalid LED position.
+        print(f"[frames] {Path(file_path).name}: only {usable_frames} usable frames "
+              f"— skipping this video.")
+        return None, None, None
 
     if DEBUG.enabled:
         stem = Path(file_path).stem
@@ -773,9 +833,12 @@ def extract_dio_com(dio_file_path_dict, sampling_freq, fallback_start_time=None)
         sys_time_dt + timedelta(seconds=float((i[0] - timestamp_at_creation) / sampling_freq))
     ) for i in red_DIO]
 
-    red_DIO_df  = pd.DataFrame({"Time_Stamp_(DIO)": [datetime.utcfromtimestamp(i[0]) for i in red_DIO_ts], 
-                                "Time_in_seconds_(DIO)": [str(i[0]) for i in red_DIO_ts], 
-                                "State": [i[1] for i in red_DIO_ts]})
+    # "State" must be the DIO line level (0 = LED off, 1 = LED on), which is
+    # field 1 of each raw DIO record. (It used to be field 1 of red_DIO_ts,
+    # which is a datetime — so `State == 1` below was never true.)
+    red_DIO_df  = pd.DataFrame({"Time_Stamp_(DIO)": [datetime.utcfromtimestamp(i[0]) for i in red_DIO_ts],
+                                "Time_in_seconds_(DIO)": [str(i[0]) for i in red_DIO_ts],
+                                "State": [int(record[1]) for record in red_DIO]})
     
     blue_dict_dio = readTrodesExtractedDataFile(dio_file_path_dict['blue'][0])
     blue_DIO = blue_dict_dio['data']
@@ -784,9 +847,9 @@ def extract_dio_com(dio_file_path_dict, sampling_freq, fallback_start_time=None)
         sys_time_dt + timedelta(seconds=float((i[0] - timestamp_at_creation) / sampling_freq))
     ) for i in blue_DIO]
 
-    blue_DIO_df  = pd.DataFrame({"Time_Stamp_(DIO)": [datetime.utcfromtimestamp(i[0]) for i in blue_DIO_ts], 
-                                 "Time_in_seconds_(DIO)": [str(i[0]) for i in blue_DIO_ts], 
-                                 "State": [i[1] for i in blue_DIO_ts]})
+    blue_DIO_df  = pd.DataFrame({"Time_Stamp_(DIO)": [datetime.utcfromtimestamp(i[0]) for i in blue_DIO_ts],
+                                 "Time_in_seconds_(DIO)": [str(i[0]) for i in blue_DIO_ts],
+                                 "State": [int(record[1]) for record in blue_DIO]})   # see red above
     
     # PERFORMANCE FIX 4: Vectorize DIO calculation
     time_stamps_red = red_DIO_df["Time_Stamp_(DIO)"].values
@@ -888,7 +951,6 @@ def pred_dio_ts_from_ica_ts_and_verify(ica_train, dio_train, test_cpu_primary, t
 
 def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blue):
     start_point_ica = 0
-    is_dio_longer = False
     trimmed_dio_red = dio_ts_red.values[1:-2]
     print(f"trimmed red dio len: {trimmed_dio_red.shape}, before trim: {dio_ts_red.shape} ")
     trimmed_ica_red_front = ica_ts_red[(ica_ts_red > dio_ts_red.values[0])].to_numpy()
@@ -896,16 +958,13 @@ def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blu
     trimmed_ica_red = trimmed_ica_red_front[start_point_ica:len(trimmed_dio_red)+start_point_ica]
     print(f"trimmed red ica len: {trimmed_ica_red.shape}, before trim: {ica_ts_red.shape} ")
 
-    try:
-        min_len = min(len(trimmed_dio_blue), len(trimmed_ica_blue))
-        diff = trimmed_dio_blue[:min_len] - trimmed_ica_blue[:min_len]
-    except Exception as e:
-        print(e, "/n Shape of ICA signal and DIO signal did not match. Auto-assuming DIO is longer.")
-        is_dio_longer = True
-        
-    if is_dio_longer:
-        trimmed_dio_red = trimmed_dio_red[:len(trimmed_ica_red)]
-        diff = trimmed_dio_red - trimmed_ica_red
+    # Pair the LED edges one to one: cut both trains to the same length.
+    # (The old code reached this through an exception — it read the blue
+    # variables before they existed — but the result was the same cut.)
+    n_red_pairs = min(len(trimmed_dio_red), len(trimmed_ica_red))
+    trimmed_dio_red = trimmed_dio_red[:n_red_pairs]
+    trimmed_ica_red = trimmed_ica_red[:n_red_pairs]
+    diff = trimmed_dio_red - trimmed_ica_red
     print("Red: Trimmed dio - Trimmed ICA difference is: ", diff)
     plt.figure()
     plt.plot(diff)
@@ -925,8 +984,10 @@ def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blu
         trimmed_ica_blue = trimmed_ica_blue_front[5*start_point_ica:len(trimmed_dio_blue)+5*start_point_ica]
         print(f"trimmed blue ica len: {trimmed_ica_blue.shape}, before trim: {ica_ts_blue.shape} ")
 
-        if is_dio_longer:
-            trimmed_dio_blue = trimmed_dio_blue[:len(trimmed_ica_blue)]
+        # Same one-to-one pairing as for red.
+        n_blue_pairs = min(len(trimmed_dio_blue), len(trimmed_ica_blue))
+        trimmed_dio_blue = trimmed_dio_blue[:n_blue_pairs]
+        trimmed_ica_blue = trimmed_ica_blue[:n_blue_pairs]
 
         diff = trimmed_dio_blue - trimmed_ica_blue
         print("Blue: Trimmed dio - Trimmed ICA difference is: ", diff)
@@ -983,52 +1044,51 @@ if __name__ == "__main__":
     if args.debug or os.environ.get('SYNC_DEBUG') == '1':
         DEBUG.setup(args.output_path or args.input_path)
 
-    vfl, xy_dict, meta_file_list, dio_file_path_dict = get_video_files_with_metadata(args.input_path, led_xy_manual=False)
+    # A run that crashed before this fix may have left videos in temp_no_led/.
+    # Put them back first, so this run sees all of them.
+    restore_videos_without_led(args.input_path)
 
     red_ica_list = []
     blue_ica_list = []
     full_ts_list = []          # full per-frame timestamps per video (for output)
     process_frame_count = None
-    for itr, video_file_path in enumerate(vfl):
-        print("\n")
-        print("Processing for eye:", itr)
-        print("Filepath:", video_file_path)
-        print("XY coordinates for crop:", xy_dict[str(video_file_path)])
+    try:
+        # NOTE: this call MOVES videos without a detectable LED into temp_no_led/.
+        vfl, xy_dict, meta_file_list, dio_file_path_dict = get_video_files_with_metadata(
+            args.input_path, led_xy_manual=False)
 
-        red_ica_out, blue_ica_out, full_frame_ts = process_video_with_metadata(
-            video_file_path, xy_dict[str(video_file_path)],
-            meta_file_list[itr], process_frame_count)
+        for itr, video_file_path in enumerate(vfl):
+            print("\n")
+            print("Processing for eye:", itr)
+            print("Filepath:", video_file_path)
+            print("XY coordinates for crop:", xy_dict[str(video_file_path)])
 
-        if red_ica_out is None:
-            print("Red ICA signal manquant pour :", str(video_file_path))
-            red_ica_out = pd.DataFrame({"key": [], "LED_Intensity": []})
+            red_ica_out, blue_ica_out, full_frame_ts = process_video_with_metadata(
+                video_file_path, xy_dict[str(video_file_path)],
+                meta_file_list[itr], process_frame_count)
 
-        if blue_ica_out is None:
-            print("Blue ICA signal manquant pour :", str(video_file_path))
-            blue_ica_out = pd.DataFrame({"key": [], "LED_Intensity": []})
+            if red_ica_out is None:
+                print("Red ICA signal manquant pour :", str(video_file_path))
+                red_ica_out = pd.DataFrame({"key": [], "LED_Intensity": []})
 
-        red_ica_list.append(red_ica_out)
-        blue_ica_list.append(blue_ica_out)
-        if full_frame_ts is not None and len(full_frame_ts) > 0:
-            full_ts_list.append(full_frame_ts)
-        print("=================")
+            if blue_ica_out is None:
+                print("Blue ICA signal manquant pour :", str(video_file_path))
+                blue_ica_out = pd.DataFrame({"key": [], "LED_Intensity": []})
+
+            red_ica_list.append(red_ica_out)
+            blue_ica_list.append(blue_ica_out)
+            if full_frame_ts is not None and len(full_frame_ts) > 0:
+                full_ts_list.append(full_frame_ts)
+            print("=================")
+    finally:
+        # Runs even when something above crashes. Without it, the moved videos
+        # stayed hidden in temp_no_led/, and step 3 (stitching) then found 11
+        # instead of 12 videos and failed — taking the tracker down with it.
+        restore_videos_without_led(args.input_path)
 
     # Write debug CSVs now, before the sync stage (which may sys.exit on a
     # folder with no usable LED), so diagnostics are always available.
     DEBUG.write_summary()
-
-    temp_dir = Path(args.input_path).resolve() / "temp_no_led"
-    if temp_dir.exists():
-        print(f"Moving files back from {temp_dir} to {args.input_path}...")
-        for f in temp_dir.iterdir():
-            target = Path(args.input_path).resolve() / f.name
-            shutil.move(str(f), str(target))
-        
-        try:
-            temp_dir.rmdir()
-            print("Cleaned up and removed 'temp_no_led' folder.")
-        except OSError as e:
-            print(f"Could not remove 'temp_no_led' folder (it might not be empty): {e}")
 
     # Prefer the blue LED for sync; fall back to red when blue was not detected
     # in any video (e.g. the blue LED was absent or ICA could not isolate a
@@ -1083,17 +1143,20 @@ if __name__ == "__main__":
 
     visualise_ica_dio_coms(dio_com_red, ica_com_red, dio_com_blue, ica_com_blue)
 
-    ts_ica_red  = pd.to_datetime(ica_com_red['Center_of_mass']).astype('int64') // 10**9
-    ts_dio_red  = pd.to_datetime(dio_com_red['Center_of_mass']).astype('int64') // 10**9
+    # Nanoseconds -> seconds. Use "/" (true division) and keep the fraction:
+    # the old "//" (floor division) cut every LED edge time to whole seconds
+    # before the regression, while the LED blinks every 0.4 s (blue).
+    ts_ica_red  = pd.to_datetime(ica_com_red['Center_of_mass']).astype('int64') / 10**9
+    ts_dio_red  = pd.to_datetime(dio_com_red['Center_of_mass']).astype('int64') / 10**9
 
-    ts_dio_blue = pd.to_datetime(dio_com_blue['Center_of_mass']).astype('int64') // 10**9
-    ts_ica_blue = pd.to_datetime(ica_com_blue['Center_of_mass']).astype('int64') // 10**9
+    ts_dio_blue = pd.to_datetime(dio_com_blue['Center_of_mass']).astype('int64') / 10**9
+    ts_ica_blue = pd.to_datetime(ica_com_blue['Center_of_mass']).astype('int64') / 10**9
 
     ica_train_red, dio_train_red, ica_train_blue, dio_train_blue = trim_ts_before_first_overlap(
         ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue)
 
-    red_ica_corrected_s  = pd.to_datetime(red_ica_total['key']).astype('int64') // 10**9
-    blue_ica_corrected_s = pd.to_datetime(blue_ica_total['key']).astype('int64') // 10**9
+    red_ica_corrected_s  = pd.to_datetime(red_ica_total['key']).astype('int64') / 10**9
+    blue_ica_corrected_s = pd.to_datetime(blue_ica_total['key']).astype('int64') / 10**9
 
     # Fit the sync regression on whichever LED drives it; the other channel is
     # only cross-checked and may be empty.

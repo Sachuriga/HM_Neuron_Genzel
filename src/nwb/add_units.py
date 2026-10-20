@@ -415,7 +415,7 @@ def add_units_to_nwb(output_folder, n_jobs=4):
 def _drop_units(nwb_path):
     """Remove an existing Units table so it can be rewritten (pynwb cannot
     replace one in place). Nothing else in the NWB references it. HDF5 does not
-    give the freed space back (h5repack does). Returns True if one was removed."""
+    give the freed space back — run src/nwb/compact_nwb.py for that. Returns True if one was removed."""
     import h5py
     with h5py.File(str(nwb_path), "r+") as f:
         if "units" in f:

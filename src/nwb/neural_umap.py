@@ -43,7 +43,7 @@ def _select_units(nwb, qualities, cell_type=None):
     """[(unit_id, spike_times_seconds), ...] for units whose quality_label is in
     `qualities` (e.g. {'good'} or {'good','mua'}) and — when `cell_type` is given
     (e.g. 'pyramidal') — whose cell_type matches."""
-    udf = nwb.units.to_dataframe()
+    udf = V.read_units_table(nwb)   # skips the big per-spike waveform columns
     ql = (udf["quality_label"].astype(str).str.lower()
           if "quality_label" in udf.columns else None)
     ct = (udf["cell_type"].astype(str).str.lower()

@@ -48,7 +48,7 @@ import visualize_nwb as V     # load_position, load_nodes, SCALE_X/Y, MAZE_EXTEN
 def _select_units(nwb, qualities):
     """[(unit_id, spike_times_seconds), ...] for units whose quality_label is in
     `qualities` (e.g. {'good'} or {'good','mua'})."""
-    udf = nwb.units.to_dataframe()
+    udf = V.read_units_table(nwb)   # skips the big per-spike waveform columns
     ql = udf["quality_label"].astype(str) if "quality_label" in udf.columns \
         else pd.Series("good", index=udf.index)
     sel = udf[ql.isin(set(qualities))]
@@ -57,6 +57,46 @@ def _select_units(nwb, qualities):
         uid = int(r["phy_cluster_id"]) if "phy_cluster_id" in sel.columns else int(i)
         out.append((uid, np.asarray(r["spike_times"], dtype=float)))
     return out
+
+
+# ------------------------------------------------------------
+#        session inputs, read once per process
+# ------------------------------------------------------------
+# One step-b run calls decode_session() many times on the SAME session: once
+# per prediction lead, plus every cross-validation run and every shuffle of the
+# predictive-coding test (30+ calls). Units and position do not change between
+# those calls, so they are read from the NWB once and then reused.
+_SESSION_INPUT_CACHE = {}
+
+
+def _load_session_inputs(nwb_path, qualities):
+    """{'units', 'position', 'session_start_time'} for one session, or None when
+    the NWB has no units. Cached per (file, modification time, unit qualities).
+
+    The file's modification time is part of the cache key on purpose: when the
+    NWB is rewritten (for example step u ran again), the old entry simply stops
+    matching and the file is read afresh. Callers must not modify the returned
+    arrays in place — they are shared between calls.
+    """
+    nwb_path = Path(nwb_path)
+    cache_key = (str(nwb_path.resolve()), nwb_path.stat().st_mtime,
+                 frozenset(qualities))
+    if cache_key in _SESSION_INPUT_CACHE:
+        return _SESSION_INPUT_CACHE[cache_key]
+
+    with NWBHDF5IO(str(nwb_path), mode="r", load_namespaces=True) as io:
+        nwb = io.read()
+        if nwb.units is None or len(nwb.units.id) == 0:
+            inputs = None
+        else:
+            inputs = {
+                "units": _select_units(nwb, qualities),
+                "position": V.load_position(nwb),
+                "session_start_time": nwb.session_start_time,
+            }
+
+    _SESSION_INPUT_CACHE[cache_key] = inputs
+    return inputs
 
 
 def _smooth2d(flat, nx, ny, sigma):
@@ -79,212 +119,211 @@ def decode_session(nwb_path, qualities, bin_cm=10.0, time_bin=0.5, folds=1,
     while preserving each cell's firing rate and temporal autocorrelation. This is
     the null decode (should reflect occupancy only); used by predictive_coding.py
     to test whether the real decode carries information beyond occupancy."""
-    io = NWBHDF5IO(str(nwb_path), mode="r", load_namespaces=True)
-    try:
-        nwb = io.read()
-        if nwb.units is None or len(nwb.units.id) == 0:
-            print("  no units — skipping."); return None
-        units = _select_units(nwb, qualities)
-        pos = V.load_position(nwb)
-        if pos is None or len(units) < 2:
-            print(f"  need position + >=2 units (have {len(units)} units, "
-                  f"pos={pos is not None}) — skipping."); return None
-        x = pos[0] / V.SCALE_X; y = pos[1] / V.SCALE_Y; t = pos[2]
-        dt_pos = float(np.median(np.diff(t))) if t.size > 1 else 1.0 / 30
-        nU = len(units)
+    # Units + position come from a per-process cache: step b calls this function
+    # 30+ times on the same session (leads, CV, shuffles), and re-reading the
+    # NWB every time was the slowest part. See _load_session_inputs().
+    inputs = _load_session_inputs(nwb_path, qualities)
+    if inputs is None:
+        print("  no units — skipping."); return None
+    units = inputs["units"]
+    pos = inputs["position"]
+    if pos is None or len(units) < 2:
+        print(f"  need position + >=2 units (have {len(units)} units, "
+              f"pos={pos is not None}) — skipping."); return None
+    x = pos[0] / V.SCALE_X; y = pos[1] / V.SCALE_Y; t = pos[2]
+    dt_pos = float(np.median(np.diff(t))) if t.size > 1 else 1.0 / 30
+    nU = len(units)
 
-        # null decode: circularly shift each unit's spikes by an independent random
-        # offset (keeps rate + ACG, destroys spike<->position coupling).
-        if shuffle_seed is not None and t.size > 1:
-            _rng = np.random.default_rng(shuffle_seed)
-            _t0, _T = float(t[0]), float(t[-1] - t[0]) or 1.0
-            units = [(uid, _t0 + np.mod(st - _t0 + _rng.uniform(0.05 * _T, 0.95 * _T), _T))
-                     for uid, st in units]
+    # null decode: circularly shift each unit's spikes by an independent random
+    # offset (keeps rate + ACG, destroys spike<->position coupling).
+    if shuffle_seed is not None and t.size > 1:
+        _rng = np.random.default_rng(shuffle_seed)
+        _t0, _T = float(t[0]), float(t[-1] - t[0]) or 1.0
+        units = [(uid, _t0 + np.mod(st - _t0 + _rng.uniform(0.05 * _T, 0.95 * _T), _T))
+                 for uid, st in units]
 
-        # spatial grid (metres) restricted later to visited bins
-        xmin, xmax, ymin, ymax = V.MAZE_EXTENT
-        bm = bin_cm / 100.0
-        nx = max(5, int(round((xmax - xmin) / bm)))
-        ny = max(5, int(round((ymax - ymin) / bm)))
-        xe = np.linspace(xmin, xmax, nx + 1); ye = np.linspace(ymin, ymax, ny + 1)
-        xc = (xe[:-1] + xe[1:]) / 2; yc = (ye[:-1] + ye[1:]) / 2
-        cx = np.repeat(xc[None, :], ny, 0).ravel()      # bin-centre x (flat, ny*nx)
-        cy = np.repeat(yc[:, None], nx, 1).ravel()
+    # spatial grid (metres) restricted later to visited bins
+    xmin, xmax, ymin, ymax = V.MAZE_EXTENT
+    bm = bin_cm / 100.0
+    nx = max(5, int(round((xmax - xmin) / bm)))
+    ny = max(5, int(round((ymax - ymin) / bm)))
+    xe = np.linspace(xmin, xmax, nx + 1); ye = np.linspace(ymin, ymax, ny + 1)
+    xc = (xe[:-1] + xe[1:]) / 2; yc = (ye[:-1] + ye[1:]) / 2
+    cx = np.repeat(xc[None, :], ny, 0).ravel()      # bin-centre x (flat, ny*nx)
+    cy = np.repeat(yc[:, None], nx, 1).ravel()
 
-        good = np.isfinite(x) & np.isfinite(y)
-        pix = np.clip(np.digitize(x, xe) - 1, 0, nx - 1)
-        piy = np.clip(np.digitize(y, ye) - 1, 0, ny - 1)
-        pbid = piy * nx + pix                            # spatial bin per pos sample
+    good = np.isfinite(x) & np.isfinite(y)
+    pix = np.clip(np.digitize(x, xe) - 1, 0, nx - 1)
+    piy = np.clip(np.digitize(y, ye) - 1, 0, ny - 1)
+    pbid = piy * nx + pix                            # spatial bin per pos sample
 
-        # speed gate (place-cell convention): tuning curves are built from RUN epochs
-        # only — occupancy + spikes below speed_thresh (m/s) are excluded so immobility
-        # doesn't contaminate the place fields. speed in metres/s; 0 disables.
-        sp = np.zeros_like(x)
-        if x.size > 1:
-            _d = np.hypot(np.diff(x), np.diff(y)); _dts = np.diff(t)
-            sp[1:] = _d / np.where(_dts > 0, _dts, np.inf)
-        moving = (sp > speed_thresh) if (speed_thresh and speed_thresh > 0) else np.ones_like(x, bool)
-        run = good & moving                              # samples used to fit tuning curves
+    # speed gate (place-cell convention): tuning curves are built from RUN epochs
+    # only — occupancy + spikes below speed_thresh (m/s) are excluded so immobility
+    # doesn't contaminate the place fields. speed in metres/s; 0 disables.
+    sp = np.zeros_like(x)
+    if x.size > 1:
+        _d = np.hypot(np.diff(x), np.diff(y)); _dts = np.diff(t)
+        sp[1:] = _d / np.where(_dts > 0, _dts, np.inf)
+    moving = (sp > speed_thresh) if (speed_thresh and speed_thresh > 0) else np.ones_like(x, bool)
+    run = good & moving                              # samples used to fit tuning curves
 
-        # decode time bins (spike counts + actual position per bin)
-        edges = np.arange(t[0], t[-1] + time_bin, time_bin)
-        nb = len(edges) - 1
-        if nb < 10:
-            print("  session too short — skipping."); return None
+    # decode time bins (spike counts + actual position per bin)
+    edges = np.arange(t[0], t[-1] + time_bin, time_bin)
+    nb = len(edges) - 1
+    if nb < 10:
+        print("  session too short — skipping."); return None
 
-        # RANDOM k-fold cross-validation: assign every decode time-bin to a random
-        # fold; position samples and spikes inherit the fold of the bin they fall in.
-        # Random (not contiguous-in-time) folds keep every visited maze region in the
-        # training set, so no test bin lands in a place the model never saw — at the
-        # cost of some leakage between temporally adjacent bins.
-        rng = np.random.default_rng(0)
-        bin_fold = (rng.integers(0, folds, size=nb) if folds > 1
-                    else np.zeros(nb, dtype=int))
+    # RANDOM k-fold cross-validation: assign every decode time-bin to a random
+    # fold; position samples and spikes inherit the fold of the bin they fall in.
+    # Random (not contiguous-in-time) folds keep every visited maze region in the
+    # training set, so no test bin lands in a place the model never saw — at the
+    # cost of some leakage between temporally adjacent bins.
+    rng = np.random.default_rng(0)
+    bin_fold = (rng.integers(0, folds, size=nb) if folds > 1
+                else np.zeros(nb, dtype=int))
 
-        def _fold_of(times):
-            return bin_fold[np.clip(np.digitize(times, edges) - 1, 0, nb - 1)]
-        samp_fold = _fold_of(t)
+    def _fold_of(times):
+        return bin_fold[np.clip(np.digitize(times, edges) - 1, 0, nb - 1)]
+    samp_fold = _fold_of(t)
 
-        # per-spike spatial bin + fold. For prediction (lead_s>0) each spike is tied
-        # to the position lead_s seconds LATER, so tuning curves map spikes to the
-        # animal's future location.
-        spk = []
-        for uid, st in units:
-            sx = np.interp(st + lead_s, t, x, left=np.nan, right=np.nan)
-            sy = np.interp(st + lead_s, t, y, left=np.nan, right=np.nan)
-            sv = np.interp(st + lead_s, t, sp, left=0.0, right=0.0)   # speed at binned pos
-            ok = np.isfinite(sx) & np.isfinite(sy)
-            if speed_thresh and speed_thresh > 0:
-                ok &= sv > speed_thresh                  # keep only run-epoch spikes
-            sbid = (np.clip(np.digitize(sy[ok], ye) - 1, 0, ny - 1) * nx
-                    + np.clip(np.digitize(sx[ok], xe) - 1, 0, nx - 1))
-            spk.append((sbid, _fold_of(st[ok]), st[ok]))
-
-        counts = np.zeros((nU, nb))
-        for u, (uid, st) in enumerate(units):
-            counts[u], _ = np.histogram(st, bins=edges)
-        sb = np.clip(np.digitize(t, edges) - 1, 0, nb - 1)
-        vs = good
-        cnt = np.bincount(sb[vs], minlength=nb).astype(float)
-        occupied = cnt > 0
-        tc_mid = (edges[:-1] + edges[1:]) / 2
-        if lead_s:
-            # target = the TRUE position lead_s seconds after each bin centre
-            ax_ = np.interp(tc_mid + lead_s, t, x, left=np.nan, right=np.nan)
-            ay_ = np.interp(tc_mid + lead_s, t, y, left=np.nan, right=np.nan)
-            occupied = occupied & np.isfinite(ax_) & np.isfinite(ay_)
-            ax_ = np.nan_to_num(ax_); ay_ = np.nan_to_num(ay_)
-        else:
-            ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
-            ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
-
-        # decode only RUN-epoch time bins too: run-epoch tuning curves can't explain
-        # immobility bins, so evaluating them would inflate error. A bin is kept if the
-        # animal's mean speed in it exceeds speed_thresh (consistent with the tuning curves).
+    # per-spike spatial bin + fold. For prediction (lead_s>0) each spike is tied
+    # to the position lead_s seconds LATER, so tuning curves map spikes to the
+    # animal's future location.
+    spk = []
+    for uid, st in units:
+        sx = np.interp(st + lead_s, t, x, left=np.nan, right=np.nan)
+        sy = np.interp(st + lead_s, t, y, left=np.nan, right=np.nan)
+        sv = np.interp(st + lead_s, t, sp, left=0.0, right=0.0)   # speed at binned pos
+        ok = np.isfinite(sx) & np.isfinite(sy)
         if speed_thresh and speed_thresh > 0:
-            bin_speed = np.bincount(sb[good], weights=sp[good], minlength=nb) / np.where(cnt > 0, cnt, 1)
-            occupied = occupied & (bin_speed > speed_thresh)
+            ok &= sv > speed_thresh                  # keep only run-epoch spikes
+        sbid = (np.clip(np.digitize(sy[ok], ye) - 1, 0, ny - 1) * nx
+                + np.clip(np.digitize(sx[ok], xe) - 1, 0, nx - 1))
+        spk.append((sbid, _fold_of(st[ok]), st[ok]))
 
-        decoded_x = np.full(nb, np.nan); decoded_y = np.full(nb, np.nan)
-        min_occ = 0.3                        # only decode over well-sampled bins (s)
-        tc_max = 50.0                        # clip tuning curves (Hz) — avoids spurious
+    counts = np.zeros((nU, nb))
+    for u, (uid, st) in enumerate(units):
+        counts[u], _ = np.histogram(st, bins=edges)
+    sb = np.clip(np.digitize(t, edges) - 1, 0, nb - 1)
+    vs = good
+    cnt = np.bincount(sb[vs], minlength=nb).astype(float)
+    occupied = cnt > 0
+    tc_mid = (edges[:-1] + edges[1:]) / 2
+    if lead_s:
+        # target = the TRUE position lead_s seconds after each bin centre
+        ax_ = np.interp(tc_mid + lead_s, t, x, left=np.nan, right=np.nan)
+        ay_ = np.interp(tc_mid + lead_s, t, y, left=np.nan, right=np.nan)
+        occupied = occupied & np.isfinite(ax_) & np.isfinite(ay_)
+        ax_ = np.nan_to_num(ax_); ay_ = np.nan_to_num(ay_)
+    else:
+        ax_ = np.bincount(sb[vs], weights=x[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
+        ay_ = np.bincount(sb[vs], weights=y[vs], minlength=nb) / np.where(cnt > 0, cnt, 1)
 
-        def _fit_and_decode(train_samp, spike_mask_fn, test_bins):
-            """Fit tuning curves on `train_samp` position samples (+ each unit's
-            spikes kept by `spike_mask_fn(sfold)`) and decode `test_bins`."""
-            occ = np.bincount(pbid[train_samp], minlength=nx * ny).astype(float) * dt_pos
-            occ_s = _smooth2d(occ, nx, ny, sigma)
-            TC = np.zeros((nU, nx * ny))
-            for u, (sbid, sfold, _st) in enumerate(spk):
-                c = np.bincount(sbid[spike_mask_fn(sfold)], minlength=nx * ny).astype(float)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    TC[u] = np.where(occ_s > 1e-3, _smooth2d(c, nx, ny, sigma) / occ_s, 0.0)
-            TC = np.clip(np.nan_to_num(TC, nan=0.0, posinf=tc_max), 0.0, tc_max)
-            visited = occ >= min_occ
-            if visited.sum() < 3 or not len(test_bins):
-                return
-            vidx = np.where(visited)[0]
-            logTC = np.log(TC[:, vidx] + 1e-3)           # (nU, nV)
-            sumrate = TC[:, vidx].sum(0)                  # (nV,)
-            with np.errstate(all="ignore"):              # flat-prior log-posterior
-                logpost = counts[:, test_bins].T @ logTC - time_bin * sumrate[None, :]
-            logpost[~np.isfinite(logpost)] = -np.inf
-            best = vidx[np.argmax(logpost, axis=1)]
-            decoded_x[test_bins] = cx[best]; decoded_y[test_bins] = cy[best]
+    # decode only RUN-epoch time bins too: run-epoch tuning curves can't explain
+    # immobility bins, so evaluating them would inflate error. A bin is kept if the
+    # animal's mean speed in it exceeds speed_thresh (consistent with the tuning curves).
+    if speed_thresh and speed_thresh > 0:
+        bin_speed = np.bincount(sb[good], weights=sp[good], minlength=nb) / np.where(cnt > 0, cnt, 1)
+        occupied = occupied & (bin_speed > speed_thresh)
 
-        if folds <= 1:                       # train on ALL run epochs, decode everything
-            _fit_and_decode(run, lambda sf: np.ones(sf.shape, bool), np.where(occupied)[0])
-        else:                                # cross-validated (train on other folds)
-            for f in range(folds):
-                _fit_and_decode((samp_fold != f) & run, (lambda ff: (lambda sf: sf != ff))(f),
-                                np.where((bin_fold == f) & occupied)[0])
+    decoded_x = np.full(nb, np.nan); decoded_y = np.full(nb, np.nan)
+    min_occ = 0.3                        # only decode over well-sampled bins (s)
+    tc_max = 50.0                        # clip tuning curves (Hz) — avoids spurious
 
-        dec = np.isfinite(decoded_x) & occupied
-        err = np.hypot(decoded_x[dec] - ax_[dec], decoded_y[dec] - ay_[dec])
-        # chance: distance from the actual position to a random visited-bin centre
-        rng = np.random.default_rng(0)
-        allvis = np.where(np.bincount(pbid[good], minlength=nx * ny) > 0)[0]
-        rc = rng.choice(allvis, size=dec.sum())
-        chance = np.hypot(cx[rc] - ax_[dec], cy[rc] - ay_[dec])
-        res = {"nwb": nwb_path.name, "quality": "+".join(sorted(qualities)),
-               "mode": ("full-data" if folds <= 1 else f"{folds}-fold CV"),
-               "lead_s": float(lead_s),
-               "n_units": nU, "n_bins": int(dec.sum()),
-               "median_err_m": float(np.median(err)), "mean_err_m": float(np.mean(err)),
-               "median_chance_m": float(np.median(chance))}
+    def _fit_and_decode(train_samp, spike_mask_fn, test_bins):
+        """Fit tuning curves on `train_samp` position samples (+ each unit's
+        spikes kept by `spike_mask_fn(sfold)`) and decode `test_bins`."""
+        occ = np.bincount(pbid[train_samp], minlength=nx * ny).astype(float) * dt_pos
+        occ_s = _smooth2d(occ, nx, ny, sigma)
+        TC = np.zeros((nU, nx * ny))
+        for u, (sbid, sfold, _st) in enumerate(spk):
+            c = np.bincount(sbid[spike_mask_fn(sfold)], minlength=nx * ny).astype(float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                TC[u] = np.where(occ_s > 1e-3, _smooth2d(c, nx, ny, sigma) / occ_s, 0.0)
+        TC = np.clip(np.nan_to_num(TC, nan=0.0, posinf=tc_max), 0.0, tc_max)
+        visited = occ >= min_occ
+        if visited.sum() < 3 or not len(test_bins):
+            return
+        vidx = np.where(visited)[0]
+        logTC = np.log(TC[:, vidx] + 1e-3)           # (nU, nV)
+        sumrate = TC[:, vidx].sum(0)                  # (nV,)
+        with np.errstate(all="ignore"):              # flat-prior log-posterior
+            logpost = counts[:, test_bins].T @ logTC - time_bin * sumrate[None, :]
+        logpost[~np.isfinite(logpost)] = -np.inf
+        best = vidx[np.argmax(logpost, axis=1)]
+        decoded_x[test_bins] = cx[best]; decoded_y[test_bins] = cy[best]
 
-        # trials on the position/spike seconds clock (same source as plot_trials /
-        # step v — see visualize_nwb.build_trials): coordinate Trial_Num blocks
-        # mapped via stitched_framewise_seconds.csv. NOT the old RecordingMeta-unix
-        # windows, which sit on the behavioural-sync clock and drift vs the video.
-        trials = V.build_trials(nwb_path.parent, nwb.session_start_time,
-                                float(t.min()), float(t.max()))
-        # carry the decoded arrays on the result so callers (e.g. the multi-lead
-        # comparison) can reuse them without re-reading the NWB.
-        res.update({"t": tc_mid[dec], "actual_x": ax_[dec], "actual_y": ay_[dec],
-                    "decoded_x": decoded_x[dec], "decoded_y": decoded_y[dec],
-                    "err": err, "chance": chance, "trials": trials})
+    if folds <= 1:                       # train on ALL run epochs, decode everything
+        _fit_and_decode(run, lambda sf: np.ones(sf.shape, bool), np.where(occupied)[0])
+    else:                                # cross-validated (train on other folds)
+        for f in range(folds):
+            _fit_and_decode((samp_fold != f) & run, (lambda ff: (lambda sf: sf != ff))(f),
+                            np.where((bin_fold == f) & occupied)[0])
 
-        out_dir = nwb_path.parent / "decoding"
-        tag = "_".join(sorted(qualities))
-        # prediction runs get a distinct 'predicted_..._lead{n}s' name so they do NOT
-        # clobber the 0-lag decoded_*.npz that plot_trials overlays per trial.
-        stem = f"decoded_{tag}" if not lead_s else f"predicted_{tag}_lead{lead_s:g}s"
-        if save:
-            # persist the decoded track so step 5 (plot_trials) can overlay it per
-            # trial. Time is t = the stitched-seconds clock (identical to the NWB
-            # position/spike timestamps), so no unix conversion is needed anywhere.
-            # Coords = scaled metres.
-            out_dir.mkdir(exist_ok=True)
-            # NB: decoded_*.npz / predicted_*.npz are NOT prefixed — step 5
-            # (plot_trials) finds them via a `decoded_*.npz` glob. Only terminal
-            # plots below get the rat_sessiondate_ prefix.
-            pfx = file_prefix(nwb_path.parent)
-            np.savez(out_dir / f"{stem}.npz",
-                     t=tc_mid[dec],
-                     actual_x=ax_[dec], actual_y=ay_[dec],
-                     decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
-                     quality="+".join(sorted(qualities)), lead_s=float(lead_s),
-                     scale_x=V.SCALE_X, scale_y=V.SCALE_Y)
-            # per-(trial, unit) place-coding + task-performance table (lead-0 only):
-            # -> CSV + PDF here; the NWB write happens after this read handle closes.
-            if not lead_s:
-                tu = build_trial_unit_metrics(units, x, y, t, dt_pos, trials, (nx, ny),
-                                              sigma, tc_mid[dec], err, V.load_nodes(),
-                                              nwb_path.parent)
-                res["trial_unit_metrics"] = tu
-                if tu is not None and len(tu):
-                    tu.to_csv(out_dir / f"{pfx}trial_unit_metrics_{tag}.csv", index=False)
-                    plot_trial_unit_metrics(out_dir / f"{pfx}trial_unit_metrics_{tag}.pdf", tu, tag)
-                    print(f"  trial/unit metrics: {len(tu)} rows "
-                          f"({tu['trial'].nunique()} trials x {tu['unit'].nunique()} units).")
-        if plot:
-            _plot(nwb_path, res, tc_mid[dec], ax_[dec], ay_[dec],
-                  decoded_x[dec], decoded_y[dec], err, chance, V.load_nodes(), qualities,
-                  trials, stem=stem)
-        return res
-    finally:
-        io.close()
+    dec = np.isfinite(decoded_x) & occupied
+    err = np.hypot(decoded_x[dec] - ax_[dec], decoded_y[dec] - ay_[dec])
+    # chance: distance from the actual position to a random visited-bin centre
+    rng = np.random.default_rng(0)
+    allvis = np.where(np.bincount(pbid[good], minlength=nx * ny) > 0)[0]
+    rc = rng.choice(allvis, size=dec.sum())
+    chance = np.hypot(cx[rc] - ax_[dec], cy[rc] - ay_[dec])
+    res = {"nwb": nwb_path.name, "quality": "+".join(sorted(qualities)),
+           "mode": ("full-data" if folds <= 1 else f"{folds}-fold CV"),
+           "lead_s": float(lead_s),
+           "n_units": nU, "n_bins": int(dec.sum()),
+           "median_err_m": float(np.median(err)), "mean_err_m": float(np.mean(err)),
+           "median_chance_m": float(np.median(chance))}
+
+    # trials on the position/spike seconds clock (same source as plot_trials /
+    # step v — see visualize_nwb.build_trials): coordinate Trial_Num blocks
+    # mapped via stitched_framewise_seconds.csv. NOT the old RecordingMeta-unix
+    # windows, which sit on the behavioural-sync clock and drift vs the video.
+    trials = V.build_trials(nwb_path.parent, inputs["session_start_time"],
+                            float(t.min()), float(t.max()))
+    # carry the decoded arrays on the result so callers (e.g. the multi-lead
+    # comparison) can reuse them without re-reading the NWB.
+    res.update({"t": tc_mid[dec], "actual_x": ax_[dec], "actual_y": ay_[dec],
+                "decoded_x": decoded_x[dec], "decoded_y": decoded_y[dec],
+                "err": err, "chance": chance, "trials": trials})
+
+    out_dir = nwb_path.parent / "decoding"
+    tag = "_".join(sorted(qualities))
+    # prediction runs get a distinct 'predicted_..._lead{n}s' name so they do NOT
+    # clobber the 0-lag decoded_*.npz that plot_trials overlays per trial.
+    stem = f"decoded_{tag}" if not lead_s else f"predicted_{tag}_lead{lead_s:g}s"
+    if save:
+        # persist the decoded track so step 5 (plot_trials) can overlay it per
+        # trial. Time is t = the stitched-seconds clock (identical to the NWB
+        # position/spike timestamps), so no unix conversion is needed anywhere.
+        # Coords = scaled metres.
+        out_dir.mkdir(exist_ok=True)
+        # NB: decoded_*.npz / predicted_*.npz are NOT prefixed — step 5
+        # (plot_trials) finds them via a `decoded_*.npz` glob. Only terminal
+        # plots below get the rat_sessiondate_ prefix.
+        pfx = file_prefix(nwb_path.parent)
+        np.savez(out_dir / f"{stem}.npz",
+                 t=tc_mid[dec],
+                 actual_x=ax_[dec], actual_y=ay_[dec],
+                 decoded_x=decoded_x[dec], decoded_y=decoded_y[dec], err=err,
+                 quality="+".join(sorted(qualities)), lead_s=float(lead_s),
+                 scale_x=V.SCALE_X, scale_y=V.SCALE_Y)
+        # per-(trial, unit) place-coding + task-performance table (lead-0 only):
+        # -> CSV + PDF here; the NWB write happens after this read handle closes.
+        if not lead_s:
+            tu = build_trial_unit_metrics(units, x, y, t, dt_pos, trials, (nx, ny),
+                                          sigma, tc_mid[dec], err, V.load_nodes(),
+                                          nwb_path.parent)
+            res["trial_unit_metrics"] = tu
+            if tu is not None and len(tu):
+                tu.to_csv(out_dir / f"{pfx}trial_unit_metrics_{tag}.csv", index=False)
+                plot_trial_unit_metrics(out_dir / f"{pfx}trial_unit_metrics_{tag}.pdf", tu, tag)
+                print(f"  trial/unit metrics: {len(tu)} rows "
+                      f"({tu['trial'].nunique()} trials x {tu['unit'].nunique()} units).")
+    if plot:
+        _plot(nwb_path, res, tc_mid[dec], ax_[dec], ay_[dec],
+              decoded_x[dec], decoded_y[dec], err, chance, V.load_nodes(), qualities,
+              trials, stem=stem)
+    return res
 
 
 # ------------------------------------------------------------
@@ -458,9 +497,13 @@ def plot_trial_unit_metrics(pdf_path, df, tag):
 
 
 def save_metrics_nwb(nwb_path, df, tag):
-    """Append the trial/unit metrics table to the NWB as a scratch DynamicTable
-    named 'trial_unit_metrics_<tag>'. Skips (leaving the CSV/PDF) if it already
-    exists or the write fails, so re-runs never crash the pipeline."""
+    """Write the trial/unit metrics table into the NWB as a scratch DynamicTable
+    named 'trial_unit_metrics_<tag>', REPLACING the one an earlier run wrote.
+
+    It used to be skipped when the table already existed, so after re-curating
+    and re-running step b the CSV was new but the NWB kept the first run's
+    numbers. If the write fails, the CSV/PDF are still there and the pipeline
+    carries on."""
     if df is None or not len(df):
         return
     name = f"trial_unit_metrics_{tag}"
@@ -468,11 +511,17 @@ def save_metrics_nwb(nwb_path, df, tag):
             "selectivity, firing_rate_hz, peak_rate_hz) + per-trial decoding_error_m, "
             f"performance=log10(shortest/actual), between_node_speed. Units: {tag.replace('_', '+')}.")
     try:
+        # pynwb cannot replace a container in place, so delete the old table
+        # with h5py first (it is small, so the space HDF5 leaves unused is too).
+        import h5py
+        with h5py.File(str(nwb_path), "r+") as f:
+            old_table_path = f"scratch/{name}"
+            if old_table_path in f:
+                del f[old_table_path]
+                print(f"  replacing the NWB scratch '{name}' from an earlier run.")
+
         with NWBHDF5IO(str(nwb_path), mode="a", load_namespaces=True) as io:
             nwb = io.read()
-            if nwb.scratch is not None and name in nwb.scratch:
-                print(f"  NWB already has scratch '{name}'; leaving CSV/PDF only.")
-                return
             try:
                 nwb.add_scratch(df, name=name, table_description=desc)
             except TypeError:

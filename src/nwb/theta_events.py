@@ -23,7 +23,8 @@ each computed in three splits — GOAL-RUNNING (type-1 trial windows), FREE-ROAM
   PETH panels share one rate scale per unit; phase-coupling panels share one
   y scale per unit.
 
-Theta comes from the session's Trodes LFP export (<op>/LFP_Output): the channel
+Theta comes from the session LFP — the session NWB's acquisition/lfp (step 8),
+or the legacy <op>/LFP_Output/*.npy export for older sessions: the channel
 with the highest theta/delta power ratio during a movement-rich block is
 band-passed 6-10 Hz and Hilbert-transformed. Phase convention: 0 deg = peak of
 filtered theta, +-180 deg = trough. LFP sample 0 of the MAZE session aligns with
@@ -183,7 +184,120 @@ def build_events(x, y, t, trials, nodes):
 # ------------------------------------------------------------
 #                 theta (LFP -> phase)
 # ------------------------------------------------------------
-def _find_lfp(op_folder):
+# The LFP can come from two places:
+#   1. the session NWB (acquisition/lfp) — where step 8 writes it now;
+#   2. LFP_Output/*.npy — older sessions, or step 8 run with KEEP_NPY=1.
+# Both are opened into the same small "LFP source" dict, so load_theta() does
+# not need to care which one it got:
+#   data         (n_samples, n_channels), sliced like data[rows, cols]; never
+#                loaded whole (an h5py dataset or a numpy memmap)
+#   fs           sampling rate in Hz
+#   boundaries   [{'name': recording name, 'start': first sample}, ...], one per
+#                concatenated recording, or None when unknown
+#   channel_map  [{'ntrode': .., 'channel': ..}, ...] one per column, or None
+#   read_column  function(col) -> that whole column as float64
+#   close        function() that releases the file
+#   origin       short text for the log
+def _lfp_source_from_nwb(op_folder):
+    """The LFP stored in the session NWB as an LFP source, or None if absent."""
+    import sleep_nwb_writer as snwb
+    from pynwb import NWBHDF5IO
+
+    nwb_path = snwb.find_session_nwb(op_folder)
+    if nwb_path is None:
+        return None
+
+    io = NWBHDF5IO(str(nwb_path), mode="r", load_namespaces=True)
+    try:
+        nwbfile = io.read()
+        lfp_series = nwbfile.acquisition.get(snwb.LFP_NAME)
+        if lfp_series is None:
+            io.close()
+            return None
+
+        # Works whether the series stores a sampling rate or a timestamps array.
+        fs = snwb._series_rate(lfp_series)
+        if not fs:
+            io.close()
+            return None
+
+        # session_info is a small JSON record next to the LFP. It holds the
+        # channel map and the sample where each concatenated recording starts.
+        sleep_module = snwb._sleep_module(nwbfile)
+        session_info = snwb._read_json(sleep_module, snwb.SESSION_INFO_NAME) or {}
+    except Exception:
+        io.close()
+        raise
+
+    boundaries = None
+    if session_info.get("session_boundaries"):
+        boundaries = []
+        for b in session_info["session_boundaries"]:
+            boundaries.append({"name": b.get("name", ""),
+                               "start": int(b.get("start_sample", 0))})
+
+    data = lfp_series.data      # h5py dataset: only the slices we ask for are read
+
+    def read_column(col):
+        # The LFP is stored in chunks of 50 s x 4 channels, so reading one
+        # column decompresses only ~1/32 of the file.
+        return np.asarray(data[:, col], dtype=np.float64)
+
+    return {"data": data, "fs": float(fs), "boundaries": boundaries,
+            "channel_map": session_info.get("channel_map"),
+            "read_column": read_column, "close": io.close,
+            "origin": nwb_path.name}
+
+
+def _lfp_source_from_npy(op_folder):
+    """The legacy LFP_Output/*.npy export as an LFP source, or None if absent."""
+    lfp_dir, pfx = _find_npy_lfp(op_folder)
+    if lfp_dir is None:
+        return None
+
+    data = np.load(lfp_dir / f"{pfx}lfp_data.npy", mmap_mode="r")
+    timestamps = np.load(lfp_dir / f"{pfx}lfp_timestamps.npy", mmap_mode="r")
+    fs = 1.0 / float(np.median(np.diff(np.asarray(timestamps[:10000]))))
+
+    boundaries = None
+    boundaries_file = lfp_dir / f"{pfx}session_boundaries.npy"
+    if boundaries_file.exists():
+        boundaries = list(np.load(boundaries_file, allow_pickle=True))
+
+    channel_map = None
+    channel_map_file = lfp_dir / f"{pfx}channel_map.npy"
+    if channel_map_file.exists():
+        channel_map = list(np.load(channel_map_file, allow_pickle=True))
+
+    def read_column(col):
+        # Fast path: KEEP_NPY also wrote one small file per channel.
+        try:
+            nt = int(channel_map[col]["ntrode"])
+            ch = int(channel_map[col]["channel"])
+            one_channel_file = lfp_dir / "channels_npy" / f"{pfx}lfp_nt{nt:02d}_ch{ch:02d}.npy"
+            if one_channel_file.exists():
+                return np.load(one_channel_file).astype(np.float64)
+        except (TypeError, KeyError, ValueError, IndexError):
+            pass                     # no usable channel map: use the slow path
+        # Slow path: one column of the big memmap (slow on a network drive).
+        return np.asarray(data[:, col], dtype=np.float64)
+
+    return {"data": data, "fs": fs, "boundaries": boundaries,
+            "channel_map": channel_map, "read_column": read_column,
+            "close": lambda: None, "origin": "LFP_Output"}
+
+
+def _channel_label(channel_map, col):
+    """'nt05ch02' for an LFP column, or 'col17' when there is no channel map."""
+    try:
+        nt = int(channel_map[col]["ntrode"])
+        ch = int(channel_map[col]["channel"])
+        return f"nt{nt:02d}ch{ch:02d}"
+    except (TypeError, KeyError, ValueError, IndexError):
+        return f"col{col}"
+
+
+def _find_npy_lfp(op_folder):
     """(lfp_dir, prefix) of the Trodes LFP export, or (None, None)."""
     lo = Path(op_folder) / "LFP_Output"
     if not lo.is_dir():
@@ -200,92 +314,105 @@ def _find_lfp(op_folder):
 
 
 def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0):
-    """Session theta phase from the LFP export, on the spike clock.
+    """Session theta phase from the LFP, on the spike clock.
+
+    The LFP is read from the session NWB (acquisition/lfp, written by step 8),
+    or from the legacy LFP_Output/*.npy export when the NWB has none.
 
     Channel = the column with the highest theta/delta Welch-power ratio inside a
     movement-rich `sel_block_s` block (found from the tracking). The maze session's
     sample 0 is spike-time 0 (session_boundaries; maze-only exports start at 0).
-    Reads ONE contiguous row-block for selection and the single per-channel file
-    from channels_npy/ for the full trace (SMB-friendly). Returns dict or None:
+    Reads ONE contiguous row-block for selection, then only the chosen column
+    for the full trace. Returns dict or None:
       {t0, fs, lt (float32 times), uw (float32 unwrapped phase), label}"""
-    lo, pfx = _find_lfp(op_folder)
-    if lo is None:
-        print("  [theta] no LFP_Output — phase/precession pages will be skipped.")
-        return None
+    # 1. Find the LFP: the NWB first, the old .npy export as a fallback.
     try:
-        ld = np.load(lo / f"{pfx}lfp_data.npy", mmap_mode="r")
-        ts = np.load(lo / f"{pfx}lfp_timestamps.npy", mmap_mode="r")
-        fs = 1.0 / float(np.median(np.diff(np.asarray(ts[:10000]))))
-        # spike-clock offset: the TASK session's start sample (0 for maze-only
-        # exports). Task recordings are named maze/mazs/awake/hab (same set
-        # scan_drive._classify_phase maps to 'task') — matching only "maze" would
-        # silently leave off=0 on a pre+awake+post export and align every spike
-        # to PRE-SLEEP LFP. If a multi-session export has no task boundary we
-        # cannot align at all: fail loudly rather than compute phases on noise.
-        off = 0.0
-        try:
-            sb = np.load(lo / f"{pfx}session_boundaries.npy", allow_pickle=True)
-            task_keys = ("maze", "mazs", "awake", "hab")
-            task = [b for b in sb
-                    if any(k in str(b.get("name", "")).lower() for k in task_keys)]
-            if task:
-                off = float(task[0]["start"]) / fs
-            elif len(sb) > 1:
-                print(f"  [theta] no task-phase boundary among "
-                      f"{[str(b.get('name', '')) for b in sb]} — cannot align the "
-                      f"LFP to the spike clock; phase pages skipped.")
-                return None
-        except FileNotFoundError:
-            pass                       # maze-only export without boundaries: off=0 correct
-        # movement-rich selection block: highest mean speed over candidate starts
-        sp = np.zeros_like(x)
-        d = np.hypot(np.diff(x), np.diff(y)); dts = np.diff(t)
-        sp[1:] = d / np.where(dts > 0, dts, np.inf)
-        dur = len(ld) / fs
-        cand = np.arange(0.0, max(dur - sel_block_s, 1.0), sel_block_s / 2)
-        best_t0, best_v = 0.0, -1.0
-        for c in cand:
-            # c is an LFP-FILE time; file time F = spike/position time F - off
-            # (the same mapping as lt below), so score the tracking at c - off.
-            m = (t >= c - off) & (t <= c - off + sel_block_s)
-            vv = sp[m]; vv = vv[np.isfinite(vv)]
-            v = float(vv.mean()) if vv.size else 0.0
-            if v > best_v:
-                best_v, best_t0 = v, c
-        s0 = int(best_t0 * fs); s1 = min(int((best_t0 + sel_block_s) * fs), len(ld))
-        block = np.asarray(ld[s0:s1, :], dtype=np.float64)   # one contiguous read
-        ratios = []
-        for chn in range(block.shape[1]):
-            f, P = welch(block[:, chn], fs=fs, nperseg=4096)
-            th = P[(f >= band[0]) & (f <= band[1])].mean()
-            de = P[(f >= 1) & (f <= 4)].mean()
-            ratios.append(th / de if de > 0 else 0.0)
-        best = int(np.argmax(ratios))
-        label = f"col{best}"
-        sig = None
-        try:                                    # fast path: single-channel file
-            cm = np.load(lo / f"{pfx}channel_map.npy", allow_pickle=True)
-            nt, chn = cm[best]["ntrode"], cm[best]["channel"]
-            label = f"nt{nt:02d}ch{chn:02d}"
-            f1 = lo / "channels_npy" / f"{pfx}lfp_nt{nt:02d}_ch{chn:02d}.npy"
-            if f1.exists():
-                sig = np.load(f1).astype(np.float64)
-        except Exception:
-            pass
-        if sig is None:                         # fallback: memmap column (slow on SMB)
-            sig = np.asarray(ld[:, best], dtype=np.float64)
-        b, a = butter(3, [band[0] / (fs / 2), band[1] / (fs / 2)], btype="band")
-        thf = filtfilt(b, a, sig)
-        uw = np.unwrap(np.angle(hilbert(thf)))
-        lt = (np.arange(len(sig)) / fs - off)
-        print(f"  [theta] channel {label} (theta/delta {max(ratios):.2f}), "
-              f"{fs:g} Hz, {len(sig) / fs:.0f}s, offset {off:g}s.")
-        return {"fs": fs, "lt": lt.astype(np.float32), "uw": uw.astype(np.float32),
-                "sig": sig.astype(np.float32),          # raw channel, for gamma bands
-                "t0": float(lt[0]), "t1": float(lt[-1]), "label": label}
+        source = _lfp_source_from_nwb(op_folder)
+    except Exception as e:
+        print(f"  [theta] could not read the LFP from the NWB ({e}); "
+              f"trying LFP_Output instead.")
+        source = None
+    if source is None:
+        source = _lfp_source_from_npy(op_folder)
+    if source is None:
+        print("  [theta] no LFP (no acquisition/lfp in the NWB and no LFP_Output) "
+              "— phase/precession pages will be skipped.")
+        return None
+
+    # 2. Compute the theta phase. The file is closed again whatever happens;
+    #    everything returned is an in-memory copy.
+    try:
+        return _theta_from_lfp_source(source, x, y, t, band, sel_block_s)
     except Exception as e:
         print(f"  [theta] failed to load LFP ({e}) — phase pages skipped.")
         return None
+    finally:
+        source["close"]()
+
+
+def _theta_from_lfp_source(source, x, y, t, band, sel_block_s):
+    """The work behind load_theta, on an LFP source dict (see above)."""
+    ld = source["data"]
+    fs = source["fs"]
+
+    # spike-clock offset: the TASK session's start sample (0 for maze-only
+    # exports). Task recordings are named maze/mazs/awake/hab (same set
+    # scan_drive._classify_phase maps to 'task') — matching only "maze" would
+    # silently leave off=0 on a pre+awake+post export and align every spike
+    # to PRE-SLEEP LFP. If a multi-session export has no task boundary we
+    # cannot align at all: fail loudly rather than compute phases on noise.
+    off = 0.0
+    sb = source["boundaries"]
+    if sb:                             # None: maze-only export, off=0 is correct
+        task_keys = ("maze", "mazs", "awake", "hab")
+        task = [b for b in sb
+                if any(k in str(b.get("name", "")).lower() for k in task_keys)]
+        if task:
+            off = float(task[0]["start"]) / fs
+        elif len(sb) > 1:
+            print(f"  [theta] no task-phase boundary among "
+                  f"{[str(b.get('name', '')) for b in sb]} — cannot align the "
+                  f"LFP to the spike clock; phase pages skipped.")
+            return None
+
+    # movement-rich selection block: highest mean speed over candidate starts
+    sp = np.zeros_like(x)
+    d = np.hypot(np.diff(x), np.diff(y)); dts = np.diff(t)
+    sp[1:] = d / np.where(dts > 0, dts, np.inf)
+    dur = len(ld) / fs
+    cand = np.arange(0.0, max(dur - sel_block_s, 1.0), sel_block_s / 2)
+    best_t0, best_v = 0.0, -1.0
+    for c in cand:
+        # c is an LFP-FILE time; file time F = spike/position time F - off
+        # (the same mapping as lt below), so score the tracking at c - off.
+        m = (t >= c - off) & (t <= c - off + sel_block_s)
+        vv = sp[m]; vv = vv[np.isfinite(vv)]
+        v = float(vv.mean()) if vv.size else 0.0
+        if v > best_v:
+            best_v, best_t0 = v, c
+    s0 = int(best_t0 * fs); s1 = min(int((best_t0 + sel_block_s) * fs), len(ld))
+    block = np.asarray(ld[s0:s1, :], dtype=np.float64)   # one contiguous read
+    ratios = []
+    for chn in range(block.shape[1]):
+        f, P = welch(block[:, chn], fs=fs, nperseg=4096)
+        th = P[(f >= band[0]) & (f <= band[1])].mean()
+        de = P[(f >= 1) & (f <= 4)].mean()
+        ratios.append(th / de if de > 0 else 0.0)
+    best = int(np.argmax(ratios))
+
+    # Read the full trace of the chosen channel only.
+    label = _channel_label(source["channel_map"], best)
+    sig = source["read_column"](best)
+
+    b, a = butter(3, [band[0] / (fs / 2), band[1] / (fs / 2)], btype="band")
+    thf = filtfilt(b, a, sig)
+    uw = np.unwrap(np.angle(hilbert(thf)))
+    lt = (np.arange(len(sig)) / fs - off)
+    print(f"  [theta] channel {label} (theta/delta {max(ratios):.2f}) from "
+          f"{source['origin']}, {fs:g} Hz, {len(sig) / fs:.0f}s, offset {off:g}s.")
+    return {"fs": fs, "lt": lt.astype(np.float32), "uw": uw.astype(np.float32),
+            "sig": sig.astype(np.float32),          # raw channel, for gamma bands
+            "t0": float(lt[0]), "t1": float(lt[-1]), "label": label}
 
 
 def spike_phases(theta, st):

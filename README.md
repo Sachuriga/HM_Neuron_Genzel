@@ -458,8 +458,8 @@ python src/sorter/sorting.py --input_folder <ip> --output_folder <op> --config <
 
 Output: `<op>/<stem>_<sorter>_sorting_output/`. Curate with `phy template-gui phy_export/params.py`.
 
-> - **Re-running step 7 wipes the whole sorting-output folder** including manual curation inside it.
-> - **Never delete `processed_binary/`** — Phy's raw-trace view and step r depend on it.
+> - **Re-running step 7 skips recordings that already have a `phy_export/`**, so adding one new session to a folder never touches curated sorts. To sort them again set `RESORT=1` in `hm_tracker_paths.txt` (or pass `--resort`): the old `phy_export/` is then moved to `<stem>_<sorter>_sorting_output.backup_<YYYYMMDD_HHMMSS>/` (the big `processed_binary/` is not copied — the new sort rebuilds it at the same path, so the backup's `params.py` still works). Delete the backup once you no longer need it.
+> - **`processed_binary/` is as big as the raw data (~27 GiB per recording hour).** Phy's trace view, step r and step u need it, so do not delete it by hand. Once a session's curation is final and step u has written its units into the NWB, free the space with `python src/sorter/processed_binary_tool.py --clean --output_folder <op>` (dry run; add `--yes` to delete). It deletes only folders whose units are already in the NWB and saves a fingerprint first. To curate again later, rebuild it from the `.rec` with `--restore --input_folder <ip> --output_folder <op> --config <hm_tracker_paths.txt>`; the rebuild uses the same preprocessing code as step 7 and is checked against the fingerprint (it is byte-identical as long as the rat's channel settings and `FREQ_MIN`/`FREQ_MAX` are unchanged).
 > - The sorter scripts exit 0 even on fatal errors so batches continue — check logs, not exit codes.
 
 #### Tetrode (NT) channel mapping
@@ -476,7 +476,7 @@ Re-runs the shared post-sorting stage (metrics, labels, Phy export, cleanup) on 
 
 **Script:** `src/sorter/recompute_metrics.py --output_folder <op|sorting_output|phy_export> [--n_jobs 4]`
 
-Recomputes all quality + template metrics on the **curated** sorting (loaded directly from `spike_times.npy` + `spike_clusters.npy` so manual splits/merges are honoured) and writes into `phy_export/`: `curated_quality_metrics.csv`, `curated_template_metrics.csv`, per-metric `cluster_<metric>.tsv` (visible as Phy columns), **`curated_templates.npy`** (+ unit/channel id files — Phy's own `templates.npy` is stale after merges), refreshed `quality_check_labels.csv`, and overwrites `cluster_group.tsv` with recomputed labels (merges/splits survive; label-only manual edits are recomputed).
+Recomputes all quality + template metrics on the **curated** sorting (loaded directly from `spike_times.npy` + `spike_clusters.npy` so manual splits/merges are honoured) and writes into `phy_export/`: `curated_quality_metrics.csv`, `curated_template_metrics.csv`, per-metric `cluster_<metric>.tsv` (visible as Phy columns), **`curated_templates.npy`** (+ unit/channel id files — Phy's own `templates.npy` is stale after merges), and the refreshed automated labels as `quality_check_labels.csv` + `cluster_auto_group.tsv` (shown as an `auto_group` column in Phy). **`cluster_group.tsv` — your manual good/mua/noise labels — is never touched**; step u reads it as the human truth and falls back to the automated label only for units you did not label.
 
 ### Step 8 — LFP + Motion + EMG-from-LFP
 
@@ -562,7 +562,9 @@ Writes the curated Phy units into the session NWB (in place). Waveforms are **al
 
 **Cell-type rule** (`src/nwb/spike_metrics.py`, CellExplorer + FR gate): *interneuron* if FR > 10 Hz, OR trough-to-peak ≤ 0.425 ms (narrow), OR (trough-to-peak > 0.425 ms AND ACG τ_rise > 6 ms, wide); else *pyramidal*.
 
-> Every run of step u **replaces** the NWB's Units table, so after re-curating in Phy just run **r → u**. If the waveforms cannot be extracted for any phy folder of the session (e.g. `processed_binary/` deleted), nothing is written, the previous Units table stays, and the step exits with an error — a Units table without `waveform_mean` is never written.
+> Every run of step u **replaces** the NWB's Units table, so after re-curating in Phy just run **r → u**. If the waveforms cannot be extracted for any phy folder of the session (e.g. `processed_binary/` deleted), nothing is written, the previous Units table stays, and the step exits with an error — a Units table without `waveform_mean` is never written. (If `processed_binary/` was removed with `processed_binary_tool.py --clean`, rebuild it with `--restore` first.)
+>
+> HDF5 files never shrink: each re-run of step u (and of step 4 / step 8, which also replace parts of the NWB) leaves the old part's space unused inside the file — ~0.2 GB per step-u re-run. `python src/nwb/compact_nwb.py <op>` rewrites the NWB compactly (with `h5repack` if installed, else pynwb export), checks that every object made it into the copy, and only then swaps it in.
 
 ### Step v — Visualize NWB Units
 

@@ -307,6 +307,21 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
 # and waveform (template) metrics on that CURATED sorting and writes them back
 # into the phy folder — WITHOUT re-exporting (so your manual curation is kept).
 
+def attach_probe(recording, probe):
+    """Attach `probe` and return the recording that carries it.
+
+    SpikeInterface changed this call between versions:
+      - up to 0.104, recording.set_probe(probe) returns a NEW recording;
+      - from 0.105 on, it changes `recording` IN PLACE and returns None.
+    Writing `rec = rec.set_probe(probe)` therefore turned `rec` into None on
+    0.105 and crashed the next line. This helper works on both versions.
+    """
+    returned = recording.set_probe(probe)
+    if returned is None:
+        return recording      # 0.105+: the probe was attached in place
+    return returned           # <= 0.104: a new recording was returned
+
+
 def _read_phy_params(phy_folder):
     """Parse phy's params.py (simple `key = value` assignments) into a dict."""
     ns = {}
@@ -388,7 +403,7 @@ def _load_recording_from_phy(phy_folder):
         probe = pi.Probe(ndim=positions.shape[1])
         probe.set_contacts(positions=positions, shapes="circle", shape_params={"radius": 5})
         probe.set_device_channel_indices(np.arange(positions.shape[0]))
-        rec = rec.set_probe(probe)
+        rec = attach_probe(rec, probe)
     return rec
 
 
@@ -466,8 +481,9 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     sorting and write them back into the phy folder. Best-effort; never raises.
 
     Writes: curated_quality_metrics.csv, curated_template_metrics.csv, one
-    cluster_<metric>.tsv per metric, and OVERWRITES Phy's cluster_group.tsv with
-    the refreshed good/mua/noise quality-check label.
+    cluster_<metric>.tsv per metric, and the refreshed automated good/mua/noise
+    label as quality_check_labels.csv + cluster_auto_group.tsv. Phy's own
+    cluster_group.tsv (your manual labels) is left untouched.
     """
     phy = Path(phy_folder)
     if not (phy / "params.py").exists():
@@ -608,16 +624,27 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     except Exception as e:
         print(f"[recompute] Could not save curated templates ({e}).")
 
-    # Refresh the good/mua/noise quality-check label on the curated units and
-    # OVERWRITE Phy's native 'group' (cluster_group.tsv) with it.
+    # Refresh the AUTOMATED good/mua/noise label on the curated units.
+    #
+    # It goes to its own files and NEVER into cluster_group.tsv: that file is
+    # where Phy saves the labels you set by hand, and step u reads it as the
+    # human truth. Overwriting it here used to replace your manual labels with
+    # the automated ones without telling you.
     try:
         qc = label_units_quality_check(analyzer)
         if qc is not None:
+            # 1) Full table, read by step u as `auto_quality_label`.
             qc.to_csv(phy / "quality_check_labels.csv")
-            tsv = qc.rename(columns={"quality_label": "group"})[["group"]].copy()
-            tsv.index.name = "cluster_id"
-            tsv.reset_index().to_csv(phy / "cluster_group.tsv", sep="\t", index=False)
-            wrote.append("cluster_group.tsv")
+            wrote.append("quality_check_labels.csv")
+
+            # 2) The same labels as a Phy column, so you can compare
+            #    "auto_group" with your own "group" side by side in Phy.
+            auto_labels = qc.rename(columns={"quality_label": "auto_group"})
+            auto_labels = auto_labels[["auto_group"]].copy()
+            auto_labels.index.name = "cluster_id"
+            auto_labels.reset_index().to_csv(phy / "cluster_auto_group.tsv",
+                                             sep="\t", index=False)
+            wrote.append("cluster_auto_group.tsv")
     except Exception as e:
         print(f"[recompute] Quality-check relabel failed ({e}).")
 

@@ -58,6 +58,10 @@ NWB_RAT_NR=1
 # FREQ_MAX         : band-pass low-pass cutoff in Hz   [8000]
 # DETECT_THRESHOLD : spike detection threshold         [5]
 # DETECT_SIGN      : spikes to detect: -1 negative, 0 both, 1 positive  [0]
+#
+# RESORT           : 1 = sort recordings again even if they already have a
+#                    phy_export (the old phy_export is backed up first).
+#                    0 / omitted = skip them, so Phy curation is never lost.  [0]
 # -------------------------------------------------------------------
 SORTER = mountainsort5
 FREQ_MIN = 600

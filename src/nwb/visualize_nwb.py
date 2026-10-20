@@ -116,6 +116,24 @@ def _read_phy_params(phy_folder):
 # ------------------------------------------------------------
 #                 loading NWB content
 # ------------------------------------------------------------
+# Units-table columns holding the INDIVIDUAL spike waveforms written by step u
+# (up to 1000 spikes per unit). They are by far the biggest part of the table
+# (~0.2 GB per session, gzip-compressed), and no analysis step reads them.
+PER_SPIKE_WAVEFORM_COLUMNS = {"waveforms", "waveforms_spike_index",
+                              "waveforms_channel_ids"}
+
+
+def read_units_table(nwb):
+    """The NWB Units table as a pandas DataFrame, without the per-spike waveforms.
+
+    A plain nwb.units.to_dataframe() decompresses every stored spike waveform
+    and turns each one into a Python object — slow and memory-hungry, and
+    step b does it dozens of times per session. Columns that do not exist
+    (older NWBs) are simply ignored by `exclude`.
+    """
+    return nwb.units.to_dataframe(exclude=PER_SPIKE_WAVEFORM_COLUMNS)
+
+
 def load_position(nwb, series=None):
     """Return (x, y, t) in session-relative seconds for one tracked body, or None.
 
@@ -841,7 +859,7 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
             print("NWB has no Units table — nothing to visualize.")
             return
 
-        udf = nwb.units.to_dataframe()
+        udf = read_units_table(nwb)
         has_wf = "waveform_mean" in udf.columns
         pos = load_position(nwb)
         if pos is None:
@@ -1165,7 +1183,8 @@ def _write_unit_pdf(path, row, cid, spike_times, wf, amp_t, amp_v,
                 w = w[:, None]
             # waveform_mean is (n_samples, all_channels) but sparse — only this
             # unit's tetrode channels are non-zero. Plot ONLY those, coloured 'cool'.
-            active = np.where(w.ptp(axis=0) > 1e-6)[0]
+            # np.ptp(w, axis=0), not w.ptp(axis=0): NumPy 2.0 removed the method.
+            active = np.where(np.ptp(w, axis=0) > 1e-6)[0]
             if active.size == 0:
                 active = np.arange(w.shape[1])
             cmap_wf = plt.get_cmap("cool")

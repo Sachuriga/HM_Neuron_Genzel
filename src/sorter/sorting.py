@@ -1,6 +1,7 @@
 import os
 import shutil
 import traceback
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 
@@ -172,11 +173,27 @@ def _parse_sleep_channels(raw_value):
     return out
 
 
+def recording_belongs_to_rat(file_stem, rat_token):
+    """True if a recording name starts with this rat's token.
+
+    A plain startswith() is not enough: "rat10_hm_neurons_..." starts with
+    "rat1" too, so Rat10..Rat19 would silently get Rat1's channel settings.
+    The character right after the token must therefore not be a digit.
+
+        recording_belongs_to_rat("Rat1_HM_20260101", "rat1")   -> True
+        recording_belongs_to_rat("Rat10_HM_20260101", "rat1")  -> False
+    """
+    stem = file_stem.lower()
+    if not stem.startswith(rat_token):
+        return False
+    next_char = stem[len(rat_token):len(rat_token) + 1]   # "" at the end of the name
+    return not next_char.isdigit()
+
+
 def resolve_sleep_channels(file_stem, config):
     """Return the ``{cortex, sr, pyr}`` sleep tetrodes for a recording (by rat), or {}."""
-    stem = file_stem.lower()
     for rat in sorted(config, key=len, reverse=True):
-        if isinstance(config[rat], dict) and stem.startswith(rat):
+        if isinstance(config[rat], dict) and recording_belongs_to_rat(file_stem, rat):
             return dict(config[rat].get("sleep_channels", {}))
     return {}
 
@@ -271,12 +288,11 @@ def resolve_rat_settings(file_stem, config):
     bad channels, reference channels and EEG channels (channels belonging to
     EEG tetrodes, excluded from sorting). Falls back to DEFAULT_BAD_CHANNELS.
     """
-    stem = file_stem.lower()
-
-    # Prefer the longest matching rat token so "rat10" beats "rat1".
+    # Find the configured rat this recording belongs to. The reserved keys
+    # ("__sorter__", "__params__") never match a recording name.
     matched = None
     for rat in sorted(config, key=len, reverse=True):
-        if stem.startswith(rat):
+        if recording_belongs_to_rat(file_stem, rat):
             matched = rat
             break
 
@@ -296,7 +312,7 @@ def resolve_rat_settings(file_stem, config):
 
     # No config entry: fall back to built-in defaults (bad channels only).
     for rat, channels in DEFAULT_BAD_CHANNELS.items():
-        if stem.startswith(rat):
+        if recording_belongs_to_rat(file_stem, rat):
             print(f"No config entry for '{rat}'; using built-in default bad channels.")
             return list(channels), [], []
 
@@ -323,6 +339,7 @@ from sorter_common import (  # noqa: E402
     QUALITY_CHECK_THRESHOLDS,
     label_units_quality_check,
     analyze_and_export,
+    attach_probe,
 )
 
 
@@ -397,46 +414,94 @@ def group_split_recordings(dat_files):
     return groups
 
 
-def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
-                        bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
-                        sorter_name=DEFAULT_SORTER, sorting_params=None):
+# ---------------------------------------------------------------------------
+#   Protecting manual Phy curation.
+#
+#   A finished sort leaves <recording>_<sorter>_sorting_output/phy_export/.
+#   After you curate it in Phy (merge / split / good-mua-noise labels), that
+#   folder holds hours of manual work that cannot be regenerated. Step 7 used to
+#   delete the whole output folder before re-sorting, which silently threw that
+#   work away. The helpers below make step 7 skip sorted recordings by default,
+#   and keep a backup of phy_export when a re-sort is explicitly requested.
+# ---------------------------------------------------------------------------
+def sorting_output_dir(first_path, output_parent, sorter_name):
+    """The output folder of one sort job: <recording>_<sorter>_sorting_output.
+
+    A .rec gets the stem its raw export used to have ('<recording>.raw_group0'),
+    so the folder name is the same whichever source the session was sorted from.
     """
-    Runs the spike sorting pipeline on a single .dat file.
-    Plotting is disabled, progress bars are enabled for all computations.
-    All intermediate files are deleted at the end, leaving only phy_export.
+    first_path = Path(first_path)
+    if first_path.suffix.lower() == ".rec":
+        file_stem = f"{first_path.stem}.raw_group0"
+    else:
+        file_stem = first_path.stem
+    return Path(output_parent) / f"{file_stem}_{sorter_name}_sorting_output"
+
+
+def has_phy_export(output_dir):
+    """True when this sort finished and produced a Phy folder (maybe curated)."""
+    params_file = Path(output_dir) / "phy_export" / "params.py"
+    return params_file.exists()
+
+
+def back_up_phy_export(output_dir):
+    """Move phy_export/ into a dated backup folder next to output_dir and delete
+    the rest of output_dir. Returns the backup folder.
+
+    Why only phy_export? It is small and holds the manual curation, which cannot
+    be recreated. processed_binary/ is huge (~27 GiB per recording hour) but is
+    rebuilt by the new sort at the SAME path, so the backed-up params.py
+    (dat_path -> <output_dir>/processed_binary/...) keeps working afterwards.
+    Copying it would double the disk use and can fill the drive.
     """
-    # `file_path` may be a single .dat, or a list of split parts of one phase to
-    # concatenate in time. Parts are pre-ordered by the caller (acquisition time).
-    paths = [Path(p) for p in (file_path if isinstance(file_path, (list, tuple)) else [file_path])]
-    file_path_obj = paths[0]
-    # A .rec gets the stem its raw export had ('<recording>.raw_group0'), so the
-    # output folder name is the same whichever source a session was sorted from.
-    file_stem = (f"{file_path_obj.stem}.raw_group0" if file_path_obj.suffix.lower() == ".rec"
-                 else file_path_obj.stem)
+    output_dir = Path(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = output_dir.with_name(f"{output_dir.name}.backup_{timestamp}")
+    backup_dir.mkdir()
 
-    # Resolve numeric sorting settings (band-pass cutoffs, detection params),
-    # falling back to the built-in defaults for anything not supplied.
-    if sorting_params is None:
-        sorting_params = resolve_sorting_params(None)
-    freq_min = sorting_params.get('freq_min', 600.0)
-    freq_max = sorting_params.get('freq_max', 8000.0)
-    detect_threshold = sorting_params.get('detect_threshold', 5.0)
-    detect_sign = sorting_params.get('detect_sign', 0)
+    # A rename inside one drive is instant and copies no data.
+    (output_dir / "phy_export").rename(backup_dir / "phy_export")
 
-    # 1. SETUP PATHS
-    output_parent_obj = Path(output_parent)
-    output_dir = output_parent_obj / f"{file_stem}_{sorter_name}_sorting_output"
+    # Everything left in output_dir is regenerated by the new sort.
+    shutil.rmtree(output_dir, ignore_errors=True)
+    return backup_dir
 
-    # Wipe any leftover artifacts from a previous (possibly failed) run so
-    # nothing collides with this attempt.
-    if output_dir.exists():
-        print(f"Cleaning previous output: {output_dir}")
-        shutil.rmtree(output_dir, ignore_errors=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n--- Processing {file_stem} ---")
-    print(f"Output folder: {output_dir}")
+def _flag_is_on(value):
+    """Read a yes/no setting such as RESORT=1 from the config / environment.
 
+    Written out on purpose: "0" is a non-empty string, so a plain truth test
+    would treat RESORT=0 as "on".
+    """
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+#   Building the preprocessed recording (sorting steps 2-5).
+#
+#   Split into small functions so that the SAME code serves two callers:
+#     - process_single_file()   when a recording is sorted;
+#     - processed_binary_tool   when a deleted processed_binary/ is rebuilt
+#                               from the .rec (it must match the original).
+# ---------------------------------------------------------------------------
+
+# How processed_binary/ is written. Shared by sorting and the rebuild tool:
+# a different chunk size would change the filter edges very slightly.
+PROCESSED_BINARY_SAVE_KWARGS = dict(
+    format='binary',
+    overwrite=True,
+    n_jobs=1,             # Keep this at 1 for Windows!
+    chunk_duration="1s",
+    progress_bar=True,
+)
+
+
+def open_raw_recording(paths, fs=30000.0, gain=0.195, offset=0.0):
+    """Steps 2-3: one lazy recording of the raw data, split parts concatenated.
+
+    `paths` are .rec files (or old *_group0.dat raw exports) of ONE phase, in
+    acquisition order.
+    """
     # 2. LOAD DATA (concatenate split parts of the phase, in acquisition order)
     #
     # Read straight from the files, never into RAM: 128 channels of int16 at 30 kHz
@@ -449,6 +514,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # kwargs — which reads the whole memmap back into memory. BinaryRecording
     # stores only the path and offset, so cloning stays free. A .rec is read the
     # same lazy way by trodes_rec.open_rec (identical samples to the raw export).
+    paths = [Path(p) for p in paths]
     print("Opening data..." if len(paths) == 1
           else f"Opening {len(paths)} split parts of this phase:")
     layouts = [None if p.suffix.lower() == ".rec" else trodesBinaryLayout(str(p))
@@ -486,16 +552,20 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     rec = recs[0] if len(recs) == 1 else si.concatenate_recordings(recs)
     rec.set_channel_gains(gain)
     rec.set_channel_offsets(offset)
+    return rec
 
+
+def attach_tetrode_probe(rec):
+    """Step 4: the 8x4 tetrode grid geometry + one 'group' per tetrode."""
     # 4. CUSTOM PROBE GEOMETRY (8x4 Tetrode Grid)
     print("Configuring probe geometry...")
     rows, cols = 8, 4
-    inter_tetrode_spacing = 250.0 
+    inter_tetrode_spacing = 250.0
     diamond_offsets = np.array([[0, 10], [10, 0], [0, -10], [-10, 0]])
-    
+
     all_positions, all_device_indices, group_ids = [], [], []
     tetrode_idx = 0
-    
+
     for r in range(rows):
         for c in range(cols):
             x_center = c * inter_tetrode_spacing
@@ -510,10 +580,17 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     probe.set_contacts(positions=all_positions, shapes='circle', shape_params={'radius': 5})
     probe.set_device_channel_indices(all_device_indices)
 
-    rec = rec.set_probe(probe)
+    rec = attach_probe(rec, probe)      # works on SpikeInterface 0.104 and 0.105+
     rec.set_property("group", group_ids)
     print(f"Probe attached. Total Groups: {len(np.unique(group_ids))}")
+    return rec
 
+
+def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
+                           eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0):
+    """Steps 4.1-5: drop EEG tetrodes -> band-pass -> interpolate bad channels
+    -> optional single-channel reference -> global median reference.
+    Returns the lazy preprocessed recording (nothing is written yet)."""
     # 4.1. Drop EEG tetrode channels — they are not spike-sorted.
     eeg_channel_ids = list(eeg_channel_ids) if eeg_channel_ids else []
     if eeg_channel_ids:
@@ -531,13 +608,13 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         bad_channel_ids = [c for c in (bad_channel_ids or []) if c not in excluded]
         ref_channels = [c for c in (ref_channels or []) if c not in excluded]
 
-    # 5. PREPROCESSING & SAVING
+    # 5. PREPROCESSING
     print("Preprocessing and saving binary...")
-    
+
     # 5.1. Bandpass filter
     print(f"Bandpass filter: {freq_min}-{freq_max} Hz")
     rec_filtered = spre.bandpass_filter(rec, freq_min=freq_min, freq_max=freq_max)
-    
+
     # 5.2. Bad Channel Detection (per-rat list from hm_tracker_paths.txt)
     bad_channel_ids = list(bad_channel_ids) if bad_channel_ids else []
     ref_channels = list(ref_channels) if ref_channels else []
@@ -569,21 +646,77 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     rec_cmr = spre.common_reference(rec_ref, reference='global', operator='median')
 
     # 5.5. No manual whitening here — MountainSort does its own whitening
-    #      (para['whiten']=True below), so whitening twice would be wrong.
-    rec_preprocessed = rec_cmr
+    #      (para['whiten']=True in process_single_file), so whitening twice
+    #      would be wrong.
+    return rec_cmr
+
+
+def build_preprocessed_recording(paths, bad_channel_ids=None, ref_channels=None,
+                                 eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0,
+                                 fs=30000.0, gain=0.195, offset=0.0):
+    """Steps 2-5 in one call: raw files -> probe -> preprocessed recording."""
+    rec = open_raw_recording(paths, fs=fs, gain=gain, offset=offset)
+    rec = attach_tetrode_probe(rec)
+    return preprocess_for_sorting(rec, bad_channel_ids=bad_channel_ids,
+                                  ref_channels=ref_channels,
+                                  eeg_channel_ids=eeg_channel_ids,
+                                  freq_min=freq_min, freq_max=freq_max)
+
+
+def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
+                        bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
+                        sorter_name=DEFAULT_SORTER, sorting_params=None):
+    """
+    Runs the spike sorting pipeline on a single .dat file.
+    Plotting is disabled, progress bars are enabled for all computations.
+    All intermediate files are deleted at the end, leaving only phy_export.
+    """
+    # `file_path` may be a single .dat, or a list of split parts of one phase to
+    # concatenate in time. Parts are pre-ordered by the caller (acquisition time).
+    paths = [Path(p) for p in (file_path if isinstance(file_path, (list, tuple)) else [file_path])]
+    output_dir = sorting_output_dir(paths[0], output_parent, sorter_name)
+    file_stem = output_dir.name[:-len(f"_{sorter_name}_sorting_output")]
+
+    # Resolve numeric sorting settings (band-pass cutoffs, detection params),
+    # falling back to the built-in defaults for anything not supplied.
+    if sorting_params is None:
+        sorting_params = resolve_sorting_params(None)
+    freq_min = sorting_params.get('freq_min', 600.0)
+    freq_max = sorting_params.get('freq_max', 8000.0)
+    detect_threshold = sorting_params.get('detect_threshold', 5.0)
+    detect_sign = sorting_params.get('detect_sign', 0)
+
+    # 1. SETUP PATHS
+    # An existing output folder is one of two things:
+    #   - a FINISHED sort (it has phy_export/): it may hold manual Phy curation,
+    #     so phy_export/ is backed up, never deleted;
+    #   - leftovers of a run that crashed before export: safe to wipe.
+    if output_dir.exists():
+        if has_phy_export(output_dir):
+            backup_dir = back_up_phy_export(output_dir)
+            print(f"Previous phy_export kept in: {backup_dir}")
+        else:
+            print(f"Cleaning leftovers of an unfinished run: {output_dir}")
+            shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n--- Processing {file_stem} ---")
+    print(f"Output folder: {output_dir}")
+
+    # 2-5. Load the raw data, attach the tetrode probe and preprocess it.
+    #      The same function rebuilds processed_binary/ later
+    #      (processed_binary_tool.py --restore), so both stay identical.
+    rec_preprocessed = build_preprocessed_recording(
+        paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
+        eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
+        fs=fs, gain=gain, offset=offset)
 
     processed_folder = output_dir / 'processed_binary'
     if processed_folder.exists():
         shutil.rmtree(processed_folder)
 
-    rec_saved = rec_preprocessed.save(
-        folder=processed_folder, 
-        format='binary', 
-        overwrite=True, 
-        n_jobs=1,  # Keep this at 1 for Windows!
-        chunk_duration="1s",
-        progress_bar=True
-    )
+    rec_saved = rec_preprocessed.save(folder=processed_folder,
+                                      **PROCESSED_BINARY_SAVE_KWARGS)
 
     # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
@@ -631,7 +764,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     )
 
 
-def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None):
+def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None,
+                         resort=False):
     """
     Scans the base_data_folder for .rec files (read directly, no raw export
     needed) — plus, for recordings whose .rec is gone, old *.raw/*_group0.dat
@@ -639,6 +773,11 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
 
     `config` is the dict returned by load_sorting_config(); per-recording bad
     channels and reference channels are resolved from it by file stem.
+
+    Recordings that already have a phy_export are SKIPPED, so running step 7
+    again (e.g. after adding one new session to the folder) never touches
+    curated sorts. `resort=True` sorts them again; their old phy_export is
+    then moved to a dated backup folder first (see back_up_phy_export).
     """
     config = config or {}
     sorter_name = resolve_sorter(config)
@@ -675,6 +814,15 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
         print(f"Job {i}/{len(groups)}: {label}")
         print(f"{'='*60}")
 
+        # Already sorted? Then leave it alone unless a re-sort was asked for.
+        output_dir = sorting_output_dir(first, output_path, sorter_name)
+        if has_phy_export(output_dir) and not resort:
+            print(f"Already sorted: {output_dir.name}/phy_export exists — skipping, "
+                  f"so any Phy curation is kept.")
+            print("To sort it again, set RESORT=1 in hm_tracker_paths.txt (or pass "
+                  "--resort); the old phy_export is then backed up, not deleted.")
+            continue
+
         bad_channel_ids, ref_channels, eeg_channel_ids = resolve_rat_settings(
             first.stem, config)
         try:
@@ -708,8 +856,15 @@ if __name__ == "__main__":
     parser.add_argument('--config', default=None,
                         help="Path to hm_tracker_paths.txt for per-rat bad/ref channel settings. "
                              "Defaults to ~/Desktop/hm_tracker_paths.txt if present.")
+    parser.add_argument('--resort', action='store_true',
+                        help="Sort recordings again even if they already have a phy_export "
+                             "(the old phy_export is backed up first). Same as RESORT=1 in "
+                             "the config file.")
 
     args = parser.parse_args()
+    # The runner exports every config key into the environment, so RESORT=1 in
+    # hm_tracker_paths.txt arrives here as an environment variable.
+    resort = args.resort or _flag_is_on(os.environ.get("RESORT"))
 
     config_path = args.config
     if not config_path:
@@ -719,7 +874,8 @@ if __name__ == "__main__":
     sorting_config = load_sorting_config(config_path)
 
     try:
-        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4, config=sorting_config)
+        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4, config=sorting_config,
+                             resort=resort)
     except Exception as e:
         print(f"\n[FATAL] Pipeline crashed for folder '{args.input_folder}':\n{e}")
         traceback.print_exc()

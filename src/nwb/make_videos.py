@@ -232,7 +232,7 @@ def _spatial_frame(t):
 def top_spatial_info_units(nwb, pos, n_units, quality, sigma=2.0, speed=0.05):
     """The n_units GOOD putative-pyramidal cells with the highest whole-session
     Skaggs spatial information. Returns [(cid, spike_times, spatial_info), ...]."""
-    udf = nwb.units.to_dataframe()
+    udf = V.read_units_table(nwb)   # skips the big per-spike waveform columns
     ql = udf["quality_label"].astype(str) if "quality_label" in udf.columns \
         else pd.Series("good", index=udf.index)
     ct = udf["cell_type"].astype(str) if "cell_type" in udf.columns \

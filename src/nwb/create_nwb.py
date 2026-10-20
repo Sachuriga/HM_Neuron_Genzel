@@ -269,7 +269,7 @@ def behavior_add(module, obj):
 # removes behaviour containers from an existing NWB so a re-track (step 4) writes
 # fresh ones instead of behavior_add keeping the stale copies. Only the names
 # given are dropped — LFP/EMG/motion (step 8), sleep scorings and units (step u)
-# are untouched. HDF5 does not give the freed space back (h5repack does).
+# are untouched. HDF5 does not give the freed space back (src/nwb/compact_nwb.py does).
 def drop_behavior_outputs(nwb_path, module_name, names):
     import h5py
     removed = []

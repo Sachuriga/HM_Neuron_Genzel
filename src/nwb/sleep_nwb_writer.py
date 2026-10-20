@@ -420,7 +420,7 @@ def drop_lfp_outputs(nwb_path):
     Drops ``acquisition/lfp`` and ``processing/sleep/{session_info, awakeness,
     emg_rms, theta_delta_ratio}``. Scorings, sleep_channels, EMG, motion,
     behaviour and units are untouched. HDF5 does not give the freed space back
-    (``h5repack`` does). Returns the names removed.
+    (run ``src/nwb/compact_nwb.py`` for that). Returns the names removed.
     """
     import h5py
 
