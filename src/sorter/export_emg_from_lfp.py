@@ -57,9 +57,10 @@ def find_raw_dats(input_folder):
 
 def find_rec_files(input_folder):
     """Trodes .rec files, chronological. Read lazily via SpikeInterface, so no
-    ``trodesexport -raw`` extraction is needed."""
-    base = Path(input_folder)
-    return sorted(base.glob("**/*.rec"), key=lambda f: f.name)
+    ``trodesexport -raw`` extraction is needed. (A ``<X>_merged.rec`` replaces
+    its ``<X>.rec``.)"""
+    from trodes_rec import find_rec_files as _find
+    return _find(input_folder, recursive=True)
 
 
 def spread_channels(n_channels, n_pick=N_PICK, ch_per_tetrode=CH_PER_TETRODE):

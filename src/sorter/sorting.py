@@ -310,9 +310,9 @@ import argparse
 # Ensure the Trodes extractor is available
 try:
     from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
-    from trodes_rec import find_rec_files, open_rec
 except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
+from trodes_rec import find_rec_files, open_rec  # noqa: E402  (.rec reader; needed for step 7)
 
 
 # Post-sorting analysis (analyzer, metrics, quality-check labels, Phy export)
