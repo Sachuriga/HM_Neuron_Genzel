@@ -139,6 +139,15 @@ def run_auto_curation(sorting, recording, n_jobs=4):
     job_kwargs = {"n_jobs": n_jobs, "progress_bar": True}
     n_start = sorting.get_num_units()
 
+    # 0. Make the unit ids plain signed integers.
+    #    SpikeInterface 0.105's run_sorter_by_property returns UNSIGNED ids
+    #    (uint64), and remove_redundant_units refuses them ("unit_ids dtype which
+    #    are not 'i' or 'U'"). Its failure is caught below, so the redundant
+    #    units were silently kept. int64 holds the same numbers and works with
+    #    every version.
+    if sorting.unit_ids.dtype.kind == "u":
+        sorting = sorting.rename_units(sorting.unit_ids.astype("int64"))
+
     # 1. Remove duplicated spikes (operates on the Sorting; cheap, no analyzer).
     try:
         sorting = remove_duplicated_spikes(sorting, censored_period_ms=0.3, method="keep_first")
