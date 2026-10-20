@@ -24,7 +24,7 @@ A batch-processing pipeline for rat hexmaze neuroscience experiments — from ra
 6. [Resource Monitoring](#resource-monitoring)
 7. [Environment Variables — Full Reference](#environment-variables--full-reference)
 8. [Pipeline Steps — Detailed Reference](#pipeline-steps--detailed-reference)
-   - [Step 1 — Trodes DIO/Raw/Analog Export](#step-1--trodes-diorawanalog-export)
+   - [Step 1 — Trodes DIO/Analog Export](#step-1--trodes-dioanalog-export)
    - [Step e — Trodes LFP + Analog Export](#step-e--trodes-lfp--analog-export)
    - [Step 2 — LED Sync (ICA)](#step-2--led-sync-ica)
    - [Step 3 — Multi-Camera Stitching](#step-3--multi-camera-stitching)
@@ -73,7 +73,7 @@ The pipeline takes raw Trodes recordings (`.rec`) and 12-camera hexmaze video, a
 **Ephys tier**
 
 - Spike sorting (MountainSort5 default / MountainSort4) via SpikeInterface, per tetrode, with automated good/mua/noise labels and Phy export for manual curation
-- LFP extraction (1500 Hz, all 128 channels from the raw export), headstage IMU motion, sleep-scoring aids (EMG channel, awakeness index, Buzsáki EMG-from-LFP)
+- LFP extraction (1500 Hz, all 128 channels straight from the `.rec`), headstage IMU motion, sleep-scoring aids (EMG channel, awakeness index, Buzsáki EMG-from-LFP)
 
 **Integration / analysis tier (NWB)**
 
@@ -148,7 +148,7 @@ Dependencies live in `pyproject.toml` (extras `[gpu]` / `[mac]`); installing als
 
 | Tool | Purpose |
 |---|---|
-| [Trodes](https://spikegadgets.com/trodes/) (`trodesexport`, `exportLFP`) | `.rec` export: DIO, raw, analog, LFP |
+| [Trodes](https://spikegadgets.com/trodes/) (`trodesexport`, `exportLFP`) | `.rec` export: DIO, analog, LFP |
 | [FFmpeg](https://ffmpeg.org/) (+ffprobe) | Stitching, compression, drive-scan video checks |
 | YOLOv11 weights (`.pt`) | Tracker detection model — see [Model](#model) |
 | [Phy](https://github.com/cortex-lab/phy) | Manual spike-sorting curation (between steps 7/c and r) |
@@ -234,7 +234,7 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 | After manual curation | `uvbm` |
 | Retrack | `346d` |
 | Full pipeline | `1e234567c89uvnbmt` |
-| Trodes export (DIO/raw/analog + LFP) | `1e` |
+| Trodes export (DIO/analog + LFP) | `1e` |
 | Sync + stitch + track | `234` |
 | Spike sorting (+ continue) | `7c` |
 | LFP + motion + EMG (sleep) | `e8` |
@@ -254,7 +254,7 @@ scripts\runner_windows.bat "C:\path\to\data_root"
 The interactive menu:
 
 ```text
-[1] Trodes Export (DIO/Raw/Analog)
+[1] Trodes Export (DIO/Analog)
 [e] Trodes Export LFP + Analog (per channel)
 [2] Sync Script
 [3] Stitching
@@ -341,15 +341,17 @@ Sorter keys (`SORTER`, `FREQ_MIN/MAX`, `DETECT_*`, `BAD_CHANNELS_<RAT>`, `REF_CH
 
 ## Pipeline Steps — Detailed Reference
 
-### Step 1 — Trodes DIO/Raw/Analog Export
+### Step 1 — Trodes DIO/Analog Export
 
 **Script:** `trodesexport` (external). Per `.rec` in `ip`:
 
 ```bash
-trodesexport -dio -raw -analogio -rec <file.rec>
+trodesexport -dio -analogio -rec <file.rec>
 ```
 
-Exports DIO TTL events (LED sync pulses), raw 30 kHz voltage `.dat` per channel group, and analog (headstage IMU) channels — into subfolders next to the `.rec` (`<stem>.DIO/`, `<stem>.raw/`, …). Required before steps 2 (sync), 7 (sorting) and the step-8 raw fallback. Skipped with a warning if the binary path doesn't resolve.
+Exports DIO TTL events (LED sync pulses) and analog (headstage IMU) channels — into subfolders next to the `.rec` (`<stem>.DIO/`, `<stem>.analog/`, …). Required before step 2 (sync). Skipped with a warning if the binary path doesn't resolve.
+
+There is no `-raw` export any more: steps 7 (sorting) and 8 (all-channel LFP, EMG fallback) read the 30 kHz wideband lazily from the `.rec` via SpikeInterface (`src/sorter/trodes_rec.py`, neo ≥ 0.14.5), which saves a second full copy of the data (~27 GiB per recording hour). The reader reproduces `trodesexport -raw` sample for sample: it fixes the Intan chip-interleaved channel order (our headers say `chanPerChip="0"`, so neo alone mislabels the channels) and subtracts the `rawRef` channel as the export did. Old sessions that still have `<stem>.raw/` but no `.rec` keep working. Check a session with `python src/sorter/trodes_rec.py <file.rec> <file.raw_group0.dat>`.
 
 ### Step e — Trodes LFP + Analog Export
 
@@ -446,7 +448,7 @@ Master-level, **always last**, over every top-level `.mp4` in every `op*` folder
 python src/sorter/sorting.py --input_folder <ip> --output_folder <op> --config <hm_tracker_paths.txt>
 ```
 
-1. **Discovery** — `**/*.raw/*_group0.dat` under ip. **Split-recording grouping:** files sharing (rat, date, phase) — phase from the `.raw` folder name (`pre` / `maze|mazs|awake|hab` / `post`) — are one job: parts ordered by acquisition time and lazily concatenated, so a crash-restarted phase sorts as one continuous recording.
+1. **Discovery** — `**/*.rec` under ip, read lazily via `trodes_rec.open_rec` (plus old `**/*.raw/*_group0.dat` exports whose `.rec` is gone). **Split-recording grouping:** files sharing (rat, date, phase) — phase from the recording name (`pre` / `maze|mazs|awake|hab` / `post`) — are one job: parts ordered by acquisition time and lazily concatenated, so a crash-restarted phase sorts as one continuous recording.
 2. **Loading** — file-backed (memmap layout via `trodesBinaryLayout()`), never into RAM; fs 30 kHz, gain **0.195 µV/bit**.
 3. **Probe** — 8×4 tetrode grid (32 tetrodes × 4 = 128 channels), 250 µm spacing, ±10 µm diamond contacts, `group` per tetrode.
 4. **Preprocessing** — drop `EEG_TETRODES_<RAT>` channels → bandpass `FREQ_MIN`–`FREQ_MAX` (600–8000) → interpolate `BAD_CHANNELS_<RAT>` (50 µm) → optional `REF_CHANNEL_<RAT>` single-reference → global-median CAR → saved to `processed_binary/`. No manual whitening (the sorter whitens itself).
@@ -486,7 +488,7 @@ python src/sorter/export_emg_from_lfp.py --input_folder <ip> --output_folder <op
 python src/sorter/export_motion.py       --input_folder <ip> --output_folder <op>
 ```
 
-**`export_lfp.py`** — builds the LFP for **every channel (128)** from step 1's raw export `<recording>.raw/*_group0.dat`: × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a raw export it falls back to step e's `<recording>.LFP/*.dat`, which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
+**`export_lfp.py`** — builds the LFP for **every channel (128)** from the 30 kHz wideband in `<recording>.rec` (`trodes_rec.open_rec`; an old `<recording>.raw/*_group0.dat` is used if there is no `.rec`): × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a `.rec` or raw export it falls back to step e's `<recording>.LFP/*.dat`, which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
 
 The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV, gzip, chunks of 50 s × 1 tetrode); `processing/sleep/session_info` holds the `channel_map` (column → nTrode/channel). Re-running on a session whose NWB holds an LFP with a different channel count replaces it (plus `session_info` and the awakeness signals). The `.npy` below are written only with `--keep-npy` / `KEEP_NPY=1`:
 
@@ -502,7 +504,7 @@ The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV,
 | `{pfx}cleanest_channel_indices.npy` / `{pfx}channel_snr_scores.npy` | top-3 sleep-band-SNR channels |
 | `{pfx}awakeness.npy`, `{pfx}emg_rms.npy`, `{pfx}theta_delta_ratio.npy` | per-sample awakeness index (0.6·zEMG + 0.4·zθ/δ) |
 
-**`export_emg_from_lfp.py`** — Buzsáki EMG-from-LFP (300–600 Hz band-pass, sliding ±0.2 s mean pairwise cross-channel correlation): `{pfx}emg_from_lfp_5hz.npy` (+timestamps), `{pfx}emg_from_lfp.npy` upsampled onto the LFP time axis. Falls back to raw 30 kHz `.dat` / `.rec` if the LFP export is missing or too low-rate.
+**`export_emg_from_lfp.py`** — Buzsáki EMG-from-LFP (300–600 Hz band-pass, sliding ±0.2 s mean pairwise cross-channel correlation): `{pfx}emg_from_lfp_5hz.npy` (+timestamps), `{pfx}emg_from_lfp.npy` upsampled onto the LFP time axis. Falls back to the 30 kHz `.rec` (or an old raw `.dat`) if the LFP export is missing or too low-rate.
 
 **`export_motion.py`** — headstage IMU `AccelX/Y/Z` from `.analog` folders, resampled to 1500 Hz: `{pfx}motion.npy`, `{pfx}motion_timestamps.npy`, `{pfx}motion_accel.npy` (movement envelope, TheStateEditor port), `{pfx}motion_session_boundaries.npy`.
 

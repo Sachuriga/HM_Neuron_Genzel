@@ -20,7 +20,7 @@ dependencies = ["PyQt6", "pyqtgraph", "psutil"]
 mac = [
     "numpy<2", "scipy", "pandas", "matplotlib", "scikit-learn",
     "opencv-python", "networkx", "openpyxl", "tqdm",
-    "spikeinterface", "pynwb", "colorama", "python-dateutil",
+    "spikeinterface>=0.104.8", "neo>=0.14.5", "pynwb", "colorama", "python-dateutil",
 ]
 # Full GPU pipeline (Linux/Windows, CUDA 12.8). torch==*+cu128 needs the
 # PyTorch index — pass it on the pip command line:
@@ -32,8 +32,12 @@ gpu = [
     # own torch — reconcile with the torch==2.10.0+cu128 pin above for your DLC
     # version before installing (see README "Step p").
     "deeplabcut",
-    "spikeinterface[full]", "kilosort", "neuroconv", "ephyviewer",
-    "probeinterface", "pynwb", "neo", "numba", "mountainsort4",
+    "spikeinterface[full]>=0.104.8", "kilosort", "neuroconv", "ephyviewer",
+    # neo>=0.14.5: read_spikegadgets knows the Intan chip-interleaved .rec layout. Our HH128
+    # headers say chanPerChip="0", so neo still mislabels channels -- remap
+    # slot = (hw % 32) * 4 + hw // 32 yourself and subtract the rawRef channel to
+    # match trodesexport -raw (verified bit-exact vs _group0.dat, Rat5 20260720).
+    "probeinterface>=0.3.2", "pynwb", "neo>=0.14.5", "numba", "mountainsort4",
     # NOTE: mountainsort4 needs isosplit5, a C++ extension. On Windows you MUST
     # install "Microsoft C++ Build Tools" (Desktop development with C++) first,
     # or the isosplit5 wheel build fails with "Microsoft Visual C++ 14.0 required".

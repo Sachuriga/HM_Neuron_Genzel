@@ -1,13 +1,17 @@
-"""All-channel LFP from the step-1 raw export (``*.raw/*_group0.dat``).
+"""All-channel LFP from the wideband ``.rec`` (or an old ``*.raw/*_group0.dat``).
 
 Trodes ``exportLFP`` writes ONE channel per nTrode (the workspace's LFP channel),
 so step e gives 32 of the 128 channels. This builds the LFP for every channel
-straight from the 30 kHz raw export instead, mirroring exportLFP's settings:
+straight from the 30 kHz wideband instead, mirroring exportLFP's settings:
 
     int16 x 0.195 uV -> low-pass 700 Hz (zero-phase Butterworth) -> keep every
     20th sample (30 kHz -> 1500 Hz)
 
 The filter runs forward-backward, so theta/gamma phases are not shifted.
+
+The wideband is read from the ``.rec`` itself (``trodes_rec.open_rec``, the same
+samples ``trodesexport -raw`` writes), so step 1 no longer has to make the raw
+export. Folders that still have ``<recording>.raw/`` but no ``.rec`` use that.
 
 Column ``k`` of the result is hardware channel ``k`` of the raw export — the
 same id the sorter and ``sorting.nt_to_channel`` use, i.e. nTrode ``k//4 + 1``,
@@ -33,32 +37,38 @@ CH_PER_TETRODE = 4
 
 
 def find_raw_sessions(input_folder):
-    """``[{'name', 'file'}]`` for every ``<recording>.raw/*_group0.dat``.
+    """``[{'name', 'file'}]`` for every recording's 30 kHz wideband source.
 
-    One raw folder per .rec, named like the ``<recording>.LFP`` folder exportLFP
-    makes, so ``name`` (and thus session_boundaries) is the same either way.
-    Sorted by name == chronological (the Trodes name embeds YYYYMMDD_HHMMSS).
+    The ``<recording>.rec`` itself, else (for folders exported before step 1
+    dropped ``-raw``) its ``<recording>.raw/*_group0.dat``. ``name`` is the
+    recording name either way — the same as the ``<recording>.LFP`` folder
+    exportLFP makes, so session_boundaries match. Sorted by name ==
+    chronological (the Trodes name embeds YYYYMMDD_HHMMSS).
     """
+    from trodes_rec import find_rec_files
+
     base = Path(input_folder)
-    sessions = []
-    for d in sorted((d for d in base.glob("*.raw") if d.is_dir()),
-                    key=lambda d: d.name):
+    by_name = {f.stem: f for f in find_rec_files(base)}
+    for d in (d for d in base.glob("*.raw") if d.is_dir()):
         dats = sorted(f for f in d.glob("*_group0.dat")
                       if not f.name.startswith("._"))
-        if dats:
-            sessions.append({"name": d.stem, "file": dats[0]})
-    return sessions
+        if dats and d.stem not in by_name:
+            by_name[d.stem] = dats[0]
+    return [{"name": k, "file": by_name[k]} for k in sorted(by_name)]
 
 
-def _open_raw(dat_file):
-    """A file-backed SpikeInterface recording of one raw .dat (never loaded)."""
+def _open_raw(src):
+    """A file-backed SpikeInterface recording of one .rec / raw .dat (never loaded)."""
     import spikeinterface.full as si
     from readTrodesExtractedDataFile3 import trodesBinaryLayout
 
-    lay = trodesBinaryLayout(str(dat_file))
+    if src.suffix.lower() == ".rec":
+        from trodes_rec import open_rec
+        return open_rec(src)
+    lay = trodesBinaryLayout(str(src))
     if lay is None:
-        raise RuntimeError(f"{dat_file.name}: not a plain interleaved raw export")
-    return si.read_binary(str(dat_file), sampling_frequency=RAW_FS,
+        raise RuntimeError(f"{src.name}: not a plain interleaved raw export")
+    return si.read_binary(str(src), sampling_frequency=RAW_FS,
                           dtype=lay["dtype"], num_channels=lay["n_channels"],
                           file_offset=lay["offset"], time_axis=0)
 

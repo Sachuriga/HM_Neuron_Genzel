@@ -310,6 +310,7 @@ import argparse
 # Ensure the Trodes extractor is available
 try:
     from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
+    from trodes_rec import find_rec_files, open_rec
 except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 
@@ -340,8 +341,10 @@ _RAT_ID_RE = re.compile(r"[Rr]at\s*_?(\d+)")
 
 
 def _recording_name(dat_file):
-    """The Trodes recording name for a *_group0.dat, taken from its .raw parent
-    folder (e.g. 'Rat5_..._090955_post.raw' -> 'Rat5_..._090955_post')."""
+    """The Trodes recording name for a .rec (its stem) or a *_group0.dat (its .raw
+    parent folder, e.g. 'Rat5_..._090955_post.raw' -> 'Rat5_..._090955_post')."""
+    if Path(dat_file).suffix.lower() == ".rec":
+        return Path(dat_file).stem
     parent = Path(dat_file).parent.name
     return parent[:-4] if parent.lower().endswith(".raw") else Path(dat_file).stem
 
@@ -406,7 +409,10 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # concatenate in time. Parts are pre-ordered by the caller (acquisition time).
     paths = [Path(p) for p in (file_path if isinstance(file_path, (list, tuple)) else [file_path])]
     file_path_obj = paths[0]
-    file_stem = file_path_obj.stem
+    # A .rec gets the stem its raw export had ('<recording>.raw_group0'), so the
+    # output folder name is the same whichever source a session was sorted from.
+    file_stem = (f"{file_path_obj.stem}.raw_group0" if file_path_obj.suffix.lower() == ".rec"
+                 else file_path_obj.stem)
 
     # Resolve numeric sorting settings (band-pass cutoffs, detection params),
     # falling back to the built-in defaults for anything not supplied.
@@ -441,14 +447,20 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # memmap. NumpyRecording keeps the array in its _kwargs, and SpikeInterface
     # clones a recording (set_probe, preprocessing, ...) with deepcopy of those
     # kwargs — which reads the whole memmap back into memory. BinaryRecording
-    # stores only the path and offset, so cloning stays free.
+    # stores only the path and offset, so cloning stays free. A .rec is read the
+    # same lazy way by trodes_rec.open_rec (identical samples to the raw export).
     print("Opening data..." if len(paths) == 1
           else f"Opening {len(paths)} split parts of this phase:")
-    layouts = [trodesBinaryLayout(str(p)) for p in paths]
+    layouts = [None if p.suffix.lower() == ".rec" else trodesBinaryLayout(str(p))
+               for p in paths]
 
     recs = []
     for p, lay in zip(paths, layouts):
-        if lay is None:
+        if p.suffix.lower() == ".rec":
+            r = open_rec(p)
+            n_samp, n_ch = r.get_num_samples(), r.get_num_channels()
+            recs.append(r)
+        elif lay is None:
             # Unexpected record layout: fall back to the structured reader. Costly
             # in memory, but correct for files this code cannot map flatly.
             v = readTrodesExtractedDataFile(str(p), memmap=True)['data']['voltage']
@@ -460,7 +472,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
                 str(p), sampling_frequency=fs, dtype=lay['dtype'],
                 num_channels=n_ch, file_offset=lay['offset'], time_axis=0))
         if len(paths) > 1:
-            print(f"  + {p.parent.name}  ({n_samp} samples)")
+            print(f"  + {_recording_name(p)}  ({n_samp} samples)")
 
     total_samples = sum(r.get_num_samples() for r in recs)
     n_ch = recs[0].get_num_channels()
@@ -621,8 +633,9 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
 
 def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None):
     """
-    Scans the base_data_folder for .dat files inside .raw folders
-    and processes each one, outputting strictly to output_data_folder.
+    Scans the base_data_folder for .rec files (read directly, no raw export
+    needed) — plus, for recordings whose .rec is gone, old *.raw/*_group0.dat
+    exports — and processes each one, outputting strictly to output_data_folder.
 
     `config` is the dict returned by load_sorting_config(); per-recording bad
     channels and reference channels are resolved from it by file stem.
@@ -637,10 +650,13 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     # Ensure the main output directory exists
     output_path.mkdir(parents=True, exist_ok=True)
 
-    dat_files = list(base_path.glob("**/*.raw/*_group0.dat"))
+    rec_files = find_rec_files(base_path, recursive=True)
+    have_rec = {_recording_name(f) for f in rec_files}
+    dat_files = rec_files + [f for f in base_path.glob("**/*.raw/*_group0.dat")
+                             if _recording_name(f) not in have_rec]
 
     if not dat_files:
-        print(f"No .dat files found inside .raw folders under '{base_data_folder}'.")
+        print(f"No .rec files (or *.raw/*_group0.dat exports) found under '{base_data_folder}'.")
         return
 
     # Split parts of the same phase (..._post + ..._post2) are concatenated and
@@ -652,8 +668,9 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
 
     for i, group in enumerate(groups, 1):
         first = group[0]
-        label = (first.parent.name if len(group) == 1
-                 else f"{first.parent.name}  (+{len(group) - 1} split part(s), concatenated)")
+        name = _recording_name(first)
+        label = (name if len(group) == 1
+                 else f"{name}  (+{len(group) - 1} split part(s), concatenated)")
         print(f"\n{'='*60}")
         print(f"Job {i}/{len(groups)}: {label}")
         print(f"{'='*60}")
@@ -685,7 +702,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tracker Headless Mode")
 
     # Input and Output arguments
-    parser.add_argument('--input_folder', required=True, help="Folder containing .raw folders")
+    parser.add_argument('--input_folder', required=True,
+                        help="Folder containing .rec files (or old .raw export folders)")
     parser.add_argument('--output_folder', required=True, help="Folder to store all outputs and Phy exports")
     parser.add_argument('--config', default=None,
                         help="Path to hm_tracker_paths.txt for per-rat bad/ref channel settings. "

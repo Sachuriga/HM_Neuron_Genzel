@@ -35,7 +35,7 @@ STEP_LABEL = {
 # glob(s) whose presence marks a step done. A folder pattern counts only when the
 # folder exists AND holds at least one file (an empty LFP_Output is not "done").
 STEP_SIGNATURES = {
-    "1": ["*.DIO", "*.raw"],                 # Trodes DIO/raw/analog export
+    "1": ["*.DIO", "*.raw"],                 # Trodes DIO/analog export (*.raw: before -raw was dropped)
     "e": ["*.LFP"],                          # Trodes LFP export
     "4": ["*_Coordinates_Full.csv"],         # Tracker
     "5": ["*_analysis_final.pdf"],           # Plotting

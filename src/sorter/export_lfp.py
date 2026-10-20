@@ -505,7 +505,8 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
 
 def run_pipeline(input_folder, output_folder, output_rate=None, config_path=None,
                  keep_npy=False, source="auto"):
-    """``source``: ``raw`` = every channel from the step-1 raw export, ``export``
+    """``source``: ``raw`` = every channel from the wideband (.rec, or an old
+    *.raw/ export), ``export``
     = exportLFP's one-channel-per-nTrode .dat, ``auto`` = raw when present."""
     scratch = []                # the all-channel LFP .npy, when it is only scratch
     try:
@@ -544,17 +545,18 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
         tqdm.write(f"▶  Input: {base_path}")
         tqdm.write("Step 1/6 — Finding the LFP source")
 
-        # Every channel comes from the step-1 raw export; exportLFP's .LFP
+        # Every channel comes from the 30 kHz wideband (.rec, else an old
+        # *.raw/ export); exportLFP's .LFP
         # folders hold only one channel per nTrode, so they are the fallback.
         raw_sessions = find_raw_sessions(input_folder) if source != "export" else []
         sessions = [] if raw_sessions else find_lfp_sessions(input_folder)
         if source == "raw" and not raw_sessions:
-            tqdm.write("❌  No raw export found (<recording>.raw/*_group0.dat). "
-                       "Run step 1 first.")
+            tqdm.write("❌  No wideband found (<recording>.rec or "
+                       "<recording>.raw/*_group0.dat).")
             return
         if not raw_sessions and not sessions:
             tqdm.write("❌  No LFP source found! Check your input folder.")
-            tqdm.write("    Expected: <recording>.raw/*_group0.dat (step 1), or")
+            tqdm.write("    Expected: <recording>.rec (or an old <recording>.raw/), or")
             tqdm.write("              <recording>.LFP/<recording>.LFP_nt*ch*.dat (step e)")
             return
         session_name = (raw_sessions or sessions)[0]['name']
@@ -564,8 +566,10 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
 
         # ── 2. ASSEMBLE THE (n_samples, n_channels) LFP MATRIX ──────────────
         if raw_sessions:
-            tqdm.write(f"Step 2/6 — All-channel LFP from {len(raw_sessions)} raw "
-                       f"export(s)")
+            n_rec = sum(s['file'].suffix.lower() == '.rec' for s in raw_sessions)
+            tqdm.write(f"Step 2/6 — All-channel LFP from {len(raw_sessions)} "
+                       f"recording(s) ({n_rec} .rec, "
+                       f"{len(raw_sessions) - n_rec} raw export)")
             # Built on disk and memory-mapped. With --keep-npy the file IS
             # lfp_data.npy; otherwise it is scratch, deleted once in the NWB.
             lfp_npy = (output_dir / f"{pfx}lfp_data.npy" if keep_npy
@@ -579,7 +583,7 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
             if keep_npy:
                 _save_channel_npys(lfp_array, ch_info_list, output_dir / "channels_npy", pfx)
         else:
-            tqdm.write("  ⚠ No raw export (<recording>.raw/) — falling back to the "
+            tqdm.write("  ⚠ No .rec / raw export — falling back to the "
                        "exportLFP .dat, which has ONE channel per nTrode.")
             total_files = sum(len(s['lfp_files']) for s in sessions)
             tqdm.write(f"  Found {len(sessions)} session(s), "
@@ -745,7 +749,7 @@ if __name__ == "__main__":
         description="Convert Trodes-exported LFP .dat files to .npy and compute awakeness."
     )
     parser.add_argument('--input_folder',  required=True,
-                        help="Recording folder: step-1 raw export (*.raw/) and/or "
+                        help="Recording folder: *.rec (or an old *.raw/ export) and/or "
                              "exportLFP output (*.LFP/*.dat)")
     parser.add_argument('--output_folder', required=True,
                         help="Destination for all output files.")
@@ -756,8 +760,8 @@ if __name__ == "__main__":
                         help="hm_tracker_paths.txt for per-rat SLEEP_CHANNELS_<rat> "
                              "(cortex/sr/pyr tetrodes). Default ~/Desktop/hm_tracker_paths.txt.")
     parser.add_argument('--source', choices=('auto', 'raw', 'export'), default='auto',
-                        help="LFP source: 'raw' = all channels from the step-1 raw "
-                             "export (*.raw/*_group0.dat), 'export' = exportLFP's "
+                        help="LFP source: 'raw' = all channels from the wideband "
+                             "(*.rec, else *.raw/*_group0.dat), 'export' = exportLFP's "
                              "one channel per nTrode (*.LFP/), 'auto' = raw when "
                              "present (default).")
     parser.add_argument('--keep-npy', dest='keep_npy', action='store_true',

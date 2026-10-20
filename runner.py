@@ -52,7 +52,7 @@ PYTHON = sys.executable  # run child python steps with the same interpreter
 # parallel per-folder worker or sequentially at master level is decided by
 # SEQUENTIAL_STEPS below — everything else is a parallel worker step.
 MENU = [
-    ("1", "Trodes Export (DIO/Raw/Analog)"),
+    ("1", "Trodes Export (DIO/Analog)"),
     ("e", "Trodes Export LFP + Analog (per channel)"),
     ("2", "Sync Script"),
     ("3", "Stitching"),
@@ -322,16 +322,18 @@ def run_worker(ip, op, steps, out):
     sync_led = os.environ.get("SYNC_LED", "auto")        # auto|red|blue (which LED drives sync)
     recs = sorted(ip.glob("*.rec"))
 
-    # --- STEP 1: Trodes DIO/Raw/Analog export (per .rec) ---
+    # --- STEP 1: Trodes DIO/Analog export (per .rec) ---
+    #  No -raw: steps 7 and 8 read the wideband straight from the .rec
+    #  (src/sorter/trodes_rec.py), so the ~27 GiB/h raw copy is not written.
     if "1" in steps:
-        log(out, "[STEP 1] Running Trodes DIO/Raw/Analog Export (per .rec)...")
+        log(out, "[STEP 1] Running Trodes DIO/Analog Export (per .rec)...")
         trodes = _tool("TRODES_EXPORT_CMD")
         if trodes:
             if not recs:
                 log(out, f"[WARNING] No .rec files found in '{ip}'")
             for f in recs:
                 log(out, f"    Exporting {f.name}")
-                run([trodes, "-dio", "-raw", "-analogio", "-rec", f], out=out)
+                run([trodes, "-dio", "-analogio", "-rec", f], out=out)
         else:
             log(out, f"[WARNING] trodesexport not found at: {os.environ.get('TRODES_EXPORT_CMD','')}")
 
@@ -389,8 +391,8 @@ def run_worker(ip, op, steps, out):
     # --- STEP 8: LFP + Motion/IMU extraction ---
     if "8" in steps:
         # Per-sample data goes into the session NWB. The LFP is built for ALL
-        # channels from step 1's raw export (*.raw/*_group0.dat); without it, it
-        # falls back to step e's exportLFP (one channel per nTrode). KEEP_NPY=1 in
+        # channels straight from the .rec (or an old *.raw/*_group0.dat); without
+        # either, it falls back to step e's exportLFP (one channel per nTrode). KEEP_NPY=1 in
         # hm_tracker_paths.txt also writes the old LFP_Output/*.npy alongside it.
         keep_npy = ["--keep-npy"] if _flag_env("KEEP_NPY", "HM_KEEP_NPY") else []
         lfp_rate = _str_env("LFP_OUTPUT_RATE", default="1500")
@@ -400,7 +402,7 @@ def run_worker(ip, op, steps, out):
                  "--input_folder", ip, "--output_folder", op,
                  "--output_rate", lfp_rate] + keep_npy, out=out)
         # EMG-from-LFP needs the raw wideband (300-600 Hz); runs after the LFP
-        # export so it can upsample onto lfp_timestamps.npy. Needs step 1 (-raw).
+        # export so it can upsample onto lfp_timestamps.npy. Reads the .rec.
         if Path("./src/sorter/export_emg_from_lfp.py").exists():
             log(out, "[STEP 8] Running EMG-from-LFP (raw wideband, Buzsáki)...")
             run([PYTHON, "-u", "./src/sorter/export_emg_from_lfp.py",

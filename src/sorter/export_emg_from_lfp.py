@@ -10,8 +10,8 @@ PRIMARY — from the 1500 Hz LFP export (``<output>/LFP_Output/``):
       -> band-pass 300–600 Hz -> cross-channel correlation EMG   (numpy/scipy)
 
 FALLBACK — raw wideband via SpikeInterface (only when the LFP band is missing,
-e.g. an old ``-lfplowpass 500`` export): read ``*.raw/*_group0.dat`` or the
-``.rec`` directly, select spread/EEG channels, band-pass 300–600, decimate,
+e.g. an old ``-lfplowpass 500`` export): read the ``.rec`` directly (or an old
+``*.raw/*_group0.dat``), select spread/EEG channels, band-pass 300–600, decimate,
 correlate. (Runs in the SpikeInterface env, HM_neuron.)
 
 Output (in ``<output>/LFP_Output/``):
@@ -424,8 +424,12 @@ def emg_for_recording(dat_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
 
 def emg_for_rec_file(rec_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
                      channels=None):
-    """EMG-from-LFP for a Trodes ``.rec`` read lazily (no raw extraction needed)."""
-    rec = se.read_spikegadgets(str(rec_file))
+    """EMG-from-LFP for a Trodes ``.rec`` read lazily (no raw extraction needed).
+
+    ``open_rec`` puts the channels in the raw export's order (neo alone mislabels
+    them on our chanPerChip="0" headers), so EEG channel ids mean the same here."""
+    from trodes_rec import open_rec
+    rec = open_rec(rec_file)
     return emg_from_recording(rec, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick,
                               channels=channels)
 
@@ -453,10 +457,10 @@ def _session_stem(input_folder):
 
 def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
                   smoothed, timestamps, boundaries):
-    """Fallback: EMG from raw wideband (extracted .dat, else .rec via SI)."""
-    dats = find_raw_dats(input_folder)
-    sources = [(d, "dat") for d in dats] if dats else \
-        [(r, "rec") for r in find_rec_files(input_folder)]
+    """Fallback: EMG from raw wideband (.rec via SI, else an old extracted .dat)."""
+    recs = find_rec_files(input_folder)
+    sources = [(r, "rec") for r in recs] if recs else \
+        [(d, "dat") for d in find_raw_dats(input_folder)]
     offset_s = 0.0
     for src, kind in sources:
         print(f"  • {src.name}")
