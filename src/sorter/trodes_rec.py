@@ -106,11 +106,16 @@ class TrodesRawRecording(BasePreprocessor):
     ``gap_index[j]`` is the packet after which ``gap_missing[j]`` samples are
     inserted. Matches trodesexport -raw bit for bit:
 
+    * a raw -32768 (Trodes' "no sample") is taken as 0, with or without ref;
     * real samples: ``x - x[ref]`` in int32, saturated to int16 (a big
-      channel-ref difference is clipped, not wrapped around). A raw -32768
-      (channel or ref) is taken as 0 first, as Trodes does;
-    * inserted:     linear between the referenced (unclipped) neighbours,
-      rounded half to even, saturated to int16.
+      channel-ref difference is clipped, not wrapped around);
+    * inserted:     from the referenced (unclipped) neighbours L, R, a float32
+      ``v = L; v += (R - v) / (m + 1 - k)`` per sample k, rounded half to
+      even, saturated to int16. (Linear in exact arithmetic; the float32 steps
+      decide the ties.)
+
+    Checked on real gaps of 1-2 packets and on synthetic gaps of 1-100
+    packets (packets cut out of a real .rec, then exported by trodesexport).
     """
 
     def __init__(self, recording, ref_col=None, gap_index=(), gap_missing=()):
@@ -161,15 +166,25 @@ class TrodesRawSegment(BasePreprocessorSegment):
             src = o
         lo, hi = int(src[0]), int(src[-1]) + 1 + int(ins[-1])
         x = self.parent_recording_segment.get_traces(lo, hi, slice(None)).astype(np.int32)
+        x[x == -32768] = 0               # Trodes' "no sample" value counts as 0
         if self.ref_col is not None:
-            x[x == -32768] = 0           # Trodes' "no sample" value counts as 0
             x -= x[:, [self.ref_col]]
         out = x[src - lo]
         if ins.any():
-            left = out[ins].astype(np.float64)
-            right = x[src[ins] + 1 - lo]
-            frac = (off[ins] / (m[ins] + 1))[:, None]
-            out[ins] = np.round(left + (right - left) * frac)
+            # Per gap, Trodes steps a float32 value from L towards R, re-aiming
+            # at R each time: v += (R - v) / (samples left + 1).
+            rows = np.flatnonzero(ins)
+            for gp in np.unique(src[rows]):
+                sel = rows[src[rows] == gp]
+                mm = int(m[sel[0]])
+                L = x[gp - lo].astype(np.float32)
+                R = x[gp + 1 - lo].astype(np.float32)
+                seq = np.empty((mm, L.size), dtype=np.float32)
+                v = L
+                for k in range(mm):
+                    v = (v + (R - v) / np.float32(mm + 1 - k)).astype(np.float32)
+                    seq[k] = v
+                out[sel] = np.round(seq[off[sel] - 1].astype(np.float64))
         out = np.clip(out, -32768, 32767).astype(np.int16)   # saturates, like Trodes
         return out if channel_indices is None else out[:, channel_indices]
 
@@ -253,8 +268,6 @@ def open_rec(rec_file, apply_raw_ref=True, interp=TRODES_INTERP):
             trode = next(t for t in trodes if t.attrib["id"] == ref_trode)
             ref_col = hw.index(int(list(trode)[int(ref_chan) - 1].attrib["hwChan"]))
 
-    if ref_col is None and not fill:
-        return rec
     return TrodesRawRecording(rec, ref_col=ref_col,
                               gap_index=[g for g, _ in fill],
                               gap_missing=[m for _, m in fill])
