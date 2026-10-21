@@ -25,7 +25,8 @@ each computed in three splits — GOAL-RUNNING (type-1 trial windows), FREE-ROAM
 
 Theta comes from the session LFP — the session NWB's acquisition/lfp (step 8),
 or the legacy <op>/LFP_Output/*.npy export for older sessions: the channel
-with the highest theta/delta power ratio during a movement-rich block is
+with the highest theta/delta power ratio during a movement-rich block (never
+one of the rat's BAD_CHANNELS from the tracker config) is
 band-passed 6-10 Hz and Hilbert-transformed. Phase convention: 0 deg = peak of
 filtered theta, +-180 deg = trough. LFP sample 0 of the MAZE session aligns with
 spike time 0 (verified: pooled spike-phase locking collapses when the LFP is
@@ -195,6 +196,8 @@ def build_events(x, y, t, trials, nodes):
 #   boundaries   [{'name': recording name, 'start': first sample}, ...], one per
 #                concatenated recording, or None when unknown
 #   channel_map  [{'ntrode': .., 'channel': ..}, ...] one per column, or None
+#   name         session name starting with the rat ('Rat5_...'), to find the
+#                rat's settings in the tracker config
 #   read_column  function(col) -> that whole column as float64
 #   close        function() that releases the file
 #   origin       short text for the log
@@ -245,6 +248,7 @@ def _lfp_source_from_nwb(op_folder):
 
     return {"data": data, "fs": float(fs), "boundaries": boundaries,
             "channel_map": session_info.get("channel_map"),
+            "name": nwb_path.stem,
             "read_column": read_column, "close": io.close,
             "origin": nwb_path.name}
 
@@ -283,8 +287,53 @@ def _lfp_source_from_npy(op_folder):
         return np.asarray(data[:, col], dtype=np.float64)
 
     return {"data": data, "fs": fs, "boundaries": boundaries,
-            "channel_map": channel_map, "read_column": read_column,
+            "channel_map": channel_map, "name": pfx, "read_column": read_column,
             "close": lambda: None, "origin": "LFP_Output"}
+
+
+def _bad_columns(source, config_path):
+    """LFP columns of the rat's BAD_CHANNELS_<rat> (tracker config), so a
+    known-bad channel is never picked as the theta channel.
+
+    Empty when there is no config, no entry for the rat or no channel map.
+    """
+    if not config_path:
+        return set()
+    try:
+        # The config reader lives with the sorter. Append (never insert at 0):
+        # src/nwb's own modules, e.g. session_prefix, must keep priority.
+        sorter_dir = str(Path(__file__).resolve().parent.parent / "sorter")
+        if sorter_dir not in sys.path:
+            sys.path.append(sorter_dir)
+        from sorting import load_sorting_config, resolve_rat_settings
+        bad_hw, _ref, _eeg = resolve_rat_settings(
+            source["name"], load_sorting_config(config_path, quiet=True))
+    except Exception as e:
+        print(f"  [theta] bad channels not read from the config ({e}); "
+              f"every channel can be the theta channel.")
+        return set()
+    if not bad_hw:
+        return set()
+    if not source["channel_map"]:
+        print("  [theta] no channel map: the bad channels cannot be found in "
+              "the LFP, so none are skipped.")
+        return set()
+
+    # The config holds hardware channel ids, as the sorter uses them:
+    # hardware id = (nTrode - 1) * 4 + (channel - 1).
+    bad_hw = {int(c) for c in bad_hw}
+    cols = set()
+    for col, entry in enumerate(source["channel_map"]):
+        try:
+            hw = (int(entry["ntrode"]) - 1) * 4 + (int(entry["channel"]) - 1)
+        except (TypeError, KeyError, ValueError):
+            continue
+        if hw in bad_hw:
+            cols.add(col)
+    if cols:
+        labels = [_channel_label(source["channel_map"], c) for c in sorted(cols)]
+        print(f"  [theta] skipping the rat's bad channels {labels}")
+    return cols
 
 
 def _channel_label(channel_map, col):
@@ -313,14 +362,15 @@ def _find_npy_lfp(op_folder):
     return lo, pfxs[0]
 
 
-def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0):
+def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=None):
     """Session theta phase from the LFP, on the spike clock.
 
     The LFP is read from the session NWB (acquisition/lfp, written by step 8),
     or from the legacy LFP_Output/*.npy export when the NWB has none.
 
     Channel = the column with the highest theta/delta Welch-power ratio inside a
-    movement-rich `sel_block_s` block (found from the tracking). The maze session's
+    movement-rich `sel_block_s` block (found from the tracking), never one of the
+    rat's BAD_CHANNELS in `config` (hm_tracker_paths.txt). The maze session's
     sample 0 is spike-time 0 (session_boundaries; maze-only exports start at 0).
     Reads ONE contiguous row-block for selection, then only the chosen column
     for the full trace. Returns dict or None:
@@ -342,7 +392,8 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0):
     # 2. Compute the theta phase. The file is closed again whatever happens;
     #    everything returned is an in-memory copy.
     try:
-        return _theta_from_lfp_source(source, x, y, t, band, sel_block_s)
+        skip = _bad_columns(source, config)
+        return _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip)
     except Exception as e:
         print(f"  [theta] failed to load LFP ({e}) — phase pages skipped.")
         return None
@@ -350,8 +401,9 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0):
         source["close"]()
 
 
-def _theta_from_lfp_source(source, x, y, t, band, sel_block_s):
-    """The work behind load_theta, on an LFP source dict (see above)."""
+def _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip=()):
+    """The work behind load_theta, on an LFP source dict (see above).
+    ``skip``: LFP columns that may not be the theta channel (bad channels)."""
     ld = source["data"]
     fs = source["fs"]
 
@@ -392,12 +444,16 @@ def _theta_from_lfp_source(source, x, y, t, band, sel_block_s):
             best_v, best_t0 = v, c
     s0 = int(best_t0 * fs); s1 = min(int((best_t0 + sel_block_s) * fs), len(ld))
     block = np.asarray(ld[s0:s1, :], dtype=np.float64)   # one contiguous read
-    ratios = []
+    if len(skip) >= block.shape[1]:
+        skip = ()                      # nothing would be left: allow every channel
+    ratios = np.full(block.shape[1], -np.inf)   # -inf = never chosen
     for chn in range(block.shape[1]):
+        if chn in skip:
+            continue                   # a bad channel is never the theta channel
         f, P = welch(block[:, chn], fs=fs, nperseg=4096)
         th = P[(f >= band[0]) & (f <= band[1])].mean()
         de = P[(f >= 1) & (f <= 4)].mean()
-        ratios.append(th / de if de > 0 else 0.0)
+        ratios[chn] = th / de if de > 0 else 0.0
     best = int(np.argmax(ratios))
 
     # Read the full trace of the chosen channel only.
@@ -1018,7 +1074,7 @@ def gamma_coupling_page(pdf, cid, st, theta, gamma, wins):
 # ------------------------------------------------------------
 #                 session-level orchestration
 # ------------------------------------------------------------
-def prepare(op_folder, x, y, t, trials, nodes):
+def prepare(op_folder, x, y, t, trials, nodes, config=None):
     """Compute the session-wide inputs once: events, theta phase, split windows.
     Returns a bundle dict (theta may be None if the LFP export is absent)."""
     wins = split_windows(trials, t.min(), t.max())
@@ -1026,7 +1082,7 @@ def prepare(op_folder, x, y, t, trials, nodes):
     n_ev = {k: {s: len(v) for s, v in d.items()} for k, d in events.items()}
     print(f"  [events] start {n_ev['start']}, goal {n_ev['goal arrival']}, "
           f"bridge {n_ev['bridge entry']}")
-    theta = load_theta(op_folder, x, y, t)
+    theta = load_theta(op_folder, x, y, t, config=config)
     gamma = None
     if theta is not None:
         gamma = _gamma_prepare(theta, wins)

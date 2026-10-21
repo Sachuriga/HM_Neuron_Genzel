@@ -5,13 +5,13 @@ now exported at 1500 Hz / ``-lfplowpass 700`` (Nyquist 750), that band survives 
 the LFP itself — exactly how buzcode/anjal run it on 1250 Hz LFP. So the primary,
 fast path reads the LFP export directly with numpy; no wideband/SpikeInterface.
 
-PRIMARY — from the 1500 Hz LFP export (``<output>/LFP_Output/``):
-    load lfp_data.npy -> pick channels (EEG config, else all/one-per-tetrode)
+PRIMARY — from the 1500 Hz LFP (session NWB, else ``<output>/LFP_Output/``):
+    one channel per tetrode, leaving out the rat's BAD_CHANNELS / EEG_TETRODES
       -> band-pass 300–600 Hz -> cross-channel correlation EMG   (numpy/scipy)
 
 FALLBACK — raw wideband via SpikeInterface (only when the LFP band is missing,
 e.g. an old ``-lfplowpass 500`` export): read the ``.rec`` directly (or an old
-``*.raw/*_group0.dat``), select spread/EEG channels, band-pass 300–600, decimate,
+``*.raw/*_group0.dat``), the same channel choice, band-pass 300–600, decimate,
 correlate. (Runs in the SpikeInterface env, HM_neuron.)
 
 Output (in ``<output>/LFP_Output/``):
@@ -64,20 +64,26 @@ def find_rec_files(input_folder):
     return _find(input_folder, recursive=True)
 
 
-def spread_channels(n_channels, n_pick=N_PICK, ch_per_tetrode=CH_PER_TETRODE):
-    """Pick ``n_pick`` channels spread across the probe: one per tetrode first.
+def spread_channels(n_channels, n_pick=N_PICK, skip=(), ch_per_tetrode=CH_PER_TETRODE):
+    """One channel per tetrode, spread across the probe: the lowest-numbered
+    channel of each tetrode that is not in ``skip`` (the rat's bad/EEG channels).
 
-    Channel index = (tetrode)*4 + local, so ``range(0, n, 4)`` is local-0 of every
-    tetrode — a clean spatial spread across the 8×4 tetrode grid. If more than the
-    number of tetrodes are requested, the extra picks are the next local index.
+    Channel index = (tetrode)*4 + local. A tetrode whose lowest channel is in
+    ``skip`` is represented by its next one; a tetrode with every channel in
+    ``skip`` is left out. With more tetrodes than ``n_pick``, an even spread of
+    ``n_pick`` of them is kept.
     """
-    n_tetrodes = n_channels // ch_per_tetrode
+    skip = set(int(c) for c in skip)
     picks = []
-    local = 0
-    while len(picks) < n_pick and local < ch_per_tetrode:
-        picks += [t * ch_per_tetrode + local for t in range(n_tetrodes)]
-        local += 1
-    return sorted(picks[:n_pick])
+    for t in range(n_channels // ch_per_tetrode):
+        good = [t * ch_per_tetrode + k for k in range(ch_per_tetrode)
+                if t * ch_per_tetrode + k not in skip]
+        if good:
+            picks.append(good[0])
+    if len(picks) > n_pick:
+        keep = np.unique(np.linspace(0, len(picks) - 1, n_pick).round().astype(int))
+        picks = [picks[i] for i in keep]
+    return picks
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,14 +221,17 @@ def _hw_to_lfp_columns(lfp_dir, hw_channels):
     return [hw_of_col[c] for c in hw_channels if c in hw_of_col]
 
 
-def _one_column_per_tetrode(lfp_dir, n_cols):
-    """The lowest-numbered channel of each nTrode, as LFP column indices.
+def _one_column_per_tetrode(lfp_dir, n_cols, skip=()):
+    """One LFP column per nTrode: its lowest-numbered channel not in ``skip``.
 
     Channels of one tetrode sit within ~50 um of each other and carry nearly the
     same signal, so feeding all four to the cross-channel correlation would
-    inflate it with near-duplicate pairs. An LFP that already holds one channel
-    per nTrode (the exportLFP layout) comes back whole.
+    inflate it with near-duplicate pairs. ``skip`` holds LFP columns never to use
+    (the rat's bad/EEG channels): a tetrode whose lowest channel is skipped is
+    represented by its next one. An LFP that already holds one channel per
+    nTrode (the exportLFP layout) comes back whole, minus ``skip``.
     """
+    skip = set(int(c) for c in skip)
     cmap = _session_info(lfp_dir).get("channel_map")
     if not cmap:
         cmap_file = find_output(lfp_dir, "channel_map.npy")
@@ -230,16 +239,18 @@ def _one_column_per_tetrode(lfp_dir, n_cols):
     if cmap is None or len(cmap) != n_cols:
         # no map: assume the 4-per-tetrode hardware order when it fits
         if n_cols >= 2 * CH_PER_TETRODE and n_cols % CH_PER_TETRODE == 0:
-            return list(range(0, n_cols, CH_PER_TETRODE))
-        return list(range(n_cols))
+            return spread_channels(n_cols, n_pick=n_cols, skip=skip)
+        return [c for c in range(n_cols) if c not in skip]
     first = {}
     for entry in cmap:
         nt, ch = entry.get("ntrode"), entry.get("channel")
-        if nt is None or ch is None:
+        col = int(entry["index"])
+        if nt is None or ch is None or col in skip:
             continue
         if nt not in first or ch < first[nt][0]:
-            first[nt] = (ch, int(entry["index"]))
-    return sorted(c for _ch, c in first.values()) or list(range(n_cols))
+            first[nt] = (ch, col)
+    return (sorted(c for _ch, c in first.values())
+            or [c for c in range(n_cols) if c not in skip])
 
 
 READ_ROWS = 75_000      # rows per LFP read = one HDF5 chunk tall (50 s @ 1500 Hz)
@@ -262,75 +273,40 @@ def _read_columns(data, cols, rows=READ_ROWS):
     return out
 
 
-SNR_FRAC = 0.3          # exclude LFP cols with SNR < SNR_FRAC * median SNR
-MIN_KEEP = 8            # never drop the EMG correlation below this many channels
+SNR_FRAC = 0.3          # with --exclude_bad: drop LFP cols with SNR < SNR_FRAC * median
+MIN_KEEP = 8            # fewer tetrodes than this left -> use every tetrode instead
 
 
-def _bad_lfp_columns(lfp_dir, n_cols, snr_frac=SNR_FRAC, config=None, stem=None,
-                     extra_exclude_hw=None, min_keep=MIN_KEEP):
-    """LFP columns to drop from the EMG correlation.
-
-    Union of (1) SNR outliers — ``channel_snr_scores.npy`` columns below
-    ``snr_frac * median`` — and (2) the config ``BAD_CHANNELS_<rat>`` /
-    ``EEG_TETRODES_<rat>`` (plus any ``extra_exclude_hw``) hardware ids mapped to
-    LFP columns. Guards so at least ``min_keep`` channels survive (re-admitting the
-    highest-SNR excluded columns first). Returns a set of column indices.
-    """
-    bad, reasons = set(), {}
-    scores = None
+def _low_snr_columns(lfp_dir, n_cols, snr_frac=SNR_FRAC):
+    """LFP columns whose step-8 SNR score (``channel_snr_scores``) is below
+    ``snr_frac * median``: probably noisy. Only used with ``--exclude_bad``."""
     scores = _session_info(lfp_dir).get("channel_snr_scores")
     snr_file = None if scores else find_output(lfp_dir, "channel_snr_scores.npy")
-    if scores or snr_file is not None:
-        scores = np.asarray(scores if scores else np.load(snr_file)).ravel()
-        finite = np.isfinite(scores)
-        if scores.size == n_cols and finite.any():
-            thr = snr_frac * float(np.median(scores[finite]))
-            for c in np.where(scores < thr)[0]:
-                bad.add(int(c)); reasons[int(c)] = f"SNR {scores[c]:.0f}<{thr:.0f}"
-
-    hw = set()
-    if config is not None and stem is not None:
-        try:
-            from sorting import resolve_rat_settings
-            bad_hw, _ref, eeg_hw = resolve_rat_settings(stem, config)
-            hw |= {int(c) for c in bad_hw} | {int(c) for c in eeg_hw}
-        except Exception as exc:
-            print(f"   (bad-channel config not resolved: {exc})")
-    if extra_exclude_hw:
-        hw |= {int(c) for c in extra_exclude_hw}
-    for c in (_hw_to_lfp_columns(lfp_dir, sorted(hw)) or []):
-        bad.add(int(c)); reasons.setdefault(int(c), "config bad/EEG")
-
-    keep_floor = min(min_keep, n_cols)
-    if n_cols - len(bad) < keep_floor:
-        # re-admit the least-bad (highest-SNR) excluded columns until at the floor
-        def _snr(c):
-            return scores[c] if scores is not None and c < scores.size else 0.0
-        for c in sorted(bad, key=_snr, reverse=True):
-            if n_cols - len(bad) >= keep_floor:
-                break
-            bad.discard(c); reasons.pop(c, None)
-    if bad:
-        print("   EMG: excluding LFP cols " +
-              ", ".join(f"{c}({reasons[c]})" for c in sorted(bad)))
-    return bad
+    if not scores and snr_file is None:
+        return set()
+    scores = np.asarray(scores if scores else np.load(snr_file)).ravel()
+    finite = np.isfinite(scores)
+    if scores.size != n_cols or not finite.any():
+        return set()
+    thr = snr_frac * float(np.median(scores[finite]))
+    low = {int(c) for c in np.where(scores < thr)[0]}
+    if low:
+        print(f"   EMG: low-SNR columns (SNR < {thr:.0f}) left out: {sorted(low)}")
+    return low
 
 
-def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False,
-                        snr_frac=SNR_FRAC, config=None, stem=None,
-                        extra_exclude_hw=None):
+def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, skip_hw=None, exclude_low_snr=False,
+                        snr_frac=SNR_FRAC):
     """EMG-from-LFP computed directly from the 1500 Hz LFP export (numpy/scipy).
 
     The LFP already carries the 300–600 Hz band (exportLFP -lfplowpass 700), so no
     wideband/SpikeInterface read is needed — this is the fast primary path.
 
-    Channel selection:
-      * ``channels`` (hardware ids) given and mappable -> use those LFP columns.
-      * otherwise -> one column per tetrode (spread across the probe — ideal for
-        the cross-channel correlation; see :func:`_one_column_per_tetrode`).
-    With ``exclude_bad`` (default), SNR-outlier and config bad/EEG columns are
-    then dropped (see :func:`_bad_lfp_columns`), since a noisy or reference
-    channel dilutes every pairwise correlation.
+    Channels: one column per tetrode, spread across the probe (ideal for the
+    cross-channel correlation; see :func:`_one_column_per_tetrode`). The
+    hardware channels in ``skip_hw`` (the rat's bad and EEG channels) are never
+    used, since a noisy channel dilutes every pairwise correlation it is part
+    of. ``exclude_low_snr`` also leaves out low-SNR columns.
     """
     lfp_dir = Path(lfp_dir)
     data, fs, close = _open_lfp(lfp_dir)
@@ -342,26 +318,28 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
                 f"LFP fs={fs:.0f} Hz (Nyquist {fs/2:.0f}) is below the 300–600 Hz EMG "
                 f"band. Re-export LFP at 1500 Hz / -lfplowpass 700.")
 
-        cols, origin = None, None
-        if channels:
-            mapped = _hw_to_lfp_columns(lfp_dir, [int(c) for c in channels])
-            if mapped and len(mapped) >= 2:
-                cols, origin = sorted(set(mapped)), f"EEG channels -> LFP cols {sorted(set(mapped))}"
+        # The columns never to use: the rat's bad/EEG channels (hardware ids,
+        # found in the LFP through its channel map), plus low-SNR ones if asked.
+        n_cols = data.shape[1]
+        skip = set()
+        if skip_hw:
+            mapped = _hw_to_lfp_columns(lfp_dir, sorted(skip_hw))
+            if mapped is None:
+                print("   (no channel map: the bad/EEG channels cannot be found "
+                      "in the LFP, so none are left out)")
             else:
-                print("   (requested EEG channels not all in the LFP export; "
-                      "using all LFP channels instead)")
-        if cols is None:
-            cols = _one_column_per_tetrode(lfp_dir, data.shape[1])
-            origin = f"{len(cols)} LFP channels (one per tetrode)"
+                skip |= set(mapped)
+        if exclude_low_snr:
+            skip |= _low_snr_columns(lfp_dir, n_cols, snr_frac)
 
-        if exclude_bad:
-            bad = _bad_lfp_columns(lfp_dir, data.shape[1], snr_frac=snr_frac,
-                                   config=config, stem=stem,
-                                   extra_exclude_hw=extra_exclude_hw)
-            kept = [c for c in cols if c not in bad]
-            dropped = sorted(c for c in cols if c in bad)
-            if dropped and len(kept) >= 2:
-                cols, origin = kept, origin + f" minus {dropped} (bad/EEG)"
+        cols = _one_column_per_tetrode(lfp_dir, n_cols, skip=skip)
+        origin = f"{len(cols)} LFP channels (one per tetrode"
+        origin += ", bad/EEG left out)" if skip else ")"
+        if skip and len(cols) < MIN_KEEP:
+            print(f"   ⚠ only {len(cols)} tetrodes left without the bad/EEG "
+                  f"channels; using every tetrode instead")
+            cols = _one_column_per_tetrode(lfp_dir, n_cols)
+            origin = f"{len(cols)} LFP channels (one per tetrode)"
 
         cols = sorted(set(int(c) for c in cols))
         print(f"   Reading {len(cols)} LFP columns: {cols}")
@@ -383,13 +361,12 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
 # FALLBACK PATH: EMG from the raw wideband (SpikeInterface), for LP-500 LFP
 # ──────────────────────────────────────────────────────────────────────────────
 
-def emg_from_recording(rec, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-                       channels=None):
+def emg_from_recording(rec, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK, skip=()):
     """Core: EMG-from-LFP for a SpikeInterface recording object (any source).
 
-    Channel selection:
-      * ``channels`` given (e.g. the tracker's EEG channels) -> use ALL of them.
-      * otherwise -> ``n_pick`` channels spread across the probe (one per tetrode).
+    Channels: up to ``n_pick``, one per tetrode spread across the probe, never
+    one in ``skip`` (the rat's bad/EEG channels; see :func:`spread_channels`).
+    Channel index == hardware id here (the raw export's column order).
 
     Band-passes to the EMG band, decimates/resamples to ``work_fs``, and
     correlates. Returns the ``emg_correlation`` dict plus ``duration_s``,
@@ -400,13 +377,10 @@ def emg_from_recording(rec, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
     src_fs = rec.get_sampling_frequency()
 
     ch_ids = rec.get_channel_ids()
-    if channels:
-        picks = sorted(int(c) for c in channels if 0 <= int(c) < n_channels)
-        if len(picks) < 2:
-            raise ValueError(f"Need >= 2 valid EEG channels; got {picks} "
-                             f"(recording has {n_channels} channels).")
-    else:
-        picks = spread_channels(n_channels, n_pick=n_pick)
+    picks = spread_channels(n_channels, n_pick=n_pick, skip=skip)
+    if len(picks) < 2:
+        raise ValueError(f"Need >= 2 channels for the EMG; got {picks} "
+                         f"(recording has {n_channels} channels).")
     rec_sel = rec.select_channels([ch_ids[i] for i in picks])
 
     lo, hi = _highfreq_passband(work_fs)                   # 300–600 Hz
@@ -434,7 +408,7 @@ def emg_from_recording(rec, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
 
 
 def emg_for_recording(dat_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-                      channels=None):
+                      skip=()):
     """EMG-from-LFP for one extracted raw ``*.raw/*_group0.dat`` (30 kHz, 128 ch)."""
     raw = readTrodesExtractedDataFile(str(dat_file))
     voltage = raw["data"]["voltage"]                       # (n_samples, n_channels)
@@ -442,34 +416,45 @@ def emg_for_recording(dat_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
     rec.set_channel_gains(GAIN)
     rec.set_channel_offsets(0.0)
     return emg_from_recording(rec, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick,
-                              channels=channels)
+                              skip=skip)
 
 
 def emg_for_rec_file(rec_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-                     channels=None):
+                     skip=()):
     """EMG-from-LFP for a Trodes ``.rec`` read lazily (no raw extraction needed).
 
     ``open_rec`` puts the channels in the raw export's order (neo alone mislabels
-    them on our chanPerChip="0" headers), so EEG channel ids mean the same here."""
+    them on our chanPerChip="0" headers), so bad/EEG channel ids mean the same
+    here. Read without Trodes' rawRef, like step 8's LFP: a subtracted reference
+    channel would put its own 300-600 Hz activity into every channel and so
+    into the cross-channel correlation."""
     from trodes_rec import open_rec
-    rec = open_rec(rec_file)
+    rec = open_rec(rec_file, apply_raw_ref=False)
     return emg_from_recording(rec, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick,
-                              channels=channels)
+                              skip=skip)
 
 
-def _resolve_eeg_channels(stem, config, eeg_override):
-    """EEG channels to use for one recording. Priority: explicit override >
-    tracker config (EEG_TETRODES_<rat>) > None (falls back to a probe spread)."""
-    if eeg_override:
-        return list(eeg_override)
+def _rat_skip_channels(stem, config, extra_eeg=None):
+    """``{hardware channel: 'bad' | 'EEG'}`` to leave out of the EMG.
+
+    From the rat's ``BAD_CHANNELS_<rat>`` and ``EEG_TETRODES_<rat>`` in the
+    tracker config (matched on the recording ``stem``), plus ``extra_eeg``
+    (``--eeg_channels``). Empty when the rat has no config entry.
+    """
+    bad, eeg = [], []
     if config:
         try:
             from sorting import resolve_rat_settings
-            _bad, _ref, eeg = resolve_rat_settings(stem, config)
-            return eeg
+            bad, _ref, eeg = resolve_rat_settings(stem, config)
         except Exception as exc:
-            print(f"   (could not resolve EEG channels from config: {exc})")
-    return None
+            print(f"   (bad/EEG channels not read from the config: {exc})")
+    skip = {int(c): "EEG" for c in list(eeg) + list(extra_eeg or [])}
+    skip.update({int(c): "bad" for c in bad})
+    if skip:
+        print(f"   EMG leaves out bad channels "
+              f"{sorted(c for c, why in skip.items() if why == 'bad')} and EEG "
+              f"channels {sorted(c for c, why in skip.items() if why == 'EEG')}")
+    return skip
 
 
 def _session_stem(input_folder):
@@ -478,7 +463,7 @@ def _session_stem(input_folder):
     return recs[0].stem if recs else Path(input_folder).name
 
 
-def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
+def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, skip_hw,
                   smoothed, timestamps, boundaries):
     """Fallback: EMG from raw wideband (.rec via SI, else an old extracted .dat)."""
     recs = find_rec_files(input_folder)
@@ -488,9 +473,9 @@ def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
     for src, kind in sources:
         print(f"  • {src.name}")
         loader = emg_for_recording if kind == "dat" else emg_for_rec_file
-        res = loader(src, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick, channels=chans)
-        origin = f"EEG channels {res['picks']}" if chans else \
-            f"{len(res['picks'])} ch spread (one per tetrode)"
+        res = loader(src, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick, skip=skip_hw)
+        origin = f"{len(res['picks'])} ch spread (one per tetrode"
+        origin += ", bad/EEG left out)" if skip_hw else ")"
         print(f"      {origin}, band {res['passband'][0]:.0f}-"
               f"{res['passband'][1]:.0f} Hz, {res['data'].size} EMG bins @ {emg_fs} Hz")
         smoothed.append(res["smoothed"])
@@ -501,8 +486,8 @@ def _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
 
 
 def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
-        config=None, eeg_channels=None, exclude_bad=False, snr_frac=SNR_FRAC,
-        keep_npy=False):
+        config=None, eeg_channels=None, include_bad=False, exclude_low_snr=False,
+        snr_frac=SNR_FRAC, keep_npy=False):
     # LFP_Output only exists for the .npy files; the NWB is the default home.
     output_dir = Path(output_folder) / "LFP_Output"
     if keep_npy:
@@ -514,16 +499,16 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     print(f"   Output: {output_dir if keep_npy else 'the session NWB'}")
 
     stem = _session_stem(input_folder)
-    chans = _resolve_eeg_channels(stem, config, eeg_channels)
+    # The rat's bad and EEG channels stay out of the correlation (unless
+    # include_bad): a noisy channel dilutes every pair it is part of.
+    skip_hw = {} if include_bad else _rat_skip_channels(stem, config, eeg_channels)
 
     smoothed, timestamps, boundaries = [], [], []
-    # PRIMARY: straight from the 1500 Hz LFP export (fast, numpy only). Use ALL
-    # tetrodes minus bad/EEG ones — EEG tetrodes (``chans``) are *excluded* from
-    # the correlation here, not used as its source.
+    # PRIMARY: straight from the 1500 Hz LFP export (fast, numpy only): one
+    # channel per tetrode, never a bad/EEG one.
     try:
-        res = emg_from_lfp_output(output_dir, emg_fs=emg_fs, exclude_bad=exclude_bad,
-                                  snr_frac=snr_frac, config=config, stem=stem,
-                                  extra_exclude_hw=chans)
+        res = emg_from_lfp_output(output_dir, emg_fs=emg_fs, skip_hw=skip_hw,
+                                  exclude_low_snr=exclude_low_snr, snr_frac=snr_frac)
         print(f"   From 1500 Hz LFP export @ {res['fs']:.0f} Hz: {res['origin']}, "
               f"band {res['passband'][0]:.0f}-{res['passband'][1]:.0f} Hz, "
               f"{res['data'].size} EMG bins @ {emg_fs} Hz")
@@ -533,7 +518,7 @@ def run(input_folder, output_folder, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PI
     except (FileNotFoundError, ValueError) as exc:
         print(f"   LFP path unavailable ({exc})")
         print(f"   Falling back to the raw wideband via SpikeInterface.")
-        _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, chans,
+        _emg_from_raw(input_folder, work_fs, emg_fs, n_pick, skip_hw,
                       smoothed, timestamps, boundaries)
     if not smoothed:
         print("❌  No input found (LFP export, **/*.raw/*_group0.dat, or **/*.rec).")
@@ -604,9 +589,9 @@ def _parse_eeg_arg(raw):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compute EMG-from-LFP (Buzsáki cross-channel correlation) from "
-                    "the raw wideband recording (or .rec) via SpikeInterface. Uses "
-                    "the tracker's EEG channels when configured, else 32 channels "
-                    "spread across the probe (one per tetrode).")
+                    "the session LFP (fallback: the raw .rec via SpikeInterface). "
+                    "Uses one channel per tetrode and leaves out the rat's "
+                    "BAD_CHANNELS and EEG_TETRODES channels from the config.")
     parser.add_argument("--input_folder", required=True,
                         help="Folder with raw export (**/*.raw/*_group0.dat) or **/*.rec.")
     parser.add_argument("--output_folder", required=True,
@@ -614,21 +599,22 @@ if __name__ == "__main__":
     parser.add_argument("--work_fs", type=float, default=WORK_FS,
                         help=f"Correlation sample rate in Hz (default {WORK_FS:.0f}).")
     parser.add_argument("--n_pick", type=int, default=N_PICK,
-                        help=f"Spread channels used when no EEG channels are given "
-                             f"(default {N_PICK}).")
+                        help=f"Raw fallback only: at most this many channels, one "
+                             f"per tetrode (default {N_PICK}).")
     parser.add_argument("--config", default=None,
-                        help="hm_tracker_paths.txt for per-rat EEG channels "
-                             "(default ~/Desktop/hm_tracker_paths.txt).")
+                        help="hm_tracker_paths.txt with the rat's BAD_CHANNELS / "
+                             "EEG_TETRODES (default ~/Desktop/hm_tracker_paths.txt).")
     parser.add_argument("--eeg_channels", default=None,
-                        help="Explicit EEG channels to EXCLUDE from the EMG "
-                             "correlation, e.g. 'NT5' or '16 17 18 19'. Adds to the "
-                             "config EEG/bad channels.")
+                        help="More channels to EXCLUDE from the EMG correlation, "
+                             "e.g. 'NT5' or '16 17 18 19'. Adds to the config's "
+                             "bad/EEG channels.")
+    parser.add_argument("--include_bad", action="store_true",
+                        help="Keep the rat's bad/EEG channels in the correlation "
+                             "(they are left out by default).")
     parser.add_argument("--exclude_bad", action="store_true",
-                        help="Drop SNR-outlier + config bad/EEG channels from the EMG "
-                             "correlation. Off by default: for a healthy probe the "
-                             "cross-channel mean is insensitive to channel choice "
-                             "(~identical correlation); useful only when several "
-                             "channels are bad.")
+                        help="Also leave out low-SNR channels (SNR < snr_frac x "
+                             "median). The config bad/EEG channels are left out "
+                             "anyway.")
     parser.add_argument("--keep-npy", dest="keep_npy", action="store_true",
                         help="Also write the EMG .npy files into LFP_Output/. "
                              "They duplicate what the NWB holds; off by default.")
@@ -638,4 +624,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run(args.input_folder, args.output_folder, work_fs=args.work_fs, n_pick=args.n_pick,
         config=_load_config(args.config), eeg_channels=_parse_eeg_arg(args.eeg_channels),
-        exclude_bad=args.exclude_bad, snr_frac=args.snr_frac, keep_npy=args.keep_npy)
+        include_bad=args.include_bad, exclude_low_snr=args.exclude_bad,
+        snr_frac=args.snr_frac, keep_npy=args.keep_npy)

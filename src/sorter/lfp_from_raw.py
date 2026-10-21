@@ -9,9 +9,12 @@ straight from the 30 kHz wideband instead, mirroring exportLFP's settings:
 
 The filter runs forward-backward, so theta/gamma phases are not shifted.
 
-The wideband is read from the ``.rec`` itself (``trodes_rec.open_rec``, the same
-samples ``trodesexport -raw`` writes), so step 1 no longer has to make the raw
-export. Folders that still have ``<recording>.raw/`` but no ``.rec`` use that.
+The wideband is read from the ``.rec`` itself (``trodes_rec.open_rec``), so step 1
+no longer has to make the raw export. It is read WITHOUT Trodes' rawRef: every
+channel stays single-ended (against the headstage reference), instead of having
+one reference channel subtracted from it as ``trodesexport -raw`` does. Folders
+that still have ``<recording>.raw/`` but no ``.rec`` use that export, whose
+rawRef is already in the samples and cannot be taken out again.
 
 Column ``k`` of the result is hardware channel ``k`` of the raw export — the
 same id the sorter and ``sorting.nt_to_channel`` use, i.e. nTrode ``k//4 + 1``,
@@ -34,6 +37,22 @@ LFP_LOWPASS = 700.0     # Hz — exportLFP -lfplowpass 700 (runner step e)
 FILTER_ORDER = 4
 FILTER_MARGIN_MS = 50.0 # chunk-edge padding; the 700 Hz filter settles in a few ms
 CH_PER_TETRODE = 4
+
+# What the LFP is referenced to. Stored in the NWB (session_info.lfp_reference)
+# so a re-run can tell whether the LFP already there was made the same way.
+REF_NONE = "none"                       # .rec read single-ended (no rawRef)
+REF_RAW_EXPORT = "trodes_raw_export"    # old trodesexport -raw .dat: rawRef baked in
+REF_EXPORTLFP = "trodes_exportlfp"      # step e's exportLFP .dat: Trodes' LFP reference
+
+
+def lfp_reference(sessions):
+    """The reference label (above) for an LFP built from these raw sessions."""
+    from_rec = {s["file"].suffix.lower() == ".rec" for s in sessions}
+    if from_rec == {True}:
+        return REF_NONE
+    if from_rec == {False}:
+        return REF_RAW_EXPORT
+    return "mixed"                      # some .rec, some raw export
 
 
 def find_raw_sessions(input_folder):
@@ -64,7 +83,10 @@ def _open_raw(src):
 
     if src.suffix.lower() == ".rec":
         from trodes_rec import open_rec
-        return open_rec(src)
+        # apply_raw_ref=False: Trodes' rawRef would subtract one channel from
+        # every channel, mixing that channel's own LFP (and spikes) into all of
+        # them. The LFP keeps each channel's own signal instead.
+        return open_rec(src, apply_raw_ref=False)
     lay = trodesBinaryLayout(str(src))
     if lay is None:
         raise RuntimeError(f"{src.name}: not a plain interleaved raw export")
@@ -129,6 +151,9 @@ def build_lfp_from_raw(sessions, out_npy, output_rate=1500.0, n_jobs=None,
         n = rec.get_num_samples()
         log(f"    • {s['name']}: {raw.get_num_samples()} raw samples "
             f"-> {n} @ {fs:g} Hz, {n_ch} ch")
+        if s["file"].suffix.lower() != ".rec":
+            log(f"      ⚠ old raw export: Trodes' rawRef is already subtracted "
+                f"in it (only a .rec gives the LFP without it)")
         recs.append(rec)
         boundaries.append({"name": s["name"], "start": start, "n": n})
         start += n

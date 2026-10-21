@@ -8,7 +8,8 @@ from scipy.signal import welch
 from tqdm import tqdm
 
 from session_prefix import session_prefix
-from lfp_from_raw import find_raw_sessions, build_lfp_from_raw
+from lfp_from_raw import (find_raw_sessions, build_lfp_from_raw, lfp_reference,
+                          REF_NONE, REF_EXPORTLFP)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -347,7 +348,7 @@ def _stored_lfp_shape(nwb_path):
 
 
 def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
-                      sleep_channels, cleanest, snr, theta_delta,
+                      sleep_channels, cleanest, snr, theta_delta, reference,
                       session_name=None):
     """Write the per-sample arrays into ``<op>/<Rat>_<YYYYMMDD>.nwb``.
 
@@ -359,7 +360,9 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
     times is touched here.
 
     ``session_info.session_boundaries`` additionally records where each
-    concatenated session starts on that axis, in samples and in seconds.
+    concatenated session starts on that axis, in samples and in seconds, and
+    ``session_info.lfp_reference`` what the LFP is referenced to (``reference``,
+    one of the labels in lfp_from_raw: ``"none"`` for a single-ended .rec read).
 
     Creates the file when absent, appends when it already exists, and never
     overwrites a container that is already there — so a scoring, behaviour or
@@ -411,6 +414,7 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
         "time_axis": ("seconds from the first sample of the first concatenated "
                       "session; spike times share this origin"),
         "channel_map": channel_map,
+        "lfp_reference": reference,
         "cleanest_channel_indices": cleanest,
         "channel_snr_scores": snr,
         "session_boundaries": bounds,
@@ -433,14 +437,26 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
         if legacy:
             tqdm.write(f"  ↻ removed old single-channel EMG outputs "
                        f"({', '.join(legacy)})")
-        # Containers are never overwritten, so an LFP with a different channel
-        # set (an older one-per-nTrode export) has to go first — together with
-        # the column-indexed session_info and the signals derived from it.
+        # Containers are never overwritten, so a stored LFP made differently
+        # from this one has to go first — together with everything computed
+        # from it (session_info, theta/delta, the EMG). It differs when its
+        # channel set does (an older one-per-nTrode export) or its reference
+        # does (older runs subtracted Trodes' rawRef and did not record it).
         old_shape = _stored_lfp_shape(nwb_path)
-        if old_shape is not None and tuple(old_shape[1:]) != tuple(lfp.shape[1:]):
-            removed = snwb.drop_lfp_outputs(nwb_path)
-            tqdm.write(f"  ↻ replacing the stored LFP {old_shape} with "
-                       f"{tuple(lfp.shape)} (removed {', '.join(removed)})")
+        if old_shape is not None:
+            old_ref = snwb.stored_session_info(nwb_path).get("lfp_reference")
+            why = []
+            if tuple(old_shape[1:]) != tuple(lfp.shape[1:]):
+                why.append(f"{old_shape[1]} -> {lfp.shape[1]} channels")
+            if old_ref != reference:
+                why.append(f"reference {old_ref or 'not recorded (older run)'} "
+                           f"-> {reference}")
+            if why:
+                removed = snwb.drop_lfp_outputs(nwb_path)
+                tqdm.write(f"  ↻ replacing the stored LFP ({'; '.join(why)}); "
+                           f"removed {', '.join(removed)}")
+                tqdm.write(f"    The old LFP's space stays inside the file until "
+                           f"`python src/nwb/compact_nwb.py {op}`.")
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()
@@ -555,6 +571,11 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
                 raw_sessions, lfp_npy, output_rate=output_rate or 1500.0,
                 log=tqdm.write)
             n_samples, num_channels = lfp_array.shape
+            reference = lfp_reference(raw_sessions)
+            if reference == REF_NONE:
+                tqdm.write("  Reference: none (single-ended; Trodes rawRef not applied)")
+            else:
+                tqdm.write(f"  Reference: {reference} (Trodes rawRef is in the raw export)")
             if keep_npy:
                 _save_channel_npys(lfp_array, ch_info_list, output_dir / "channels_npy", pfx)
         else:
@@ -604,6 +625,8 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
             lfp_array = np.column_stack([ch['data'] for ch in channels])
             if keep_npy:
                 np.save(output_dir / f"{pfx}lfp_data.npy", lfp_array)
+            # exportLFP applies Trodes' own LFP reference; it cannot be undone here.
+            reference = REF_EXPORTLFP
 
             ch_info_list = [{'index': i, 'ntrode': ch['ntrode'],
                              'channel': ch['channel'],
@@ -674,7 +697,7 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
             output_folder, pfx, fs=fs, lfp=lfp_array, boundaries=boundaries,
             channel_map=ch_info_list, sleep_channels=sc,
             cleanest=best_ch_idx, snr=scores, theta_delta=theta_delta,
-            session_name=session_name)
+            reference=reference, session_name=session_name)
 
         del lfp_array
         gc.collect()

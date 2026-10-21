@@ -840,7 +840,7 @@ def plot_spike_path(ax, x, y, t, spike_times, title, extent, t0=None, t1=None,
 #                 the visualiser
 # ------------------------------------------------------------
 def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
-              theta_events=True, units_sel=None):
+              theta_events=True, units_sel=None, config=None):
     nwb_path = find_nwb_file(output_folder)
     if nwb_path is None:
         print(f"No .nwb under '{output_folder}' (run steps w/u first). Skipping.")
@@ -959,7 +959,9 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
         if theta_events and pos is not None and trials:
             try:
                 import theta_events as TE
-                te_bundle = TE.prepare(output_folder, x, y, t, trials, nodes)
+                # config: the rat's bad channels are never the theta channel
+                te_bundle = TE.prepare(output_folder, x, y, t, trials, nodes,
+                                       config=config)
             except Exception as e:
                 print(f"  [theta-events] preparation failed ({e}); pages skipped.")
 
@@ -1352,7 +1354,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_folder", required=True,
                         help="op folder with the NWB, *_sorting_output/phy_export and RecordingMeta.xlsx.")
     parser.add_argument("--config", required=False, default=None,
-                        help="Accepted for runner consistency (unused).")
+                        help="hm_tracker_paths.txt: the rat's BAD_CHANNELS are "
+                             "never picked as the theta channel.")
     parser.add_argument("--bin_cm", type=float, default=5.0,
                         help="Spatial bin size in cm (square) in the plot_trials metre frame.")
     parser.add_argument("--smooth", type=float, default=2.0,
@@ -1369,7 +1372,8 @@ if __name__ == "__main__":
     try:
         visualize(args.output_folder, bin_cm=args.bin_cm, sigma=args.smooth, speed=args.speed,
                   theta_events=not args.no_theta_events,
-                  units_sel=set(args.units) if args.units else None)
+                  units_sel=set(args.units) if args.units else None,
+                  config=args.config)
     except Exception as e:
         print(f"[viz] Failed: {e}")
         traceback.print_exc()

@@ -421,14 +421,15 @@ def drop_lfp_outputs(nwb_path):
     """Remove the LFP and everything computed from its columns, so a re-export
     can write them again (``add_sleep_inputs`` never overwrites).
 
-    Drops ``acquisition/lfp`` and ``processing/sleep/{session_info,
-    theta_delta_ratio}``. Scorings, sleep_channels, EMG, motion,
-    behaviour and units are untouched. HDF5 does not give the freed space back
-    (run ``src/nwb/compact_nwb.py`` for that). Returns the names removed.
+    Drops ``acquisition/lfp``, ``acquisition/emg_from_lfp`` (computed from the
+    LFP; step 8's EMG step writes it again) and ``processing/sleep/{session_info,
+    theta_delta_ratio}``. Scorings, sleep_channels, motion, behaviour and units
+    are untouched. HDF5 does not give the freed space back (run
+    ``src/nwb/compact_nwb.py`` for that). Returns the names removed.
     """
     import h5py
 
-    paths = [f"acquisition/{LFP_NAME}"] + [
+    paths = [f"acquisition/{LFP_NAME}", f"acquisition/{EMG_NAME}"] + [
         f"processing/{SLEEP_MODULE}/{n}" for n in (SESSION_INFO_NAME,) + DERIVED_NAMES]
     removed = []
     with h5py.File(str(nwb_path), "r+") as f:
@@ -477,6 +478,22 @@ def drop_legacy_outputs(nwb_path):
                 layout["derived"] = kept
                 mod[LAYOUT_NAME].attrs["description"] = json.dumps(layout)
     return removed
+
+
+def stored_session_info(nwb_path):
+    """``processing/sleep/session_info`` of ``nwb_path`` as a dict ({} if none).
+
+    Read with h5py directly, so it is quick even on a file with a multi-GB LFP.
+    """
+    import h5py
+
+    try:
+        with h5py.File(str(nwb_path), "r") as f:
+            mod = f.get(f"processing/{SLEEP_MODULE}")
+            info = None if mod is None else _description_json(mod, SESSION_INFO_NAME)
+    except OSError:
+        return {}
+    return info or {}
 
 
 def _description_json(group, name):
