@@ -73,7 +73,7 @@ The pipeline takes raw Trodes recordings (`.rec`) and 12-camera hexmaze video, a
 **Ephys tier**
 
 - Spike sorting (MountainSort5 default / MountainSort4) via SpikeInterface, per tetrode, with automated good/mua/noise labels and Phy export for manual curation
-- LFP extraction (1500 Hz, all 128 channels straight from the `.rec`), headstage IMU motion, sleep-scoring aids (EMG channel, awakeness index, Buzsáki EMG-from-LFP)
+- LFP extraction (1500 Hz, all 128 channels straight from the `.rec`), headstage IMU motion, sleep-scoring aids (theta/delta ratio, Buzsáki EMG-from-LFP)
 
 **Integration / analysis tier (NWB)**
 
@@ -490,7 +490,7 @@ python src/sorter/export_motion.py       --input_folder <ip> --output_folder <op
 
 **`export_lfp.py`** — builds the LFP for **every channel (128)** from the 30 kHz wideband in `<recording>.rec` (`trodes_rec.open_rec`; an old `<recording>.raw/*_group0.dat` is used if there is no `.rec`): × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a `.rec` or raw export it falls back to step e's `<recording>.LFP/*.dat`, which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
 
-The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV, gzip, chunks of 50 s × 1 tetrode); `processing/sleep/session_info` holds the `channel_map` (column → nTrode/channel). Re-running on a session whose NWB holds an LFP with a different channel count replaces it (plus `session_info` and the awakeness signals). The `.npy` below are written only with `--keep-npy` / `KEEP_NPY=1`:
+The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV, gzip, chunks of 50 s × 1 tetrode); `processing/sleep/session_info` holds the `channel_map` (column → nTrode/channel). Re-running on a session whose NWB holds an LFP with a different channel count replaces it (plus `session_info` and `theta_delta_ratio`). Re-running on an NWB from before the single-channel EMG was dropped also removes its `awakeness` / `emg_rms` and `session_info.emg_channel_index`. The `.npy` below are written only with `--keep-npy` / `KEEP_NPY=1`:
 
 | File (`{pfx}` = session prefix) | Contents |
 |---|---|
@@ -500,16 +500,15 @@ The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV,
 | `{pfx}channel_map.npy` | `{index, ntrode, channel, source_file}` per column |
 | `channels_npy/{pfx}lfp_nt<NN>_ch<CC>.npy` | one file per channel (fast single-channel reads) |
 | `{pfx}sleep_channels.npy` | `{cortex, sr, pyr}` tetrodes from `SLEEP_CHANNELS_<RAT>` |
-| `{pfx}emg_data.npy` / `{pfx}emg_channel_index.npy` | channel with max 20–200 Hz power (raw-LFP "EMG") |
 | `{pfx}cleanest_channel_indices.npy` / `{pfx}channel_snr_scores.npy` | top-3 sleep-band-SNR channels |
-| `{pfx}awakeness.npy`, `{pfx}emg_rms.npy`, `{pfx}theta_delta_ratio.npy` | per-sample awakeness index (0.6·zEMG + 0.4·zθ/δ) |
+| `{pfx}theta_delta_ratio.npy` | per-sample θ (5–9 Hz) / δ (0.5–4 Hz) power of the cleanest channel, 1 s epochs |
 
 **`export_emg_from_lfp.py`** — Buzsáki EMG-from-LFP (300–600 Hz band-pass, sliding ±0.2 s mean pairwise cross-channel correlation): `{pfx}emg_from_lfp_5hz.npy` (+timestamps), `{pfx}emg_from_lfp.npy` upsampled onto the LFP time axis. Falls back to the 30 kHz `.rec` (or an old raw `.dat`) if the LFP export is missing or too low-rate.
 
 **`export_motion.py`** — headstage IMU `AccelX/Y/Z` from `.analog` folders, resampled to 1500 Hz: `{pfx}motion.npy`, `{pfx}motion_timestamps.npy`, `{pfx}motion_accel.npy` (movement envelope, TheStateEditor port), `{pfx}motion_session_boundaries.npy`.
 
 > - **Timestamps are synthetic** (sample/fs, gapless): real inter-recording gaps are not represented — use `session_boundaries.npy`.
-> - Two different "EMG" families exist: `emg_data`/`emg_rms` (one raw LFP channel) vs `emg_from_lfp*` (cross-channel correlation muscle-tone estimate).
+> - The only EMG is `emg_from_lfp*` (cross-channel correlation across all channels). The old single-channel `emg_data`/`emg_rms` and `awakeness` are no longer written.
 > - Running `export_lfp.py` by hand **must** include `--output_rate 1500` or downstream timestamps can be ~20× off.
 
 ### Step d — DeepLabCut Export + Inference

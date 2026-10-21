@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 import spikeinterface.full as si
 import spikeinterface.preprocessing as spre
@@ -171,7 +172,7 @@ _INFO_CACHE = {}
 def _session_info(lfp_dir):
     """``processing/sleep/session_info`` from the session NWB, else ``{}``.
 
-    Holds the channel map, session boundaries, EMG channel and SNR scores that
+    Holds the channel map, session boundaries and SNR scores that
     used to live in LFP_Output as small ``.npy``. Cached per folder.
     """
     key = str(lfp_dir)
@@ -239,6 +240,26 @@ def _one_column_per_tetrode(lfp_dir, n_cols):
         if nt not in first or ch < first[nt][0]:
             first[nt] = (ch, int(entry["index"]))
     return sorted(c for _ch, c in first.values()) or list(range(n_cols))
+
+
+READ_ROWS = 75_000      # rows per LFP read = one HDF5 chunk tall (50 s @ 1500 Hz)
+
+
+def _read_columns(data, cols, rows=READ_ROWS):
+    """``data[:, cols]`` as float64, read one block of rows at a time.
+
+    Asking h5py for several columns at once (``data[:, cols]``) on the chunked,
+    gzip-compressed NWB LFP is very slow: ~17x slower than this loop when
+    measured, i.e. minutes for one session with nothing printed, so the run
+    looks frozen. Here each block reads every column of a 50 s stretch (each
+    chunk decompressed once) and numpy keeps the wanted columns.
+    """
+    n = data.shape[0]
+    out = np.empty((n, len(cols)), dtype=np.float64)
+    for s in tqdm(range(0, n, rows), desc="   Reading LFP", unit="block",
+                  leave=False):
+        out[s:s + rows] = np.asarray(data[s:s + rows])[:, cols]
+    return out
 
 
 SNR_FRAC = 0.3          # exclude LFP cols with SNR < SNR_FRAC * median SNR
@@ -342,13 +363,14 @@ def emg_from_lfp_output(lfp_dir, emg_fs=EMG_FS, channels=None, exclude_bad=False
             if dropped and len(kept) >= 2:
                 cols, origin = kept, origin + f" minus {dropped} (bad/EEG)"
 
-        # h5py fancy indexing needs strictly increasing columns
         cols = sorted(set(int(c) for c in cols))
-        sel = np.asarray(data[:, cols], dtype=np.float64)
+        print(f"   Reading {len(cols)} LFP columns: {cols}")
+        sel = _read_columns(data, cols)
         n_samples = data.shape[0]
     finally:
         close()
 
+    print(f"   Band-pass + cross-channel correlation on {len(cols)} channels ...")
     res = emg_from_lfp(sel, fs, emg_fs=emg_fs, smooth_window_s=SMOOTH_S)
     res["duration_s"] = n_samples / fs
     res["picks"] = cols

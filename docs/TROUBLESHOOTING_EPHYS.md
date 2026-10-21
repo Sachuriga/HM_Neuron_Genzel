@@ -61,20 +61,9 @@ The NWB will hold 32 LFP channels (one per nTrode) instead of 128. Run Step 1 (`
 
 If no `*.timestamps.dat` file is found in the `.LFP/` folder, the script generates timestamps using the sample rate from the file header. The resulting timestamps will be relative (starting at 0) rather than aligned to wall-clock time. This is generally acceptable for within-session analyses but will not align to neural spiking data if timestamps differ.
 
-**EMG channel selection looks wrong**
+**Old NWB still shows `awakeness`, `emg_rms` or an "EMG ch"**
 
-The script selects the EMG channel by finding the one with the highest power in the 20–200 Hz band during the first 60 seconds of the recording. If the animal was very still at the start of the session, the EMG channel selected may be a noisy electrode rather than a true EMG.
-
-- Check `channel_snr_scores.npy` to inspect the selection scores.
-- If the wrong channel was selected, note the correct channel index and contact your supervisor to update the selection parameters.
-
-**Awakeness index looks flat or unrealistic**
-
-The awakeness index is computed as `0.6 × EMG_zscore + 0.4 × theta/delta ratio`. If either component is unusable (noise, bad reference, etc.), the index will not reflect true arousal.
-
-- Check the raw `emg_data.npy` and `theta_delta_ratio.npy` files separately.
-- If the EMG trace is flat (cable disconnected or electrode failing), the awakeness index will be dominated by the theta/delta ratio alone.
-- Report the issue with the session name and rat ID in the HM_tracking channel.
+Step 8 used to pick one LFP channel as "EMG" (the one with the most 20–200 Hz power) and build an awakeness index from it. That is no longer written: the only EMG is `acquisition/emg_from_lfp`, the cross-channel correlation. Re-running step 8 on the session removes the old containers from its NWB.
 
 **Output files not generated / folder not created**
 

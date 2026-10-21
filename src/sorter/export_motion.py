@@ -132,7 +132,7 @@ def accel_to_movement(accel, fs, lowband=0.1, highband=1.0, forder=500):
            correlation identical to convolution, so ``mode='same'`` matches)
 
     The result stays at the input rate ``fs`` (no 1-second binning), so it is the
-    same length and rate as ``motion.npy`` / ``emg_rms.npy`` and the rest of the
+    same length and rate as ``motion.npy`` / ``theta_delta_ratio.npy`` and the rest of the
     step-8 output. The sleep scorer averages it into 1-second spectrogram bins at
     load time (``MotionType='File'``), which reproduces ``TheStateEditor``'s
     final per-second motion exactly — and is identical to feeding it the raw

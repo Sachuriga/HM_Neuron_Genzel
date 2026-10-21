@@ -18,7 +18,7 @@ What step 8 writes::
                                 reader never has to agree with us in advance
         sleep_channels          per-rat cortex / sr / pyr tetrodes (JSON)
         session_info            channel map, session boundaries, SNR (JSON)
-        awakeness, emg_rms, theta_delta_ratio
+        theta_delta_ratio       theta/delta of the cleanest EEG channel
 
 **This module is NOT shared with the scoring GUI.** It used to be kept
 byte-identical with ``HM_rat_sleep_score/python/sleep_nwb_store.py``, which was a
@@ -48,7 +48,11 @@ SLEEP_MODULE = "sleep"
 SLEEP_CHANNELS_NAME = "sleep_channels"
 SESSION_INFO_NAME = "session_info"
 # per-sample signals derived from the LFP by the tracker's LFP export
-DERIVED_NAMES = ("awakeness", "emg_rms", "theta_delta_ratio")
+DERIVED_NAMES = ("theta_delta_ratio",)
+# What older step-8 runs also wrote and this one no longer does: the RMS of one
+# LFP column picked as "EMG" (most 20-200 Hz power) and an awakeness index built
+# on it. The real muscle-tone signal is acquisition/emg_from_lfp (EMG_NAME).
+LEGACY_DERIVED_NAMES = ("awakeness", "emg_rms")
 STATES_PREFIX = "states_"
 EVENTS_PREFIX = "events_"
 LAYOUT_NAME = "layout"          # where the contract below is recorded in the file
@@ -296,7 +300,7 @@ def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
     file an 8-byte-per-sample time axis (hundreds of MB over a long session).
 
     ``derived`` holds per-sample signals computed from the LFP
-    (``awakeness``, ``emg_rms``, ``theta_delta_ratio``), each on the LFP clock.
+    (``theta_delta_ratio``), each on the LFP clock.
     ``metadata`` holds the small session records (channel map, session
     boundaries, cleanest channels, SNR scores) as JSON.
     """
@@ -417,8 +421,8 @@ def drop_lfp_outputs(nwb_path):
     """Remove the LFP and everything computed from its columns, so a re-export
     can write them again (``add_sleep_inputs`` never overwrites).
 
-    Drops ``acquisition/lfp`` and ``processing/sleep/{session_info, awakeness,
-    emg_rms, theta_delta_ratio}``. Scorings, sleep_channels, EMG, motion,
+    Drops ``acquisition/lfp`` and ``processing/sleep/{session_info,
+    theta_delta_ratio}``. Scorings, sleep_channels, EMG, motion,
     behaviour and units are untouched. HDF5 does not give the freed space back
     (run ``src/nwb/compact_nwb.py`` for that). Returns the names removed.
     """
@@ -433,6 +437,56 @@ def drop_lfp_outputs(nwb_path):
                 del f[p]
                 removed.append(p.rsplit("/", 1)[-1])
     return removed
+
+
+def drop_legacy_outputs(nwb_path):
+    """Remove the single-channel EMG outputs that older step-8 runs wrote.
+
+    Deletes ``processing/sleep/{awakeness, emg_rms}`` and takes the
+    ``emg_channel_index`` key out of ``session_info``. The ``layout`` record's
+    ``derived`` list is updated to match, so it only names what the file holds.
+    Everything else (LFP, emg_from_lfp, scorings, behaviour, units) is left
+    alone. Returns what was removed; empty when the file was already clean.
+    """
+    import h5py
+
+    removed = []
+    with h5py.File(str(nwb_path), "r+") as f:
+        mod = f.get(f"processing/{SLEEP_MODULE}")
+        if mod is None:
+            return removed
+
+        for name in LEGACY_DERIVED_NAMES:
+            if name in mod:
+                del mod[name]
+                removed.append(name)
+
+        # session_info and layout keep their JSON in the series' description
+        # attribute, so they are edited in place rather than rewritten.
+        info = _description_json(mod, SESSION_INFO_NAME)
+        if info is not None and "emg_channel_index" in info:
+            del info["emg_channel_index"]
+            mod[SESSION_INFO_NAME].attrs["description"] = json.dumps(info)
+            removed.append("session_info.emg_channel_index")
+
+        layout = _description_json(mod, LAYOUT_NAME)
+        if layout is not None:
+            old = list(layout.get("derived", []))
+            kept = [n for n in old if n not in LEGACY_DERIVED_NAMES]
+            if kept != old:
+                layout["derived"] = kept
+                mod[LAYOUT_NAME].attrs["description"] = json.dumps(layout)
+    return removed
+
+
+def _description_json(group, name):
+    """The JSON in ``group[name]``'s description attribute (h5py), or None."""
+    if name not in group:
+        return None
+    try:
+        return json.loads(group[name].attrs["description"])
+    except Exception:
+        return None
 
 
 def _jsonable(v):
