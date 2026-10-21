@@ -1,6 +1,7 @@
 import gc
 import os
 import re
+import sys
 import argparse
 import numpy as np
 from pathlib import Path
@@ -10,6 +11,14 @@ from tqdm import tqdm
 from session_prefix import session_prefix
 from lfp_from_raw import (find_raw_sessions, build_lfp_from_raw, lfp_reference,
                           REF_NONE, REF_EXPORTLFP)
+
+# src/nwb holds the session-NWB writer, which also owns the one theta/delta
+# definition shared with step v. Append, never insert(0): src/nwb has its own
+# session_prefix.py that would otherwise shadow this package's.
+_NWB_DIR = str(Path(__file__).resolve().parent.parent / "nwb")
+if _NWB_DIR not in sys.path:
+    sys.path.append(_NWB_DIR)
+import sleep_nwb_writer as snwb   # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -270,16 +279,60 @@ def select_cleanest_channels(lfp_array, fs, n_best=3, segment_duration_s=60):
 # THETA / DELTA RATIO
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_theta_delta(lfp_array, fs, best_ch_idx, epoch_s=1):
-    """Theta/delta power ratio of the cleanest EEG channel.
+def _column_info(channel_map, column, source):
+    """Describe one LFP column for the log and session_info: which column,
+    which nTrode/channel it is, and why it was chosen (``source``)."""
+    entry = channel_map[column]
+    ntrode, channel = entry.get('ntrode'), entry.get('channel')
+    return {'index': int(column),
+            'ntrode': None if ntrode is None else int(ntrode),
+            'channel': None if channel is None else int(channel),
+            'source': source}
 
-    One value per ``epoch_s`` epoch (theta 5–9 Hz over delta 0.5–4 Hz), then
-    interpolated onto every LFP sample so it shares the LFP clock.
+
+def pick_theta_delta_channel(channel_map, sleep_channels, bad_hw, cleanest_idx):
+    """The LFP column the theta/delta ratio is computed on.
+
+    Normally a channel of the rat's pyr tetrode (``pyr:NT<t>`` in
+    SLEEP_CHANNELS_<RAT> of the config): the ratio then follows theta in the
+    hippocampal layer the cells sit in, instead of whichever channel happened
+    to have the best sleep-band SNR. Which of its four channels is decided by
+    sorting.sleep_role_column — the same rule step v uses for theta phase.
+
+    Falls back to the cleanest channel when the config names no pyr tetrode,
+    the tetrode is not in this LFP, or all of its channels are bad.
+
+    Returns the ``_column_info`` dict of the chosen column.
+    """
+    pyr_tetrode = (sleep_channels or {}).get('pyr')
+    if pyr_tetrode is None:
+        tqdm.write("  ⚠ No pyr tetrode in SLEEP_CHANNELS_<RAT> — theta/delta "
+                   "uses the cleanest channel instead.")
+        return _column_info(channel_map, int(cleanest_idx[0]), 'cleanest')
+
+    # sorting is imported here, not at the top: it pulls in spikeinterface,
+    # which this script only needs once a pyr tetrode is configured.
+    from sorting import sleep_role_column
+    column = sleep_role_column(channel_map, sleep_channels, 'pyr', bad_hw)
+    if column is None:
+        tqdm.write(f"  ⚠ pyr tetrode NT{pyr_tetrode} has no usable channel in "
+                   f"this LFP (missing, or all bad) — theta/delta uses the "
+                   f"cleanest channel instead.")
+        return _column_info(channel_map, int(cleanest_idx[0]), 'cleanest')
+    return _column_info(channel_map, column, 'pyr')
+
+
+def compute_theta_delta(lfp_array, fs, column, epoch_s=1):
+    """Theta/delta power ratio of one LFP column (see pick_theta_delta_channel).
+
+    One value per ``epoch_s`` epoch, with the bands of
+    ``sleep_nwb_writer.theta_delta_ratio`` (theta 6–12 Hz over delta 1–4 Hz),
+    then interpolated onto every LFP sample so it shares the LFP clock.
     """
     n_samples   = lfp_array.shape[0]
     n_per_epoch = int(fs * epoch_s)
     n_epochs    = n_samples // n_per_epoch
-    eeg_ch      = int(best_ch_idx[0])
+    column      = int(column)
 
     theta_delta = np.zeros(n_epochs, dtype='float32')
 
@@ -288,13 +341,11 @@ def compute_theta_delta(lfp_array, fs, best_ch_idx, epoch_s=1):
         for i in range(n_epochs):
             s = i * n_per_epoch
             e = s + n_per_epoch
-            eeg_seg = np.array(lfp_array[s:e, eeg_ch], dtype='float64')
+            segment = np.array(lfp_array[s:e, column], dtype='float64')
 
-            f, psd = welch(eeg_seg, fs=fs,
+            f, psd = welch(segment, fs=fs,
                            nperseg=min(n_per_epoch, int(2 * fs)))
-            delta          = np.mean(psd[(f >= 0.5) & (f <= 4)])
-            theta          = np.mean(psd[(f >= 5)   & (f <= 9)])
-            theta_delta[i] = theta / (delta + 1e-12)
+            theta_delta[i] = snwb.theta_delta_ratio(f, psd)
             pb.update(1)
 
     tqdm.write(f"  Upsampling theta/delta from {n_epochs} epochs → "
@@ -349,7 +400,7 @@ def _stored_lfp_shape(nwb_path):
 
 def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
                       sleep_channels, cleanest, snr, theta_delta, reference,
-                      session_name=None):
+                      theta_delta_info=None, session_name=None):
     """Write the per-sample arrays into ``<op>/<Rat>_<YYYYMMDD>.nwb``.
 
     THE TIME AXIS is unchanged from the ``lfp_timestamps.npy`` this replaces.
@@ -363,18 +414,13 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
     concatenated session starts on that axis, in samples and in seconds, and
     ``session_info.lfp_reference`` what the LFP is referenced to (``reference``,
     one of the labels in lfp_from_raw: ``"none"`` for a single-ended .rec read).
+    ``session_info.theta_delta`` (``theta_delta_info``) records the channel and
+    bands ``theta_delta_ratio`` was computed with.
 
     Creates the file when absent, appends when it already exists, and never
     overwrites a container that is already there — so a scoring, behaviour or
     units added later survive a re-run.
     """
-    # append, never insert(0): src/nwb has its own session_prefix.py that would
-    # otherwise shadow this package's
-    import sys as _sys
-    _nwb_dir = str(Path(__file__).resolve().parent.parent / "nwb")
-    if _nwb_dir not in _sys.path:
-        _sys.path.append(_nwb_dir)
-    import sleep_nwb_writer as snwb
     from pynwb import NWBHDF5IO, NWBFile
     from uuid import uuid4
     from datetime import datetime, timezone as _tz
@@ -418,6 +464,7 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
         "cleanest_channel_indices": cleanest,
         "channel_snr_scores": snr,
         "session_boundaries": bounds,
+        "theta_delta": theta_delta_info,
     }
     derived = {
         "theta_delta_ratio": (theta_delta, fs, "ratio",
@@ -457,6 +504,16 @@ def write_session_nwb(output_folder, pfx, fs, lfp, boundaries, channel_map,
                            f"removed {', '.join(removed)}")
                 tqdm.write(f"    The old LFP's space stays inside the file until "
                            f"`python src/nwb/compact_nwb.py {op}`.")
+        # The stored theta/delta is never overwritten either. When it was made
+        # from another channel or with other bands (older runs: the cleanest
+        # channel, 5–9 / 0.5–4 Hz), drop it together with the session_info that
+        # describes it, so both are written again below.
+        old_theta_delta = snwb.stored_session_info(nwb_path).get("theta_delta")
+        if old_theta_delta != theta_delta_info:
+            removed = snwb.drop_theta_delta_outputs(nwb_path)
+            if removed:
+                tqdm.write(f"  ↻ theta/delta channel or bands changed; "
+                           f"removed {', '.join(removed)}")
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()
@@ -657,16 +714,20 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
 
         # Per-rat sleep-scoring channels (cortex/sr/pyr tetrodes) from the config,
         # saved alongside the data so the sleep scorer uses the right layers.
+        # The rat's bad channels (hardware ids) come along, so a bad channel of
+        # the pyr tetrode is never the theta/delta channel.
         sc = {}
+        bad_hw = []
         try:
-            from sorting import load_sorting_config, resolve_sleep_channels
-            sc = resolve_sleep_channels(
-                session_name,
-                load_sorting_config(config_path, quiet=True)) or {}
+            from sorting import (load_sorting_config, resolve_sleep_channels,
+                                 resolve_rat_settings)
+            config = load_sorting_config(config_path, quiet=True)
+            sc = resolve_sleep_channels(session_name, config) or {}
             if sc:
                 if keep_npy:
                     np.save(output_dir / f"{pfx}sleep_channels.npy", sc)
                 tqdm.write(f"  ✓ sleep channels  {sc}")
+            bad_hw, _ref, _eeg = resolve_rat_settings(session_name, config)
         except Exception as exc:
             tqdm.write(f"  (sleep_channels not resolved: {exc})")
 
@@ -683,9 +744,23 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
 
         # ── 4. COMPUTE THETA/DELTA RATIO ────────────────────────────────────
         tqdm.write("Step 4/5 — Computing theta/delta ratio")
-        theta_delta = compute_theta_delta(lfp_array, fs, best_ch_idx)
+        td_channel = pick_theta_delta_channel(ch_info_list, sc, bad_hw, best_ch_idx)
+        td_label = f"nt{td_channel['ntrode']}ch{td_channel['channel']}"
+        tqdm.write(f"  theta/delta on column {td_channel['index']} ({td_label}, "
+                   f"{td_channel['source']}), "
+                   f"theta {snwb.THETA_RATIO_BAND[0]:g}–{snwb.THETA_RATIO_BAND[1]:g} Hz / "
+                   f"delta {snwb.DELTA_BAND[0]:g}–{snwb.DELTA_BAND[1]:g} Hz")
+        theta_delta = compute_theta_delta(lfp_array, fs, td_channel['index'])
         if keep_npy:
             np.save(output_dir / f"{pfx}theta_delta_ratio.npy", theta_delta)
+        # Written into session_info, so a later run can tell whether the stored
+        # ratio still matches (plain lists/ints: compared against stored JSON).
+        theta_delta_info = {
+            "channel": td_channel,
+            "theta_band_hz": [float(v) for v in snwb.THETA_RATIO_BAND],
+            "delta_band_hz": [float(v) for v in snwb.DELTA_BAND],
+            "epoch_s": 1,
+        }
         advance(4)
 
         # ── 5. PACKAGE INTO THE SESSION NWB ─────────────────────────────────
@@ -697,7 +772,8 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
             output_folder, pfx, fs=fs, lfp=lfp_array, boundaries=boundaries,
             channel_map=ch_info_list, sleep_channels=sc,
             cleanest=best_ch_idx, snr=scores, theta_delta=theta_delta,
-            reference=reference, session_name=session_name)
+            reference=reference, theta_delta_info=theta_delta_info,
+            session_name=session_name)
 
         del lfp_array
         gc.collect()
@@ -705,7 +781,8 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
     tqdm.write(f"\n{'='*60}")
     tqdm.write(f"✅  Per-sample data → {nwb_path.name}")
     tqdm.write(f"   acquisition/lfp              ({n_samples}, {num_channels}) @ {fs} Hz")
-    tqdm.write(f"   sleep/theta_delta_ratio      per-sample")
+    tqdm.write(f"   sleep/theta_delta_ratio      per-sample, {td_label} "
+               f"({td_channel['source']})")
     tqdm.write(f"   sleep/sleep_channels         cortex/sr/pyr tetrodes")
     tqdm.write(f"   sleep/session_info           channel map, boundaries, "
                f"top-3 EEG ch {best_ch_idx}, SNR")

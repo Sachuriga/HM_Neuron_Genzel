@@ -147,7 +147,8 @@ def _parse_tetrode_list(raw_value):
 
 # Sleep-scoring channels: one tetrode per role.
 #   cortex -> NREM slow-wave/delta ; sr (stratum radiatum) -> REM theta ;
-#   pyr (pyramidal) -> optional (ripples / EMG spread).
+#   pyr (pyramidal) -> step 8's theta/delta ratio and step v's theta phase
+#                      (sleep_role_column picks its channel for both).
 SLEEP_ROLES = ("cortex", "sr", "pyr")
 
 
@@ -196,6 +197,42 @@ def resolve_sleep_channels(file_stem, config):
         if isinstance(config[rat], dict) and recording_belongs_to_rat(file_stem, rat):
             return dict(config[rat].get("sleep_channels", {}))
     return {}
+
+
+def sleep_role_column(channel_map, sleep_channels, role, bad_channels=()):
+    """The LFP column that stands for one sleep role's tetrode, or None.
+
+    ``channel_map``    the LFP's columns, ``[{'index', 'ntrode', 'channel'}, ...]``
+    ``sleep_channels`` ``{role: tetrode}`` from resolve_sleep_channels
+    ``role``           "cortex", "sr" or "pyr"
+    ``bad_channels``   hardware channel ids from BAD_CHANNELS_<RAT>
+
+    The four channels of a tetrode carry nearly the same LFP, so one is enough:
+    the lowest-numbered channel that is not bad. Step 8 (theta/delta ratio) and
+    step v (theta phase) both use this, so they always pick the same channel.
+
+    None when the role has no tetrode in the config, the tetrode is not in
+    this LFP, or all of its channels are bad.
+    """
+    tetrode = (sleep_channels or {}).get(role)
+    if tetrode is None:
+        return None
+
+    bad = set(int(c) for c in bad_channels)
+    candidates = []                      # (channel number, LFP column)
+    for position, entry in enumerate(channel_map or []):
+        ntrode, channel = entry.get("ntrode"), entry.get("channel")
+        if ntrode is None or channel is None or int(ntrode) != int(tetrode):
+            continue
+        hardware_id = (int(ntrode) - 1) * CH_PER_TETRODE + (int(channel) - 1)
+        if hardware_id in bad:
+            continue                     # a bad channel never stands for the tetrode
+        candidates.append((int(channel), int(entry.get("index", position))))
+
+    if not candidates:
+        return None
+    _channel, column = min(candidates)   # lowest channel number first
+    return column
 
 
 def load_sorting_config(config_path, quiet=False):

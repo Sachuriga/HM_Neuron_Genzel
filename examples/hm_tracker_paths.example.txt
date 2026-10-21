@@ -116,7 +116,9 @@ DETECT_SIGN = -1
 # so pick ONE tetrode per layer (written "role:NT<t>" or "role:<t>", 1..32):
 #   cortex : drives the slow-wave / delta metric  -> NREM detection
 #   sr     : stratum radiatum, where theta peaks   -> REM detection
-#   pyr    : pyramidal layer (ripples); optional, reserved for EMG/future use
+#   pyr    : pyramidal layer; step 8's theta/delta ratio (6-12 / 1-4 Hz) and
+#            step v's theta phase both use it (its lowest channel not in
+#            BAD_CHANNELS)
 # Example:  SLEEP_CHANNELS_RAT1 = cortex:NT28 sr:NT10 pyr:NT5
 # The tracker resolves these at step 8 and writes <prefix>sleep_channels.npy into
 # LFP_Output; the sleep scorer then uses cortex for slow-wave and sr for theta

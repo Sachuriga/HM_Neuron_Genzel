@@ -24,10 +24,13 @@ each computed in three splits — GOAL-RUNNING (type-1 trial windows), FREE-ROAM
   y scale per unit.
 
 Theta comes from the session LFP — the session NWB's acquisition/lfp (step 8),
-or the legacy <op>/LFP_Output/*.npy export for older sessions: the channel
-with the highest theta/delta power ratio during a movement-rich block (never
-one of the rat's BAD_CHANNELS from the tracker config) is
-band-passed 6-10 Hz and Hilbert-transformed. Phase convention: 0 deg = peak of
+or the legacy <op>/LFP_Output/*.npy export for older sessions. The theta
+channel is the rat's pyr tetrode (SLEEP_CHANNELS_<RAT> in the tracker config,
+its lowest channel not in BAD_CHANNELS) — the same channel step 8 computes
+theta/delta on. Without a pyr tetrode it is the channel with the highest
+theta/delta power ratio (6-12 / 1-4 Hz, the tracker's one definition in
+sleep_nwb_writer) during a movement-rich block, never a BAD_CHANNELS one. That
+channel is band-passed 6-10 Hz and Hilbert-transformed. Phase convention: 0 deg = peak of
 filtered theta, +-180 deg = trough. LFP sample 0 of the MAZE session aligns with
 spike time 0 (verified: pooled spike-phase locking collapses when the LFP is
 artificially shifted). If the LFP is missing the phase/precession pages are
@@ -50,7 +53,10 @@ from scipy.ndimage import gaussian_filter1d
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import visualize_nwb as V      # noqa: E402
 import neural_umap as NU       # noqa: E402  _hex_assign / _bridges (no umap import)
+import sleep_nwb_writer as snwb  # noqa: E402  NWB names + the theta/delta ratio
 
+# Band-pass for the theta PHASE only. Choosing the theta channel uses the
+# tracker-wide theta/delta bands instead (snwb.theta_delta_ratio).
 THETA_BAND = (6.0, 10.0)
 PETH_WIN = 3.0                 # s each side of the event
 PETH_BIN = 0.1                 # s
@@ -203,7 +209,6 @@ def build_events(x, y, t, trials, nodes):
 #   origin       short text for the log
 def _lfp_source_from_nwb(op_folder):
     """The LFP stored in the session NWB as an LFP source, or None if absent."""
-    import sleep_nwb_writer as snwb
     from pynwb import NWBHDF5IO
 
     nwb_path = snwb.find_session_nwb(op_folder)
@@ -291,27 +296,69 @@ def _lfp_source_from_npy(op_folder):
             "close": lambda: None, "origin": "LFP_Output"}
 
 
-def _bad_columns(source, config_path):
-    """LFP columns of the rat's BAD_CHANNELS_<rat> (tracker config), so a
-    known-bad channel is never picked as the theta channel.
+def _rat_config(source, config_path):
+    """This session's rat in the tracker config (hm_tracker_paths.txt):
+    ``(bad hardware channel ids, {"cortex"/"sr"/"pyr": tetrode})``.
 
-    Empty when there is no config, no entry for the rat or no channel map.
+    Both are empty when there is no config, no entry for the rat, or the
+    config cannot be read.
     """
     if not config_path:
-        return set()
+        return [], {}
     try:
         # The config reader lives with the sorter. Append (never insert at 0):
         # src/nwb's own modules, e.g. session_prefix, must keep priority.
         sorter_dir = str(Path(__file__).resolve().parent.parent / "sorter")
         if sorter_dir not in sys.path:
             sys.path.append(sorter_dir)
-        from sorting import load_sorting_config, resolve_rat_settings
-        bad_hw, _ref, _eeg = resolve_rat_settings(
-            source["name"], load_sorting_config(config_path, quiet=True))
+        from sorting import (load_sorting_config, resolve_rat_settings,
+                             resolve_sleep_channels)
+        config = load_sorting_config(config_path, quiet=True)
+        bad_hw, _ref, _eeg = resolve_rat_settings(source["name"], config)
+        sleep_channels = resolve_sleep_channels(source["name"], config)
     except Exception as e:
-        print(f"  [theta] bad channels not read from the config ({e}); "
-              f"every channel can be the theta channel.")
-        return set()
+        print(f"  [theta] the tracker config could not be read ({e}); no bad "
+              f"channels are skipped and no pyr tetrode is known.")
+        return [], {}
+    return list(bad_hw), dict(sleep_channels or {})
+
+
+def _pyr_column(source, sleep_channels, bad_hw):
+    """LFP column of the rat's pyr tetrode (SLEEP_CHANNELS_<RAT>), or None.
+
+    The same channel step 8 computes the theta/delta ratio on: both use
+    sorting.sleep_role_column. None (with a note in the log) when the config
+    names no pyr tetrode, the LFP has no channel map, or the tetrode has no
+    usable channel in this LFP; the caller then picks a channel itself.
+    """
+    pyr_tetrode = sleep_channels.get("pyr")
+    if pyr_tetrode is None:
+        print("  [theta] no pyr tetrode in SLEEP_CHANNELS_<RAT>; using the "
+              "channel with the highest theta/delta instead.")
+        return None
+    if not source["channel_map"]:
+        print("  [theta] no channel map: the pyr tetrode cannot be found in "
+              "the LFP; using the channel with the highest theta/delta instead.")
+        return None
+
+    # _rat_config already put src/sorter on sys.path (sleep_channels is only
+    # non-empty when it read the config), so this import works.
+    from sorting import sleep_role_column
+    column = sleep_role_column(source["channel_map"], sleep_channels, "pyr", bad_hw)
+    if column is None:
+        print(f"  [theta] pyr tetrode NT{pyr_tetrode} has no usable channel in "
+              f"this LFP (missing, or all bad); using the channel with the "
+              f"highest theta/delta instead.")
+    return column
+
+
+def _bad_columns(source, bad_hw):
+    """LFP columns of the rat's BAD_CHANNELS_<rat> (``bad_hw``, hardware ids
+    from _rat_config), so a known-bad channel is never picked as the theta
+    channel.
+
+    Empty when the rat has no bad channels or the LFP has no channel map.
+    """
     if not bad_hw:
         return set()
     if not source["channel_map"]:
@@ -368,9 +415,13 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=No
     The LFP is read from the session NWB (acquisition/lfp, written by step 8),
     or from the legacy LFP_Output/*.npy export when the NWB has none.
 
-    Channel = the column with the highest theta/delta Welch-power ratio inside a
-    movement-rich `sel_block_s` block (found from the tracking), never one of the
-    rat's BAD_CHANNELS in `config` (hm_tracker_paths.txt). The maze session's
+    Channel = the rat's pyr tetrode from SLEEP_CHANNELS_<RAT> in `config`
+    (hm_tracker_paths.txt): its lowest channel that is not in BAD_CHANNELS, the
+    same channel step 8 computes theta/delta on. Without one, the column with
+    the highest theta/delta Welch-power ratio (snwb.theta_delta_ratio:
+    6-12 / 1-4 Hz) inside a movement-rich `sel_block_s` block (found from the
+    tracking), never a BAD_CHANNELS one. `band` is the phase
+    band-pass only. The maze session's
     sample 0 is spike-time 0 (session_boundaries; maze-only exports start at 0).
     Reads ONE contiguous row-block for selection, then only the chosen column
     for the full trace. Returns dict or None:
@@ -392,8 +443,11 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=No
     # 2. Compute the theta phase. The file is closed again whatever happens;
     #    everything returned is an in-memory copy.
     try:
-        skip = _bad_columns(source, config)
-        return _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip)
+        bad_hw, sleep_channels = _rat_config(source, config)
+        skip = _bad_columns(source, bad_hw)
+        pyr_column = _pyr_column(source, sleep_channels, bad_hw)
+        return _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip,
+                                      column=pyr_column)
     except Exception as e:
         print(f"  [theta] failed to load LFP ({e}) — phase pages skipped.")
         return None
@@ -401,9 +455,11 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=No
         source["close"]()
 
 
-def _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip=()):
+def _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip=(), column=None):
     """The work behind load_theta, on an LFP source dict (see above).
-    ``skip``: LFP columns that may not be the theta channel (bad channels)."""
+    ``column``: the theta channel (the pyr tetrode's) when known; None picks
+    the channel with the highest theta/delta in a movement-rich block.
+    ``skip``: LFP columns that may not be picked that way (bad channels)."""
     ld = source["data"]
     fs = source["fs"]
 
@@ -443,28 +499,40 @@ def _theta_from_lfp_source(source, x, y, t, band, sel_block_s, skip=()):
         if v > best_v:
             best_v, best_t0 = v, c
     s0 = int(best_t0 * fs); s1 = min(int((best_t0 + sel_block_s) * fs), len(ld))
-    block = np.asarray(ld[s0:s1, :], dtype=np.float64)   # one contiguous read
-    if len(skip) >= block.shape[1]:
-        skip = ()                      # nothing would be left: allow every channel
-    ratios = np.full(block.shape[1], -np.inf)   # -inf = never chosen
-    for chn in range(block.shape[1]):
-        if chn in skip:
-            continue                   # a bad channel is never the theta channel
-        f, P = welch(block[:, chn], fs=fs, nperseg=4096)
-        th = P[(f >= band[0]) & (f <= band[1])].mean()
-        de = P[(f >= 1) & (f <= 4)].mean()
-        ratios[chn] = th / de if de > 0 else 0.0
-    best = int(np.argmax(ratios))
 
-    # Read the full trace of the chosen channel only.
+    if column is not None:
+        # The theta channel is given (the pyr tetrode's): read only its trace.
+        # Its theta/delta in the movement block is computed for the log only,
+        # so a pyr channel with weak theta shows up there.
+        best = int(column)
+        how = "pyr tetrode"
+        sig = source["read_column"](best)
+        f, P = welch(sig[s0:s1], fs=fs, nperseg=4096)
+        best_ratio = snwb.theta_delta_ratio(f, P)
+    else:
+        # No pyr channel: pick the channel with the highest theta/delta ratio
+        # in the movement block, then read the full trace of that one only.
+        block = np.asarray(ld[s0:s1, :], dtype=np.float64)   # one contiguous read
+        if len(skip) >= block.shape[1]:
+            skip = ()                  # nothing would be left: allow every channel
+        ratios = np.full(block.shape[1], -np.inf)   # -inf = never chosen
+        for chn in range(block.shape[1]):
+            if chn in skip:
+                continue               # a bad channel is never the theta channel
+            f, P = welch(block[:, chn], fs=fs, nperseg=4096)
+            ratios[chn] = snwb.theta_delta_ratio(f, P)   # same bands as step 8
+        best = int(np.argmax(ratios))
+        best_ratio = float(ratios[best])
+        how = "highest theta/delta"
+        sig = source["read_column"](best)
+
     label = _channel_label(source["channel_map"], best)
-    sig = source["read_column"](best)
 
     b, a = butter(3, [band[0] / (fs / 2), band[1] / (fs / 2)], btype="band")
     thf = filtfilt(b, a, sig)
     uw = np.unwrap(np.angle(hilbert(thf)))
     lt = (np.arange(len(sig)) / fs - off)
-    print(f"  [theta] channel {label} (theta/delta {max(ratios):.2f}) from "
+    print(f"  [theta] channel {label} ({how}, theta/delta {best_ratio:.2f}) from "
           f"{source['origin']}, {fs:g} Hz, {len(sig) / fs:.0f}s, offset {off:g}s.")
     return {"fs": fs, "lt": lt.astype(np.float32), "uw": uw.astype(np.float32),
             "sig": sig.astype(np.float32),          # raw channel, for gamma bands

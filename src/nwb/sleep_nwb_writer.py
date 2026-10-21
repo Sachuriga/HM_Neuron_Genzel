@@ -17,8 +17,10 @@ What step 8 writes::
         layout                  the container names used here, recorded so a
                                 reader never has to agree with us in advance
         sleep_channels          per-rat cortex / sr / pyr tetrodes (JSON)
-        session_info            channel map, session boundaries, SNR (JSON)
-        theta_delta_ratio       theta/delta of the cleanest EEG channel
+        session_info            channel map, session boundaries, SNR, and the
+                                channel + bands theta_delta_ratio used (JSON)
+        theta_delta_ratio       theta/delta of the config's pyr tetrode (the
+                                cleanest EEG channel when there is none)
 
 **This module is NOT shared with the scoring GUI.** It used to be kept
 byte-identical with ``HM_rat_sleep_score/python/sleep_nwb_store.py``, which was a
@@ -49,6 +51,13 @@ SLEEP_CHANNELS_NAME = "sleep_channels"
 SESSION_INFO_NAME = "session_info"
 # per-sample signals derived from the LFP by the tracker's LFP export
 DERIVED_NAMES = ("theta_delta_ratio",)
+
+# The theta/delta ratio has ONE definition for the whole tracker: step 8
+# (export_lfp, which stores theta_delta_ratio) and step v (theta_events, which
+# picks its theta channel by this ratio) both call theta_delta_ratio() below,
+# so the two steps can never drift onto different bands again.
+THETA_RATIO_BAND = (6.0, 12.0)   # Hz
+DELTA_BAND = (1.0, 4.0)          # Hz
 # What older step-8 runs also wrote and this one no longer does: the RMS of one
 # LFP column picked as "EMG" (most 20-200 Hz power) and an awakeness index built
 # on it. The real muscle-tone signal is acquisition/emg_from_lfp (EMG_NAME).
@@ -284,6 +293,28 @@ def _read_json(mod, name):
 
 
 # ---------------------------------------------------------------------------- #
+#  The theta/delta ratio (shared by step 8 and step v)
+# ---------------------------------------------------------------------------- #
+def theta_delta_ratio(freqs, psd):
+    """Theta/delta power ratio of one power spectrum (e.g. from Welch).
+
+    Mean power density inside THETA_RATIO_BAND divided by the mean inside
+    DELTA_BAND. A mean, not a sum, so the two bands' different widths do not
+    tilt the ratio. Returns 0.0 when the delta band holds no power (a flat or
+    disconnected channel), so such a channel never looks theta-rich.
+    """
+    freqs = np.asarray(freqs)
+    psd = np.asarray(psd)
+    in_theta = (freqs >= THETA_RATIO_BAND[0]) & (freqs <= THETA_RATIO_BAND[1])
+    in_delta = (freqs >= DELTA_BAND[0]) & (freqs <= DELTA_BAND[1])
+    theta_power = psd[in_theta].mean()
+    delta_power = psd[in_delta].mean()
+    if not delta_power > 0:          # also catches NaN
+        return 0.0
+    return float(theta_power / delta_power)
+
+
+# ---------------------------------------------------------------------------- #
 #  Writing the scoring inputs (tracker step 8)
 # ---------------------------------------------------------------------------- #
 def add_sleep_inputs(nwbfile, lfp=None, lfp_timestamps=None, lfp_rate=None,
@@ -431,6 +462,29 @@ def drop_lfp_outputs(nwb_path):
 
     paths = [f"acquisition/{LFP_NAME}", f"acquisition/{EMG_NAME}"] + [
         f"processing/{SLEEP_MODULE}/{n}" for n in (SESSION_INFO_NAME,) + DERIVED_NAMES]
+    removed = []
+    with h5py.File(str(nwb_path), "r+") as f:
+        for p in paths:
+            if p in f:
+                del f[p]
+                removed.append(p.rsplit("/", 1)[-1])
+    return removed
+
+
+def drop_theta_delta_outputs(nwb_path):
+    """Remove ``processing/sleep/{theta_delta_ratio, session_info}`` so a
+    re-export can write them again (``add_sleep_inputs`` never overwrites).
+
+    Used when the stored ratio was computed from another channel or with other
+    bands than this run's. ``session_info`` goes too because it records which
+    channel and bands the stored ratio used; step 8 writes it again in full.
+    The LFP, EMG, scorings, behaviour and units are untouched. Returns the
+    names removed.
+    """
+    import h5py
+
+    paths = [f"processing/{SLEEP_MODULE}/{n}" for n in ("theta_delta_ratio",
+                                                       SESSION_INFO_NAME)]
     removed = []
     with h5py.File(str(nwb_path), "r+") as f:
         for p in paths:
