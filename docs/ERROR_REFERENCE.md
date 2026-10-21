@@ -6,7 +6,6 @@ Look up the exact error or warning message you see to find the likely cause and 
 |---|---|---|---|
 | `Config file not found` | `scripts/runner_windows.bat` | `hm_tracker_paths.txt` not on Desktop | Copy example from repo, rename, fill in paths |
 | `trodesexport not found at: ...` | `scripts/runner_windows.bat` | `TRODES_EXPORT_CMD` path is wrong | Fix path in `hm_tracker_paths.txt` |
-| `exportLFP not found at: ...` | `scripts/runner_windows.bat` | `TRODES_EXPORT_LFP` path is wrong | Fix path in `hm_tracker_paths.txt` |
 | `No videos found at location [...]` | `join_views.py` | Camera videos missing or named incorrectly | Rename to `eye??_*.mp4`, verify 12 files present |
 | `Found unexpected number of videos` | `join_views.py` | Video count doesn't match expected | Use `-n` flag or remove extra `.mp4` files |
 | `Can't find requested path` | `join_views.py` | Input folder doesn't exist | Verify input folder path |
@@ -19,7 +18,7 @@ Look up the exact error or warning message you see to find the likely cause and 
 | `No log files found in output folder` | `plot_trials.py` | Step 4 not run | Run Step 4 first |
 | `FFmpeg compression failed` | `scripts/runner_windows.bat` | NVENC session limit or GPU out of memory | Reduce parallel jobs; check `nvidia-smi` |
 | `No valid .mp4 file found to compress` | `scripts/runner_windows.bat` | Step 4 did not produce output | Run Step 4 first |
-| `No LFP .dat files found` | `sorting.py`, `export_lfp.py` | Step e (LFP export) not run | Run `exportLFP` with `-rec` flag |
+| `No LFP source found` | `export_lfp.py` | No `.rec` in the input folder (and no old raw / `.LFP` export) | Put the session's `.rec` in the ip folder; step 8 reads it directly |
 | `Warning: 'readTrodesExtractedDataFile3.py' not found` | `sorting.py` | Helper script missing from `src/sorter/` | Obtain file from supervisor, place in `src/sorter/` |
 | `Settings format not supported` | `readTrodesExtractedDataFile3.py` | `.dat` file header malformed or wrong Trodes version | Re-export from Trodes; check file header |
 | `No .xlsx files found` | `hex_maze_analysis.py` | `RecordingMeta.xlsx` not in input folder | Move metadata file to input folder |
@@ -36,8 +35,7 @@ Use this to verify each step completed successfully before moving to the next.
 | Step | Expected Output | Location |
 |---|---|---|
 | Step 1 | `<recording>.DIO/` folder | Input folder |
-| Step 1 | `<recording>.raw/` folder | Input folder |
-| Step e | `<recording>.LFP/` folder containing `_nt*ch*.dat` files | Input folder |
+| Step 1 | `<recording>.analog/` folder (headstage IMU, read by step 8) | Input folder |
 | Step 2 | `stitched_framewise_ts.csv` or `stitched_framewise_seconds.csv` | Output folder |
 | Step 3 | `stitched.mp4` | Input folder |
 | Step 4 | `<date>_Rat<id>.txt` (node log) | Output folder |

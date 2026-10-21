@@ -1,7 +1,7 @@
 """All-channel LFP from the wideband ``.rec`` (or an old ``*.raw/*_group0.dat``).
 
 Trodes ``exportLFP`` writes ONE channel per nTrode (the workspace's LFP channel),
-so step e gives 32 of the 128 channels. This builds the LFP for every channel
+so it gave 32 of the 128 channels (the retired step e). This builds the LFP for every channel
 straight from the 30 kHz wideband instead, mirroring exportLFP's settings:
 
     int16 x 0.195 uV -> low-pass 700 Hz (zero-phase Butterworth) -> keep every
@@ -33,7 +33,7 @@ import numpy as np
 
 RAW_FS = 30000.0        # raw acquisition rate (Hz)
 GAIN = 0.195            # uV per bit (as in sorting.py)
-LFP_LOWPASS = 700.0     # Hz — exportLFP -lfplowpass 700 (runner step e)
+LFP_LOWPASS = 700.0     # Hz — as exportLFP -lfplowpass 700 (the retired step e)
 FILTER_ORDER = 4
 FILTER_MARGIN_MS = 50.0 # chunk-edge padding; the 700 Hz filter settles in a few ms
 CH_PER_TETRODE = 4
@@ -42,7 +42,7 @@ CH_PER_TETRODE = 4
 # so a re-run can tell whether the LFP already there was made the same way.
 REF_NONE = "none"                       # .rec read single-ended (no rawRef)
 REF_RAW_EXPORT = "trodes_raw_export"    # old trodesexport -raw .dat: rawRef baked in
-REF_EXPORTLFP = "trodes_exportlfp"      # step e's exportLFP .dat: Trodes' LFP reference
+REF_EXPORTLFP = "trodes_exportlfp"      # old exportLFP .dat: Trodes' LFP reference
 
 
 def lfp_reference(sessions):

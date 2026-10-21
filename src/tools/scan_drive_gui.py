@@ -1679,7 +1679,9 @@ class MetaDialog(QDialog):
                if errs else ""))
 
 
-_PP_STEPS = list("1e2345678d")
+# every step an implanted session runs (a superset of the video-only steps);
+# taken from preprocess_check so the columns follow the expected steps
+_PP_STEPS = list(ppc.PRESET[True])
 _PP_COLS = ["Rat", "Date", "d/s", "type"] + _PP_STEPS + ["progress", "folder"]
 _PP_STATUS_COLOR = {
     ppc.DONE:      QColor(210, 244, 214),   # output present

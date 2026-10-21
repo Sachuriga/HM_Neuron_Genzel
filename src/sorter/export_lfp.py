@@ -548,7 +548,7 @@ def _run_pipeline(input_folder, output_folder, output_rate, config_path,
         if not raw_sessions and not sessions:
             tqdm.write("❌  No LFP source found! Check your input folder.")
             tqdm.write("    Expected: <recording>.rec (or an old <recording>.raw/), or")
-            tqdm.write("              <recording>.LFP/<recording>.LFP_nt*ch*.dat (step e)")
+            tqdm.write("              an old <recording>.LFP/<recording>.LFP_nt*ch*.dat export")
             return
         session_name = (raw_sessions or sessions)[0]['name']
         # rat_sessiondate_ prefix for every generated file (from the recording).

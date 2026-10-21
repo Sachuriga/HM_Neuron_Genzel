@@ -12,21 +12,18 @@ The batch script requires a config file on your Desktop. It will not run without
    - `FFMPEG_CMD` — full path to `ffmpeg.exe`
    - `ONNX_WEIGHTS_PATH` — full path to the `.onnx` model weights file
    - `TRODES_EXPORT_CMD` — full path to `trodesexport.exe`
-   - `TRODES_EXPORT_LFP` — full path to `exportLFP.exe`
-   - `LFP_CHANNELS` — channel list for LFP export
 
 ---
 
 ## External Tools Not Found
 
 **Warning: `trodesexport not found at: ...`**
-**Warning: `exportLFP not found at: ...`**
 
-The paths in `hm_tracker_paths.txt` are incorrect or Trodes is not installed.
+The path in `hm_tracker_paths.txt` is incorrect or Trodes is not installed.
 
 1. Confirm Trodes is installed on this machine.
-2. Find the actual path to `trodesexport.exe` and `exportLFP.exe`.
-3. Update both paths in `hm_tracker_paths.txt` on your Desktop.
+2. Find the actual path to `trodesexport.exe`.
+3. Update `TRODES_EXPORT_CMD` in `hm_tracker_paths.txt` on your Desktop.
 
 ---
 

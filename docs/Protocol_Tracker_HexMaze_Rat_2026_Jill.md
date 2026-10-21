@@ -82,8 +82,8 @@ You can run the tracking using a GPU on a computer that has installed the tracke
 - Run: `scripts\runner_windows.bat C:\Users\gl_pc\Desktop\data\yolov` and press enter
   - Note: if the ip and op folders are located somewhere else copy that path instead
 - A menu will show with different number and functions. Depending on what data is being tracked a different sequence numbers will be used.
-  - **Maze data**: run `1234567de89.`
-  - **Sleep data:** run `e8`
+  - **Maze data**: run `1234567d89.`
+  - **Sleep data:** run `18`
 
 ![What the anaconda terminal should look like before tracking](media/image7.png)
 

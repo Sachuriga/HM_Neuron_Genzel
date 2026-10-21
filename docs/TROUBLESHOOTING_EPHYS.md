@@ -2,17 +2,6 @@
 
 ## Step 7 — Spike Sorting (Mountainsort4)
 
-**Error: `No LFP .dat files found`**
-
-The LFP export (Step e) was not run or the output is in the wrong location.
-
-1. Run Step e first:
-   ```
-   exportLFP -rec <file.rec> -outputrate 1000 -lfplowpass 500
-   ```
-2. After export, verify a folder named `<recording>.LFP/` exists inside the input folder, containing `_nt<N>ch<C>.dat` files.
-3. If files exist but are in a different location, move the `.LFP/` folder to the input folder.
-
 **Warning: `'readTrodesExtractedDataFile3.py' not found`**
 
 The Trodes reader helper script is missing.
@@ -51,11 +40,11 @@ The bad channels are hardcoded in `sorting.py`. If the probe has changed or a pr
 
 **Error: `No LFP source found`**
 
-Step 8 builds the all-channel LFP from Step 1's raw export (`<recording>.raw/*_group0.dat`) — run Step 1 first. Without it, it falls back to Step e's `.LFP/` export, which has only one channel per nTrode.
+Step 8 builds the all-channel LFP straight from the session's `.rec` in the input folder (an old `<recording>.raw/*_group0.dat` also works). Make sure the `.rec` is there. Without either, it falls back to an old `.LFP/` export from the retired step e, which has only one channel per nTrode.
 
-**Warning: `No raw export ... falling back to the exportLFP .dat`**
+**Warning: `No .rec / raw export — falling back to the exportLFP .dat`**
 
-The NWB will hold 32 LFP channels (one per nTrode) instead of 128. Run Step 1 (`trodesexport -raw`) and rerun Step 8 to get all channels; the stored LFP is replaced automatically.
+The NWB will hold 32 LFP channels (one per nTrode) instead of 128. Put the `.rec` back in the input folder and rerun Step 8 to get all channels; the stored LFP is replaced automatically.
 
 **Timestamps file missing — synthetic timestamps used**
 

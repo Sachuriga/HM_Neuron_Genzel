@@ -52,8 +52,7 @@ PYTHON = sys.executable  # run child python steps with the same interpreter
 # parallel per-folder worker or sequentially at master level is decided by
 # SEQUENTIAL_STEPS below — everything else is a parallel worker step.
 MENU = [
-    ("1", "Trodes Export (DIO/Analog)"),
-    ("e", "Trodes Export LFP + Analog (per channel)"),
+    ("1", "Trodes Export (DIO + Analog/IMU)"),
     ("2", "Sync Script"),
     ("3", "Stitching"),
     ("4", "Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)"),
@@ -131,9 +130,7 @@ def load_config():
         print("Please create hm_tracker_paths.txt on your Desktop with lines like:")
         print("  FFMPEG_CMD=/usr/local/bin/ffmpeg")
         print("  ONNX_WEIGHTS_PATH=/path/to/weights.pt")
-        print("  TRODES_EXPORT_CMD=/path/to/trodesexport")
-        print("  TRODES_EXPORT_LFP=/path/to/exportLFP")
-        print("  LFP_CHANNELS=1 2 3 4 5 6 7 8\n")
+        print("  TRODES_EXPORT_CMD=/path/to/trodesexport\n")
         print("See examples/hm_tracker_paths.example.txt in the repo for a template.")
         sys.exit(1)
 
@@ -340,25 +337,6 @@ def run_worker(ip, op, steps, out):
         else:
             log(out, f"[WARNING] trodesexport not found at: {os.environ.get('TRODES_EXPORT_CMD','')}")
 
-    # --- STEP e: Trodes LFP + Analog export (per .rec) ---
-    if "e" in steps:
-        log(out, "[STEP e] Running Trodes LFP + Analog Export (per .rec)...")
-        lfp, trodes = _tool("TRODES_EXPORT_LFP"), _tool("TRODES_EXPORT_CMD")
-        if not recs:
-            log(out, f"[WARNING] No .rec files found in '{ip}'")
-        for f in recs:
-            log(out, f"    --- {f.name} ---")
-            if lfp:
-                log(out, "    Exporting LFP (1500Hz, LP 700Hz)...")
-                run([lfp, "-rec", f, "-outputrate", "1500", "-lfplowpass", "700"], out=out)
-            else:
-                log(out, f"[WARNING] exportLFP not found at: {os.environ.get('TRODES_EXPORT_LFP','')}")
-            if trodes:
-                log(out, "    Exporting analog/AUX (headstage IMU)...")
-                run([trodes, "-analogio", "-rec", f], out=out)
-            else:
-                log(out, f"[WARNING] trodesexport not found at: {os.environ.get('TRODES_EXPORT_CMD','')}")
-
     # --- STEP 2: LED sync ---
     if "2" in steps and Path("./src/tracker/Video_LED_Sync_using_ICA.py").exists():
         log(out, f"[STEP 2] Running Sync Script (LED detection starts after {sync_start}s, "
@@ -395,8 +373,10 @@ def run_worker(ip, op, steps, out):
     if "8" in steps:
         # Per-sample data goes into the session NWB. The LFP is built for ALL
         # channels straight from the .rec (or an old *.raw/*_group0.dat); without
-        # either, it falls back to step e's exportLFP (one channel per nTrode). KEEP_NPY=1 in
-        # hm_tracker_paths.txt also writes the old LFP_Output/*.npy alongside it.
+        # either, it falls back to an old exportLFP export (<recording>.LFP/, one
+        # channel per nTrode, from the retired step e). Motion reads the analog
+        # (IMU) export of step 1. KEEP_NPY=1 in hm_tracker_paths.txt also writes
+        # the old LFP_Output/*.npy alongside it.
         keep_npy = ["--keep-npy"] if _flag_env("KEEP_NPY", "HM_KEEP_NPY") else []
         lfp_rate = _str_env("LFP_OUTPUT_RATE", default="1500")
         if Path("./src/sorter/export_lfp.py").exists():
@@ -651,6 +631,15 @@ def main():
         selection = input("Enter steps: ")
     else:
         print(f"[STEPS] (from HM_STEPS) {selection}")
+
+    # Step [e] (Trodes exportLFP + analog export) is retired: step 8 builds the
+    # LFP for every channel straight from the .rec, and the analog (headstage
+    # IMU) export that step 8's motion needs is part of step 1. So an "e" in an
+    # old preset or HM_STEPS string (e.g. "e8") runs step 1 instead.
+    if "e" in selection:
+        print("[STEPS] Step [e] is retired: step 8 builds the LFP from the .rec "
+              "and step 1 exports the analog (IMU) data. Running step 1 for 'e'.")
+        selection = selection.replace("e", "" if "1" in selection else "1")
 
     # Split the selection into sequential master steps and parallel worker steps.
     # Step 6 (compression) is special: it always runs LAST at master level over all

@@ -1,8 +1,8 @@
 # Troubleshooting: Pipeline Steps
 
-## Step 1 / Step e — Trodes Export (DIO / Raw / LFP)
+## Step 1 — Trodes Export (DIO / Analog)
 
-**No `.DIO/`, `.raw/`, or `.LFP/` folder generated after running**
+**No `.DIO/` or `.analog/` folder generated after running**
 
 - Confirm Trodes is installed and the paths in `hm_tracker_paths.txt` are correct.
 - Check that the `.rec` file is not corrupted and is accessible.

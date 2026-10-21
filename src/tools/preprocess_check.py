@@ -24,10 +24,10 @@ import re
 from pathlib import Path
 
 # Steps each animal type is expected to run (from tracker_gui PRESETS).
-PRESET = {True: "1e2345678d", False: "23456d"}
+PRESET = {True: "12345678d", False: "23456d"}
 
 STEP_LABEL = {
-    "1": "Trodes export", "e": "LFP export", "2": "Sync", "3": "Stitch",
+    "1": "Trodes export", "2": "Sync", "3": "Stitch",
     "4": "Tracker", "5": "Plotting", "6": "Compression", "7": "Sorting",
     "8": "LFP+Motion", "d": "DeepLabCut",
 }
@@ -36,7 +36,6 @@ STEP_LABEL = {
 # folder exists AND holds at least one file (an empty LFP_Output is not "done").
 STEP_SIGNATURES = {
     "1": ["*.DIO", "*.raw"],                 # Trodes DIO/analog export (*.raw: before -raw was dropped)
-    "e": ["*.LFP"],                          # Trodes LFP export
     "4": ["*_Coordinates_Full.csv"],         # Tracker
     "5": ["*_analysis_final.pdf"],           # Plotting
     "7": ["*_sorting_output"],               # Spike sorting

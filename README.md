@@ -25,7 +25,6 @@ A batch-processing pipeline for rat hexmaze neuroscience experiments — from ra
 7. [Environment Variables — Full Reference](#environment-variables--full-reference)
 8. [Pipeline Steps — Detailed Reference](#pipeline-steps--detailed-reference)
    - [Step 1 — Trodes DIO/Analog Export](#step-1--trodes-dioanalog-export)
-   - [Step e — Trodes LFP + Analog Export](#step-e--trodes-lfp--analog-export)
    - [Step 2 — LED Sync (ICA)](#step-2--led-sync-ica)
    - [Step 3 — Multi-Camera Stitching](#step-3--multi-camera-stitching)
    - [Step 4 — YOLOv11 Tracker](#step-4--yolov11-tracker)
@@ -148,7 +147,7 @@ Dependencies live in `pyproject.toml` (extras `[gpu]` / `[mac]`); installing als
 
 | Tool | Purpose |
 |---|---|
-| [Trodes](https://spikegadgets.com/trodes/) (`trodesexport`, `exportLFP`) | `.rec` export: DIO, analog, LFP |
+| [Trodes](https://spikegadgets.com/trodes/) (`trodesexport`) | `.rec` export: DIO, analog (IMU) |
 | [FFmpeg](https://ffmpeg.org/) (+ffprobe) | Stitching, compression, drive-scan video checks |
 | YOLOv11 weights (`.pt`) | Tracker detection model — see [Model](#model) |
 | [Phy](https://github.com/cortex-lab/phy) | Manual spike-sorting curation (between steps 7/c and r) |
@@ -168,7 +167,6 @@ Format: `KEY=VALUE` lines, `#` comments; whitespace around `=` tolerated. **Ever
 FFMPEG_CMD=C:\path\to\ffmpeg.exe          # auto-repaired to system ffmpeg if the path is stale
 ONNX_WEIGHTS_PATH=C:\path\to\weights.pt   # YOLOv11 model (step 4)
 TRODES_EXPORT_CMD=C:\path\to\trodesexport.exe
-TRODES_EXPORT_LFP=C:\path\to\exportLFP.exe
 
 # LED sync (step 2)
 SYNC_START_SEC=45        # skip this many s before locating the LED (0 = off)
@@ -229,15 +227,15 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 
 | Preset | Steps |
 |---|---|
-| Tracker implanted | `1e2345678d` |
+| Tracker implanted | `12345678d` |
 | Tracker non-implanted | `23456d` |
 | After manual curation | `uvbm` |
 | Retrack | `346d` |
-| Full pipeline | `1e234567c89uvnbmt` |
-| Trodes export (DIO/analog + LFP) | `1e` |
+| Full pipeline | `1234567c89uvnbmt` |
+| Trodes export (DIO + analog/IMU) | `1` |
 | Sync + stitch + track | `234` |
 | Spike sorting (+ continue) | `7c` |
-| LFP + motion + EMG (sleep) | `e8` |
+| LFP + motion + EMG (sleep) | `18` |
 | NWB units + visualise | `uv` |
 | Analysis (decode / UMAP) | `nbm` |
 | Drive scan (QC) | `t` |
@@ -254,8 +252,7 @@ scripts\runner_windows.bat "C:\path\to\data_root"
 The interactive menu:
 
 ```text
-[1] Trodes Export (DIO/Analog)
-[e] Trodes Export LFP + Analog (per channel)
+[1] Trodes Export (DIO + Analog/IMU)
 [2] Sync Script
 [3] Stitching
 [4] Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)
@@ -322,7 +319,7 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `NVENC_SLOT_TIMEOUT` | 1800 | gpuslot: wait for a GPU slot before CPU fallback |
 | `NVENC_SLOT_DIR` | `<tmp>/hm_tracker_gpu_slots` | gpuslot: slot/cache dir |
 | `ONNX_WEIGHTS_PATH` | — | step 4: YOLO weights |
-| `TRODES_EXPORT_CMD` / `TRODES_EXPORT_LFP` | — | steps 1/e binaries |
+| `TRODES_EXPORT_CMD` | — | step 1 binary |
 | `DLC_CONFIG_PATH` | — (inference skipped) | step d part 2 |
 | `DLC_SHUFFLE` | 2 | step d part 2 |
 | `NWB_RAT_NR` | 1 | step 4 NWB fallback rat number |
@@ -349,20 +346,11 @@ Sorter keys (`SORTER`, `FREQ_MIN/MAX`, `DETECT_*`, `BAD_CHANNELS_<RAT>`, `REF_CH
 trodesexport -dio -analogio -rec <file.rec>
 ```
 
-Exports DIO TTL events (LED sync pulses) and analog (headstage IMU) channels — into subfolders next to the `.rec` (`<stem>.DIO/`, `<stem>.analog/`, …). Required before step 2 (sync). Skipped with a warning if the binary path doesn't resolve.
+Exports DIO TTL events (LED sync pulses) and analog (headstage IMU) channels — into subfolders next to the `.rec` (`<stem>.DIO/`, `<stem>.analog/`, …). Required before step 2 (sync), and before step 8, whose motion trace reads `<stem>.analog/`. Skipped with a warning if the binary path doesn't resolve.
+
+Step e (Trodes `exportLFP` + another analog export) is retired: step 8 builds the LFP for all 128 channels from the `.rec` itself, and its analog export duplicated this step's. An `e` in an old preset or `HM_STEPS` string (e.g. `e8`) runs step 1 instead.
 
 There is no `-raw` export any more: steps 7 (sorting) and 8 (all-channel LFP, EMG fallback) read the 30 kHz wideband lazily from the `.rec` via SpikeInterface (`src/sorter/trodes_rec.py`, neo ≥ 0.14.5), which saves a second full copy of the data (~27 GiB per recording hour). The reader reproduces `trodesexport -raw` sample for sample: it fixes the Intan chip-interleaved channel order (our headers say `chanPerChip="0"`, so neo alone mislabels the channels), subtracts the `rawRef` channel with int16 saturation, and fills dropped-packet gaps of ≤ 100 packets by linear interpolation exactly as `trodesexport -interp 100` (the default) does — larger gaps are spliced shut, as in the export, with a warning. A `<X>_merged.rec` replaces its `<X>.rec`. Old sessions that still have `<stem>.raw/` but no `.rec` keep working. Check a session with `python src/sorter/trodes_rec.py <file.rec> <file.raw_group0.dat>`. Only step 7 keeps the `rawRef` subtraction; step 8 reads the `.rec` with `apply_raw_ref=False`, so the LFP and EMG are single-ended.
-
-### Step e — Trodes LFP + Analog Export
-
-**Script:** `exportLFP` + `trodesexport` (external). Per `.rec`:
-
-```bash
-exportLFP -rec <file.rec> -outputrate 1500 -lfplowpass 700
-trodesexport -analogio -rec <file.rec>
-```
-
-LFP at **1500 Hz** (low-pass **700 Hz**) into `<recording>.LFP/` — one `.dat` per channel + `*.timestamps.dat`; analog IMU into `<recording>.analog/`. Consumed by step 8. The 1500 Hz rate is load-bearing: the EMG-from-LFP method needs Nyquist > 600 Hz.
 
 ### Step 2 — LED Sync (ICA)
 
@@ -488,7 +476,7 @@ python src/sorter/export_emg_from_lfp.py --input_folder <ip> --output_folder <op
 python src/sorter/export_motion.py       --input_folder <ip> --output_folder <op>
 ```
 
-**`export_lfp.py`** — builds the LFP for **every channel (128)** from the 30 kHz wideband in `<recording>.rec` (`trodes_rec.open_rec`; an old `<recording>.raw/*_group0.dat` is used if there is no `.rec`): × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a `.rec` or raw export it falls back to step e's `<recording>.LFP/*.dat`, which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
+**`export_lfp.py`** — builds the LFP for **every channel (128)** from the 30 kHz wideband in `<recording>.rec` (`trodes_rec.open_rec`; an old `<recording>.raw/*_group0.dat` is used if there is no `.rec`): × **0.195 µV/bit**, zero-phase 4th-order Butterworth low-pass **700 Hz**, every 20th sample → **1500 Hz** (`src/sorter/lfp_from_raw.py`; column `k` = hardware channel `k` = nTrode `k//4+1`, channel `k%4+1`). Without a `.rec` or raw export it falls back to an old `exportLFP` export, `<recording>.LFP/*.dat` (from the retired step e), which has only **one channel per nTrode** (voltage × header `voltagescaling`; `--output_rate 1500` overrides the sometimes-lying header fs). `--source raw|export|auto` forces either. Multiple recordings = sessions concatenated chronologically.
 
 The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV, gzip, chunks of 50 s × 1 tetrode); `processing/sleep/session_info` holds the `channel_map` (column → nTrode/channel) and `lfp_reference` (`none` = read from the `.rec` without Trodes' `rawRef`; `trodes_raw_export` / `trodes_exportlfp` = a fallback source with Trodes' reference already in it). Re-running on a session whose NWB holds an LFP with a different channel count or a different `lfp_reference` (NWBs from before this was recorded count as different) replaces it, plus `session_info`, `theta_delta_ratio` and `acquisition/emg_from_lfp`, which step 8's EMG step then writes again. The old LFP's space stays in the file until `python src/nwb/compact_nwb.py <op>`. Re-running on an NWB from before the single-channel EMG was dropped also removes its `awakeness` / `emg_rms` and `session_info.emg_channel_index`. The `.npy` below are written only with `--keep-npy` / `KEEP_NPY=1`:
 

@@ -9,7 +9,6 @@
 FFMPEG_CMD=C:\Users\YOUR_NAME\Desktop\ffmpeg-...\bin\ffmpeg.exe
 ONNX_WEIGHTS_PATH=C:\Users\YOUR_NAME\Desktop\data\yolov\bests_1280_mosiac_close.pt
 TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport.exe
-TRODES_EXPORT_LFP=C:\Users\gl_pc\Desktop\Trodes_2-8-0_Windows11\exportLFP.exe
 
 # -------------------------------------------------------------------
 # DeepLabCut inference (menu [d] part 2, src/dlc/dlc_coordinates.py).
