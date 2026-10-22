@@ -258,6 +258,32 @@ def _lfp_source_from_nwb(op_folder):
             "origin": nwb_path.name}
 
 
+STANDARD_LFP_RATES = (1000.0, 1250.0, 1500.0, 2000.0, 2500.0)
+
+
+def _lfp_rate_problem(source, t):
+    """Why this LFP source cannot be the task session's LFP, or None if it can.
+
+    Some exports stamp a ~1 kHz LFP with 30 kHz timestamps (the trace then lasts
+    1/30 of the session), and old NWBs hold a stub paired with the 5 Hz EMG
+    timestamps. A maze-only export lasts about as long as the tracking (``t``, on
+    the spike clock); a multi-session export is longer by design and only its
+    rate is checked."""
+    fs, n = source["fs"], source["data"].shape[0]
+    if not fs or fs < 100:
+        return f"{fs or 0:.0f} Hz is not an LFP rate"
+    expected = float(np.nanmax(t)) if t is not None and len(t) else 0.0
+    if source["boundaries"] or expected <= 0:
+        return None
+    # the duration matches, or a standard rate and the ephys merely ran longer or
+    # shorter than the camera (both are started by hand)
+    ratio = n / fs / expected
+    standard = any(abs(fs - r) <= 0.01 * r for r in STANDARD_LFP_RATES)
+    if 0.8 <= ratio <= 1.25 or (standard and 0.5 <= ratio <= 2.0):
+        return None
+    return f"{n} samples at {fs:.0f} Hz last {n / fs:.0f} s, the session ~{expected:.0f} s"
+
+
 def _lfp_source_from_npy(op_folder):
     """The legacy LFP_Output/*.npy export as an LFP source, or None if absent."""
     lfp_dir, pfx = _find_npy_lfp(op_folder)
@@ -433,8 +459,26 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=No
         print(f"  [theta] could not read the LFP from the NWB ({e}); "
               f"trying LFP_Output instead.")
         source = None
+    if source is not None:
+        why = _lfp_rate_problem(source, t)
+        if why:
+            print(f"  [theta] the NWB's LFP is not usable ({why}); trying LFP_Output instead.")
+            source["close"]()
+            source = None
     if source is None:
         source = _lfp_source_from_npy(op_folder)
+        why = _lfp_rate_problem(source, t) if source is not None else None
+        if why:
+            n, expected = source["data"].shape[0], float(np.nanmax(t))
+            fit = min(STANDARD_LFP_RATES, key=lambda r: abs(n / r - expected))
+            if not source["boundaries"] and abs(n / fit - expected) < 0.2 * expected:
+                print(f"  [theta] LFP_Output: {why}; using {fit:.0f} Hz, the standard rate "
+                      f"whose duration fits.")
+                source["fs"] = fit
+            else:
+                print(f"  [theta] LFP_Output is not usable either ({why}) — phase/precession "
+                      f"pages will be skipped.")
+                return None
     if source is None:
         print("  [theta] no LFP (no acquisition/lfp in the NWB and no LFP_Output) "
               "— phase/precession pages will be skipped.")

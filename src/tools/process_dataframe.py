@@ -4,11 +4,43 @@ from pathlib import Path
 from pathnames import find_paths, find_session_folders
 from process_log import process_log
 
-# Column with index 'col_index' (default = 1) of dataframe 'df_2' is inserted in dataframe 'df_1'
+# Column with index 'col_index' (default = 1) of dataframe 'df_2' is inserted in dataframe 'df_1'.
+# Positional (by row index): only correct when df_1 has exactly one row per frame,
+# starting at frame 0. Use merge_on_frame for coordinates + framewise timestamps.
 def merge_df(df_1, df_2, col_label = None, col_index = 1, insert_index = 1):
     df = df_1.copy()
     df.insert(insert_index, col_label, df_2.iloc[:, col_index])
     return df
+
+
+FRAME_COLUMNS = ("Frame_Index", "Frame Number", "Frame_Number", "frame")
+
+
+def _frame_column(df):
+    return next((c for c in FRAME_COLUMNS if c in df.columns), None)
+
+
+# Insert the timestamp column of a framewise CSV (Frame Number, <time>) into the
+# coordinates, matched on the frame index. Rows of a tracker file whose frames were
+# skipped, repeated or started late still get their own frame's timestamp; a frame
+# without a timestamp gets NaN (and is reported) instead of a neighbour's time.
+def merge_on_frame(df_coords, df_framewise, col_label='Time (seconds)', col_index=1,
+                   insert_index=1):
+    fc, ff = _frame_column(df_coords), _frame_column(df_framewise)
+    if fc is None or ff is None:
+        print(f"[merge_on_frame] no frame column ({fc}, {ff}); falling back to row order")
+        return merge_df(df_coords, df_framewise, col_label, col_index, insert_index)
+    times = pd.Series(df_framewise.iloc[:, col_index].to_numpy(),
+                      index=pd.to_numeric(df_framewise[ff], errors="coerce").astype("Int64"))
+    times = times[~times.index.duplicated(keep="first")]
+    frames = pd.to_numeric(df_coords[fc], errors="coerce").astype("Int64")
+    values = times.reindex(frames).to_numpy()
+    missing = int(pd.isna(values).sum())
+    if missing:
+        print(f"[merge_on_frame] {missing} of {len(values)} rows have no framewise timestamp")
+    out = df_coords.copy()
+    out.insert(insert_index, col_label, values)
+    return out
 
 # Trim to active trials
 # Trim dataframe to filter all rows for which column 'label' contains NaN
@@ -38,7 +70,7 @@ def extract_col_by_name(df, session_nr, trial_nr, col_name):
 
 def process_df(df_coordinates, df_framewise_seconds):
     # Merge stitched framewise into coordinates
-    df_merged = merge_df(df_coordinates, df_framewise_seconds, 'Time (seconds)', 1)
+    df_merged = merge_on_frame(df_coordinates, df_framewise_seconds, 'Time (seconds)', 1)
 
     # Trim merged dataframe to only contain frames with active trials
     df_trial = filter_nan_in_col(df_merged, 'Trial_Num')
@@ -86,7 +118,7 @@ if __name__ == "__main__":
     df_framewise_seconds = safe_read('framewise_seconds', paths.csv_paths, 'csv')
     df_log = safe_read(next(iter(paths.log_paths)), paths.log_paths, 'log')
     # Merge stitched framewise into coordinates
-    df_merged = merge_df(df_coordinates.copy(), df_framewise_seconds, 'Time (seconds)', 1)
+    df_merged = merge_on_frame(df_coordinates.copy(), df_framewise_seconds, 'Time (seconds)', 1)
 
     # Trim merged dataframe to only contain frames with active trials
     df_trial = filter_nan_in_col(df_merged, 'Trial_Num')

@@ -210,11 +210,15 @@ def create_timeseries():
     # pynwb needs time on axis 0. If a 2D array has time on axis 1, transpose.
     if data.ndim == 2 and data.shape[0] != n and data.shape[1] == n:
         data = data.T
-    # If the lengths still differ (e.g. the LFP and its timestamps were built from
-    # a different number of concatenated .rec sessions), truncate both to the
-    # common length so the TimeSeries is valid instead of crashing.
+    # A few samples' difference is an export quirk: truncate both to the common
+    # length. More means the timestamps belong to something else (the 5 Hz EMG
+    # timestamps once gave 627-sample LFP stubs): write no LFP rather than a wrong one.
     if data.shape[0] != n:
         m = min(data.shape[0], n)
+        if abs(data.shape[0] - n) > max(10, 1e-4 * max(data.shape[0], n)):
+            print(f"{Fore.RED}[LFP] data ({data.shape[0]}) and timestamps ({n}) do not belong "
+                  f"together; the LFP is NOT written.{Style.RESET_ALL}")
+            return None
         print(f"{Fore.YELLOW}[LFP] data ({data.shape[0]}) and timestamps ({n}) "
               f"length mismatch; truncating both to {m}.{Style.RESET_ALL}")
         data, ts = data[:m], ts[:m]
@@ -230,6 +234,8 @@ def create_timeseries():
 # if there is an existing timeseries with the same name already (e.g. in case of editing files) it will return an error
 def add_timeseries(ts_name):
     ts = create_timeseries()
+    if ts is None:
+        return None
     try:
         nwbfile.get_acquisition(ts_name)
         print(f"Failed to add subject! {ts.name} might already exist in nwb file!")
@@ -723,10 +729,19 @@ if __name__ == "__main__":
         # Try to load LFP files; if they don't exist, they'll be None
         lfp_channels = safe_read('lfp_channels', paths.numpy_paths, 'npy')
         lfp_data = safe_read('lfp_data', paths.numpy_paths, 'npy')
-        lfp_timestamps = safe_read('lfp_timestamps', paths.numpy_paths, 'npy')
+        # the LFP's OWN timestamps: the key 'lfp_timestamps' also suffix-matches the
+        # 5 Hz *_emg_from_lfp_timestamps.npy, which sorts first
+        lfp_data_path = resolve_path('lfp_data', paths.numpy_paths)
+        lfp_ts_path = (lfp_data_path.with_name(lfp_data_path.name.replace("lfp_data", "lfp_timestamps"))
+                       if lfp_data_path is not None else None)
+        lfp_timestamps = np.load(lfp_ts_path) if lfp_ts_path is not None and lfp_ts_path.exists() \
+            else safe_read('lfp_timestamps', paths.numpy_paths, 'npy')
 
-        if df_framewise_seconds is not None:
-            df = pdf.merge_df(df_coordinates_with_frames, df_framewise_seconds, 'Time (seconds)')
+        if df_framewise_seconds is not None and df_coordinates_with_frames is not None:
+            # Matched on Frame_Index, not row order: a coordinate file that skips or
+            # repeats a frame would otherwise shift every later position in time.
+            df = pdf.merge_on_frame(df_coordinates_with_frames, df_framewise_seconds,
+                                    'Time (seconds)')
         else:
             df = df_coordinates_with_frames
 

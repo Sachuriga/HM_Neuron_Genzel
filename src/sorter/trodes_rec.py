@@ -39,6 +39,12 @@ __version__ = "1.0"         # SpikeInterface needs it to rebuild TrodesRawRecord
 INTAN_CHANS_PER_CHIP = 32   # RHD2132; used when the header's chanPerChip is unusable
 TRODES_INTERP = 100         # trodesexport -interp default (max dropped packets filled)
 
+# Gaps open_rec leaves spliced shut (> TRODES_INTERP dropped packets) or timestamp
+# repeats/resets, per .rec: after each, ``sample / fs`` stops matching the Trodes
+# clock that the video is synced to. Recorded so step 7 can write them next to the
+# sorting output (spliced_gaps.json) and step u can warn.
+SPLICED_GAPS = {}
+
 
 def find_rec_files(folder, recursive=False):
     """Trodes ``.rec`` files in ``folder``, sorted by name (== chronological, the
@@ -235,6 +241,18 @@ def open_rec(rec_file, apply_raw_ref=True, interp=TRODES_INTERP):
             f"trodesexport -interp {interp} does — (packet, timestamp step): "
             f"{left[:5]}. After a gap, sample/fs runs behind the Trodes clock.",
             stacklevel=2)
+    # Output sample index of each left gap = packet index + samples interpolated
+    # before it; `step - 1` samples of Trodes time are missing there (negative for a
+    # repeat/reset, i.e. sample/fs then runs AHEAD of the Trodes clock).
+    fill_idx = np.array([g for g, _ in fill], dtype=np.int64)
+    fill_cum = np.cumsum([m for _, m in fill]) if fill else np.array([], dtype=np.int64)
+    table = []
+    for g, st in left:
+        k = int(np.searchsorted(fill_idx, g))
+        ins_before = int(fill_cum[k - 1]) if k > 0 else 0
+        table.append(dict(packet=int(g), output_sample=int(g + ins_before + 1),
+                          timestamp_step=int(st), missing_samples=int(st - 1)))
+    SPLICED_GAPS[str(rec_file)] = table
 
     # neo lists the channels in byte-slot order. When the header's chanPerChip is
     # valid, neo has labelled each slot with its true hwChan; otherwise (our files:

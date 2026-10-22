@@ -365,7 +365,9 @@ try:
     from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
 except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
-from trodes_rec import find_rec_files, open_rec  # noqa: E402  (.rec reader; needed for step 7)
+from trodes_rec import find_rec_files, open_rec, SPLICED_GAPS  # noqa: E402  (.rec reader; needed for step 7)
+
+LAST_SPLICED_GAPS = []   # set by open_raw_recording; see spliced_gaps.json
 
 
 # Post-sorting analysis (analyzer, metrics, quality-check labels, Phy export)
@@ -579,6 +581,17 @@ def open_raw_recording(paths, fs=30000.0, gain=0.195, offset=0.0):
 
     total_samples = sum(r.get_num_samples() for r in recs)
     n_ch = recs[0].get_num_channels()
+
+    # Gaps the .rec reader spliced shut, on the concatenated output's sample axis
+    # (written to <sorting_output>/spliced_gaps.json by process_single_file).
+    global LAST_SPLICED_GAPS
+    LAST_SPLICED_GAPS = []
+    part_start = 0
+    for p, r in zip(paths, recs):
+        for gap in SPLICED_GAPS.get(str(p), []):
+            LAST_SPLICED_GAPS.append(dict(gap, file=p.name,
+                                          output_sample=gap["output_sample"] + part_start))
+        part_start += r.get_num_samples()
     print(f"  = {total_samples} samples total ({total_samples / fs / 60:.1f} min, "
           f"{total_samples * n_ch * 2 / 2**30:.1f} GiB on disk)")
 
@@ -747,6 +760,15 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
         eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
         fs=fs, gain=gain, offset=offset)
+
+    # Record where sample/fs stops matching the Trodes clock (spliced gaps).
+    import json
+    with open(output_dir / "spliced_gaps.json", "w") as fh:
+        json.dump(dict(sampling_frequency=fs, gaps=LAST_SPLICED_GAPS), fh, indent=1)
+    if LAST_SPLICED_GAPS:
+        lost = sum(g["missing_samples"] for g in LAST_SPLICED_GAPS) / fs
+        print(f"WARNING: {len(LAST_SPLICED_GAPS)} spliced gap(s) — spike times after them "
+              f"are off the behaviour clock by up to {lost:+.3f} s (see spliced_gaps.json)")
 
     processed_folder = output_dir / 'processed_binary'
     if processed_folder.exists():

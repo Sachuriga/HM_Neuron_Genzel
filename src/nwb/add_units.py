@@ -378,6 +378,20 @@ def add_units_to_nwb(output_folder, n_jobs=4):
     failed = []
     for phy in phys:
         print(f"\n--- Reading units from {phy} ---")
+        gaps_file = phy.parent / "spliced_gaps.json"
+        if gaps_file.exists():
+            import json
+            gaps = json.loads(gaps_file.read_text()).get("gaps", [])
+            if gaps:
+                fs_g = json.loads(gaps_file.read_text()).get("sampling_frequency", 30000.0)
+                lost = sum(g["missing_samples"] for g in gaps) / fs_g
+                print("*" * 70)
+                print(f"WARNING: {len(gaps)} spliced Trodes gap(s) in this recording; spike "
+                      f"times (sample/fs) after them are off the behaviour clock by up to "
+                      f"{lost:+.3f} s. First at sample {gaps[0]['output_sample']} "
+                      f"({gaps[0]['output_sample'] / fs_g:.1f} s). Check with "
+                      f"src/nwb/clock_qc.py.")
+                print("*" * 70)
         try:
             units, q_cols, t_cols = _collect_units(phy, n_jobs=n_jobs)
         except Exception as e:

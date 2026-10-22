@@ -949,6 +949,79 @@ def pred_dio_ts_from_ica_ts_and_verify(ica_train, dio_train, test_cpu_primary, t
     return pred_primary, pred_other, pred_frame_wise_ts
 
 
+def robust_led_sync(sync_color, ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue,
+                    primary_corrected, frame_wise_ts, args):
+    """Time-paired LED/DIO clock fit (sync_fit.py) with a hard QC gate.
+
+    Replaces the index-paired regression, whose slope absorbs every missed or extra
+    blink. Returns (predicted primary blink times, per-frame corrected timestamps,
+    QC dict). Exits with status 2 when the QC fails, unless --allow-bad-sync.
+    """
+    import json
+    import sync_fit
+
+    trains = {'red': (np.asarray(ts_ica_red, float), np.asarray(ts_dio_red, float)),
+              'blue': (np.asarray(ts_ica_blue, float), np.asarray(ts_dio_blue, float))}
+    other_color = 'red' if sync_color == 'blue' else 'blue'
+
+    fit = sync_fit.fit_led_clock(*trains[sync_color], sync_fit.LED_PERIOD_S[sync_color])
+    other_fit = None
+    if min(len(t) for t in trains[other_color]) >= 10:
+        try:
+            other_fit = sync_fit.fit_led_clock(*trains[other_color],
+                                               sync_fit.LED_PERIOD_S[other_color])
+        except sync_fit.SyncFitError as e:
+            print(f"[sync] {other_color} LED could not be fitted for the cross-check: {e}")
+
+    x0 = float(primary_corrected[0])      # same anchor frame as the original pipeline
+    mapping, decision = sync_fit.frame_mapping(fit, x0, anchor=args.sync_anchor,
+                                               confirm=other_fit)
+    failures = sync_fit.qc_failures(fit, max_slope_dev=args.max_slope_dev)
+    if other_fit is not None and abs(other_fit.slope - fit.slope) > args.max_slope_dev:
+        failures.append(f"{sync_color} and {other_color} LEDs give different clock rates "
+                        f"({(fit.slope - 1) * 1e6:+.0f} vs {(other_fit.slope - 1) * 1e6:+.0f} ppm)")
+    try:
+        legacy_slope, _ = sync_fit.legacy_index_pair_fit(*trains[sync_color])
+    except Exception:
+        legacy_slope = float('nan')
+
+    s = fit.summary()
+    print(f"[{sync_color} sync] {s['n_pairs']} blink/DIO pairs "
+          f"({s['match_frac_video']:.0%} of blinks, {s['match_frac_dio']:.0%} of DIO edges); "
+          f"clock rate {s['slope_ppm']:+.1f} ppm ({s['drift_s_per_h']:+.3f} s/h); "
+          f"|residual| median {s['resid_med_abs'] * 1000:.1f} ms, 95% {s['resid_p95_abs'] * 1000:.1f} ms")
+    print(f"[{sync_color} sync] old index-paired slope would have been "
+          f"{(legacy_slope - 1) * 1e6:+.0f} ppm ({(legacy_slope - 1) * 3600:+.2f} s/h)")
+    print(f"[{sync_color} sync] anchor: LED offset at first detection frame "
+          f"{decision['delta_s'] * 1000:+.1f} ms, "
+          f"{'applied' if decision['applied'] else 'not applied'} ({decision['reason'] or decision['anchor']})")
+    for note in fit.notes:
+        print(f"[{sync_color} sync] note: {note}")
+
+    qc = dict(method='time-paired', sync_color=sync_color, fit=s,
+              other_fit=other_fit.summary() if other_fit is not None else None,
+              anchor=decision, legacy_index_paired_slope=legacy_slope,
+              failures=failures, accepted=not failures or args.allow_bad_sync)
+    if args.output_path:
+        with open(os.path.join(args.output_path, 'sync_qc.json'), 'w') as fh:
+            json.dump(qc, fh, indent=1, default=float)
+
+    if failures:
+        print("\n" + "*" * 72)
+        print("[sync] QC FAILED — the video clock would not line up with the ephys clock:")
+        for f in failures:
+            print(f"  - {f}")
+        if not args.allow_bad_sync:
+            print("Nothing written. Check sync_debug/ (SYNC_DEBUG=1), the LED crop/ICA overrides, "
+                  "or force the other LED with SYNC_LED; --allow-bad-sync writes anyway.")
+            print("*" * 72)
+            sys.exit(2)
+        print("--allow-bad-sync given: writing the outputs anyway.")
+        print("*" * 72)
+
+    return mapping(primary_corrected), mapping(frame_wise_ts), qc
+
+
 def trim_ts_before_first_overlap(ica_ts_red, dio_ts_red, ica_ts_blue, dio_ts_blue):
     start_point_ica = 0
     trimmed_dio_red = dio_ts_red.values[1:-2]
@@ -1031,6 +1104,24 @@ if __name__ == "__main__":
                              "prefer blue, else red), or force 'red'/'blue'. Use 'red' "
                              "when the blue LED drops out mid-session but red stays on "
                              "(red is continuous, so the fit is more robust).")
+    parser.add_argument("--sync-anchor", dest='sync_anchor',
+                        default=os.environ.get('SYNC_ANCHOR', 'auto').lower(),
+                        choices=['auto', 'pc', 'led'],
+                        help="Absolute anchor of the corrected clock (see sync_fit.frame_mapping): "
+                             "'pc' keeps the camera-clock anchor at the first detection frame "
+                             "(original behaviour), 'led' moves it by the LED-measured "
+                             "sub-period offset, 'auto' (default) does so when unambiguous.")
+    parser.add_argument("--max-slope-dev", dest='max_slope_dev', type=float,
+                        default=float(os.environ.get('SYNC_MAX_SLOPE_DEV', 2e-4)),
+                        help="Refuse a fit whose clock-rate ratio differs from 1 by more than "
+                             "this (default 2e-4 = 0.7 s/h; two crystals differ by tens of ppm).")
+    parser.add_argument("--allow-bad-sync", dest='allow_bad_sync', action='store_true',
+                        default=os.environ.get('SYNC_ALLOW_BAD') == '1',
+                        help="Write the outputs even when the sync QC fails (not recommended).")
+    parser.add_argument("--legacy-sync", dest='legacy_sync', action='store_true',
+                        default=os.environ.get('SYNC_LEGACY') == '1',
+                        help="Use the old index-paired regression (reproduces pre-fix outputs; "
+                             "it can drift by tens of seconds when a blink is missed).")
     args = parser.parse_args()
 
     if args.input_path is None:
@@ -1152,28 +1243,37 @@ if __name__ == "__main__":
     ts_dio_blue = pd.to_datetime(dio_com_blue['Center_of_mass']).astype('int64') / 10**9
     ts_ica_blue = pd.to_datetime(ica_com_blue['Center_of_mass']).astype('int64') / 10**9
 
-    ica_train_red, dio_train_red, ica_train_blue, dio_train_blue = trim_ts_before_first_overlap(
-        ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue)
-
     red_ica_corrected_s  = pd.to_datetime(red_ica_total['key']).astype('int64') / 10**9
     blue_ica_corrected_s = pd.to_datetime(blue_ica_total['key']).astype('int64') / 10**9
 
-    # Fit the sync regression on whichever LED drives it; the other channel is
-    # only cross-checked and may be empty.
+    # Fit the sync on whichever LED drives it; the other channel is only
+    # cross-checked and may be empty.
     if sync_color == 'blue':
-        ica_train, dio_train = ica_train_blue, dio_train_blue
         primary_corrected = blue_ica_corrected_s.to_numpy()
         other_corrected   = red_ica_corrected_s.to_numpy()
     else:
-        ica_train, dio_train = ica_train_red, dio_train_red
         primary_corrected = red_ica_corrected_s.to_numpy()
         other_corrected   = blue_ica_corrected_s.to_numpy()
 
-    if len(ica_train) == 0 or len(dio_train) == 0:
-        sys.exit(f"[ERROR] No overlapping {sync_color} ICA/DIO edges to fit the sync regression.")
-
-    pred_dio_primary, pred_dio_other, pred_framewise_ts = pred_dio_ts_from_ica_ts_and_verify(
-        ica_train, dio_train, primary_corrected, other_corrected, avg_ts_per_frame, vis_on=False)
+    if args.legacy_sync:
+        # Pre-fix behaviour: edge k paired with blink k. One missed or extra blink
+        # shifts every later pair by a period and tilts the slope (Rat5_20260630:
+        # +0.75 %, ~27 s/h). Kept only to reproduce old outputs.
+        print("[sync] --legacy-sync: index-paired regression (no QC).")
+        ica_train_red, dio_train_red, ica_train_blue, dio_train_blue = trim_ts_before_first_overlap(
+            ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue)
+        if sync_color == 'blue':
+            ica_train, dio_train = ica_train_blue, dio_train_blue
+        else:
+            ica_train, dio_train = ica_train_red, dio_train_red
+        if len(ica_train) == 0 or len(dio_train) == 0:
+            sys.exit(f"[ERROR] No overlapping {sync_color} ICA/DIO edges to fit the sync regression.")
+        pred_dio_primary, pred_dio_other, pred_framewise_ts = pred_dio_ts_from_ica_ts_and_verify(
+            ica_train, dio_train, primary_corrected, other_corrected, avg_ts_per_frame, vis_on=False)
+    else:
+        pred_dio_primary, pred_framewise_ts, sync_qc = robust_led_sync(
+            sync_color, ts_ica_red, ts_dio_red, ts_ica_blue, ts_dio_blue,
+            primary_corrected, avg_ts_per_frame, args)
 
     diff = pred_dio_primary - primary_corrected
     print(f"[{sync_color} sync] Min diff in seconds (final corrected vs cpu corrected):", np.min(diff))

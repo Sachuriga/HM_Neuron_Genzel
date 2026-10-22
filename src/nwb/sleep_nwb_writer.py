@@ -150,8 +150,10 @@ def find_session_nwb(folder):
     folder = Path(folder)
     roots = [folder, folder.parent] if folder.name == "LFP_Output" else [folder]
     for root in roots:
+        # skip *.tmp.nwb leftovers and macOS AppleDouble sidecars ("._*.nwb", which a
+        # Mac writes next to files on an SMB share; they sort first and are not HDF5)
         cands = [p for p in sorted(root.glob("*.nwb"))
-                 if not p.name.endswith(".tmp.nwb")]
+                 if not p.name.endswith(".tmp.nwb") and not p.name.startswith("._")]
         if cands:
             return cands[0]
     return None

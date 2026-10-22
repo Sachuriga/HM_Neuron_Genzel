@@ -13,6 +13,27 @@
 
 ## Step 2 — LED Sync (ICA)
 
+**Error: `[sync] QC FAILED — the video clock would not line up with the ephys clock`** (exit 2, nothing written)
+
+The time-paired LED/DIO fit (`src/tracker/sync_fit.py`) produced a clock that cannot be right. `sync_qc.json` in the op folder says why:
+
+- *clock-rate ratio off by N ppm* — real camera/Trodes clocks differ by tens of ppm; hundreds or more means the blinks were not the LED (wrong ICA component or crop). Re-run with `SYNC_DEBUG=1` and check `sync_debug/`; pin the crop/component with `led_crop_override.txt` / `led_ica_override.txt`, or force the other LED with `SYNC_LED`.
+- *segment(s) offset by more than one frame* — the camera clock jumps mid-session (PC clock adjusted, frames dropped). Check the `.meta` timestamps around that time.
+- *only N % of blinks / DIO edges paired* — the LED was occluded or the wrong DIO file was found.
+- *red and blue LEDs give different clock rates* — one of the two trains is wrong; force the good one with `SYNC_LED`.
+
+Only after checking: `SYNC_ALLOW_BAD=1` writes the outputs anyway. Afterwards always run `python src/nwb/clock_qc.py <op>`.
+
+**`[clock-qc] ... behaviour and ephys clocks DISAGREE` / `no repair verified — NOT changed`** (step 4 end, step 7)
+
+The video clock drifts against the spike/LFP clock. `<op>/clock_qc/clock_qc.json` has every window (`t`, `D`, `r_peak`) and the fit. Step 7 repairs a FAIL automatically when the repaired clock passes; when it does not (the drift is not a straight line — e.g. frames lost mid-session — or the signals disagree), nothing is changed:
+
+- Re-run step 2 if the raw `.meta` + DIO still exist (the step-2 fit is now checked, see above).
+- Otherwise look at *D(t)* in the report: a step at one time means frames were lost there; a curve, a clock that wanders.
+- To undo an automatic repair, copy the files in `<op>/clock_repair_backup/` back and refresh the NWB (step 4 end).
+
+**`[clock-qc] ... clock not verified`** (UNKNOWN): too few windows with clear speed coupling, or they cover only part of the session (e.g. the ephys stops early). Not an error; such a session is never repaired.
+
 **Error: `No contours found in <file>`**
 
 The script could not detect the LED in the video.

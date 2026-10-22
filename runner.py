@@ -58,7 +58,7 @@ MENU = [
     ("4", "Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)"),
     ("5", "Plotting"),
     ("6", "Compression (always runs LAST, over all op folders)"),
-    ("7", "Sorting"),
+    ("7", "Sorting + clock QC/repair"),
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
@@ -454,6 +454,54 @@ def refresh_session_nwb(op, out=None):
         run([PYTHON, "-u", "create_nwb.py", "--rat_nr", rat_nr, "--noroot",
              "--ip", op.parent, "--op", op.parent, "--session_folder", op.name],
             cwd=str(SCRIPT_DIR / "src" / "nwb"), out=out)
+    if Path("./src/nwb/clock_qc.py").exists():
+        # Behaviour vs ephys clock, from the data (theta amplitude vs running speed).
+        # Reports only; a failing session is flagged loudly with the repair command.
+        log_("[STEP 4] Checking the behaviour clock against the ephys clock...")
+        run([PYTHON, "-u", "./src/nwb/clock_qc.py", op], out=out)
+
+
+def clock_qc_after_sorting(ops):
+    """Step 7, after sorting: check the behaviour clock against the ephys clock and
+    repair it automatically when needed.
+
+    clock_qc.py --auto re-times the op folder's video-clock files (framewise CSVs,
+    coordinates Timestamp, tracker .txt/.log) only when the check FAILS and the
+    repaired clock passes the same check; originals go to <op>/clock_repair_backup/. A repaired
+    session's NWB is then refreshed (step 4 end) so positions and trials carry the
+    corrected clock. A failure no repair can verify is left untouched and reported.
+    """
+    if not Path("./src/nwb/clock_qc.py").exists():
+        return
+    print("\n" + "=" * 56)
+    print("[MASTER] Clock QC (behaviour vs ephys) with automatic repair...")
+    print("=" * 56)
+    review, repaired = [], []
+    for i, (_ip, op) in enumerate(ops, 1):
+        print(f"\n[CLOCK {i}/{len(ops)}] {op}")
+        rc = run([PYTHON, "-u", "./src/nwb/clock_qc.py", op, "--auto"])
+        if rc == 10:
+            print(f"[CLOCK {i}/{len(ops)}] repaired — refreshing the session NWB")
+            refresh_session_nwb(op)
+            repaired.append(op)
+        elif rc == 3:
+            review.append(op)
+        elif rc != 0:
+            print(f"[CLOCK {i}/{len(ops)}] clock_qc.py exited with {rc}")
+    if repaired:
+        # figures and decodes made before the repair are on the old clock
+        print("\n[CLOCK] Clock repaired (originals in <op>/clock_repair_backup/) for:")
+        for op in repaired:
+            print(f"   {op}")
+        print("Steps 5 / v / b / m outputs made before this run are on the old clock: "
+              "re-run them for these sessions (later steps of this run already use the fix).")
+    if review:
+        print("\n" + "*" * 70)
+        print("[CLOCK] Behaviour/ephys clocks disagree and no repair verified for:")
+        for op in review:
+            print(f"   {op}")
+        print("Re-run step 2 for these (needs the raw .meta + DIO), see <op>/clock_qc/.")
+        print("*" * 70)
 
 
 def clean_folder(target):
@@ -731,6 +779,7 @@ def main():
     # --- Sequential master steps, in fixed order ---
     if has["7"]:
         _run_per_op("SORTING", "SORT", "./src/sorter/sorting.py", ops, config, extra_ip=True)
+        clock_qc_after_sorting(ops)
     if has["c"]:
         _run_per_op("CONTINUE-AFTER-SORTING", "CONT", "./src/sorter/continue_sorting.py", seq_ops, config)
     if has["r"]:

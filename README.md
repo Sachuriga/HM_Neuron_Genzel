@@ -171,6 +171,10 @@ TRODES_EXPORT_CMD=C:\path\to\trodesexport.exe
 # LED sync (step 2)
 SYNC_START_SEC=45        # skip this many s before locating the LED (0 = off)
 SYNC_LED=auto            # auto | red | blue
+SYNC_ANCHOR=auto         # auto | pc | led   (absolute anchor of the corrected clock)
+SYNC_MAX_SLOPE_DEV=2e-4  # refuse fits whose clock-rate ratio is off by more (0.7 s/h)
+SYNC_ALLOW_BAD=0         # 1 = write outputs even when the sync QC fails
+SYNC_LEGACY=0            # 1 = old index-paired regression (reproduces pre-fix outputs)
 
 # DeepLabCut (step d)
 DLC_CONFIG_PATH=         # path to the trained project's config.yaml; blank = export-only
@@ -311,6 +315,10 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `SYNC_START_SEC` | 45 | step 2: LED detection skip window (0 = off) |
 | `SYNC_LED` | auto | step 2: auto \| red \| blue |
 | `SYNC_DEBUG` | — | step 2: 1 = per-video debug output (`sync_debug/`) |
+| `SYNC_ANCHOR` | auto | step 2: corrected-clock anchor — auto \| pc \| led |
+| `SYNC_MAX_SLOPE_DEV` | 2e-4 | step 2: QC limit on the clock-rate ratio (ppm/1e6) |
+| `SYNC_ALLOW_BAD` | 0 | step 2: 1 = write outputs despite a failed sync QC |
+| `SYNC_LEGACY` | 0 | step 2: 1 = old index-paired regression, no QC |
 | `FFMPEG_CMD` | PATH `ffmpeg` | steps 3/6, vcodec, scan_drive |
 | `FFPROBE_CMD` | sibling of `FFMPEG_CMD` | step 6 probe, scan_drive |
 | `FFMPEG_VCODEC` | auto-probe | vcodec: force an encoder (e.g. `libx264`) |
@@ -366,8 +374,10 @@ Aligns the video timeline to the Trodes clock via the blinking sync LED in each 
 1. **LED localization** per `*eye*.mp4` — max frame-difference region (top 100 px ignored), 16×16 crop.
 2. **FastICA** (3 components, seeded) on the crop luminance + KMeans ON/OFF → blink train.
 3. **Component classification** — red blinks at 0.5 Hz, blue at 2.5 Hz (frequency within 10 %, duty cycle near 0.5; assumes 30 fps).
-4. **Regression** of blink times against the DIO TTL edge trains (`Din1` = blue, `Din2` = red; recursive multi-pattern `.dat` discovery) maps every frame timestamp onto the ephys clock.
-5. **Outputs (op):** `stitched_framewise_ts.csv` (*Corrected Time Stamp*) and `stitched_framewise_seconds.csv` (*Seconds From Creation* — **the master session clock**, see [Analysis Conventions](#analysis-conventions-clocks-coordinates-gating)).
+4. **Clock fit** of blink times against the DIO TTL edge trains (`Din1` = blue, `Din2` = red; recursive multi-pattern `.dat` discovery) maps every frame timestamp onto the ephys clock (`src/tracker/sync_fit.py`). Blinks are paired with DIO edges **by time**, not by order: a whole-hour clock difference is removed, the blink–edge offset is tracked modulo the LED period in 30 s windows and unwrapped, a line is fitted (slope = camera/Trodes clock-rate ratio), and every blink is paired with the edge that line predicts. The old fit paired edge *k* with blink *k*, so one missed or extra blink tilted the slope — Rat5_20260630 came out 0.75 % fast (behaviour drifting ~27 s/h against the spikes) with no warning. `--legacy-sync` / `SYNC_LEGACY=1` reproduces it.
+5. **Anchor.** Periodic LED trains fix the clock offset only up to whole LED periods, so the corrected clock keeps the camera-clock anchor at the first detection frame (as before) and moves it by the LED-measured sub-period offset when that is unambiguous (`--sync-anchor auto`, default; `pc` = never, `led` = always).
+6. **QC gate** — the run **stops without writing** (exit 2) if the clock-rate ratio is off by more than 200 ppm (`--max-slope-dev`, 0.7 s/h; two crystals differ by tens of ppm), the median / 95th-percentile pair residual exceeds 1 / 2 frames, any 5-min segment is offset by more than a frame (a camera-clock jump), fewer than 80 % of blinks/edges pair up, or the two LEDs disagree on the rate. `--allow-bad-sync` / `SYNC_ALLOW_BAD=1` writes anyway. Every run writes **`sync_qc.json`** (rate in ppm, residuals, pairing fractions, anchor decision, and the slope the old index-paired fit would have given).
+7. **Outputs (op):** `stitched_framewise_ts.csv` (*Corrected Time Stamp*) and `stitched_framewise_seconds.csv` (*Seconds From Creation* — **the master session clock**, see [Analysis Conventions](#analysis-conventions-clocks-coordinates-gating)).
 
 Options & rescue knobs: `--start-sec`/`SYNC_START_SEC` skips the first N s for detection only (LED often repositioned early; per-frame output still covers everything); `--sync-led`/`SYNC_LED` forces a colour (auto = prefer blue, fall back red); manual overrides in **ip**: `led_crop_override.txt` (`filename, x, y`) and `led_ica_override.txt` (`filename, color, component`); `--debug`/`SYNC_DEBUG=1` writes `sync_debug/` diagnostics (localization/crop/ICA PNGs + CSVs) *before* the sync stage so they survive failures. Videos with no detectable LED are parked in `<ip>/temp_no_led/` during the run and restored after (an aborted run can leave them there).
 
@@ -443,6 +453,7 @@ python src/sorter/sorting.py --input_folder <ip> --output_folder <op> --config <
 5. **Sorting** — MountainSort5 (default, scheme 2) or MountainSort4 per tetrode (`run_sorter_by_property('group')`), selectable via `SORTER`.
 6. **Post-sorting** (shared with step c): duplicate-spike removal (0.3 ms censor) + redundant-unit removal → SortingAnalyzer (waveforms 1/2 ms, 3-PC, quality metrics) → automated **good/mua/noise** labels (noise gate: SNR > 2.5 & >100 spikes; mua gate: isolation distance > 8 & ISI violations < 0.2) → **Phy export** with `copy_binary=False` (`params.py` points at `processed_binary/` — the >100 GB recording is not duplicated) → writes `quality_check_labels.csv` and pre-fills `cluster_group.tsv` so units arrive pre-labelled in Phy.
 7. **Cleanup** — everything deleted except `phy_export/` and `processed_binary/`.
+8. **Clock QC with automatic repair** (master level, after sorting every op) — `src/nwb/clock_qc.py <op> --auto` checks the behaviour clock against the ephys clock from the data (running speed vs theta amplitude and spike rate; see *Analysis Conventions*). On **FAIL** it re-times the op folder's video-clock files in place — `*framewise_seconds.csv`, `*framewise_ts.csv`, the coordinates' `Timestamp`, the tracker `.txt` (Sync Seconds, durations, speeds) and `.log` (UTC times) — but only if the repaired clock passes the same check; every original is copied once to `<op>/clock_repair_backup/` and the repair is logged in `clock_repair_backup/clock_repair.json`. A repaired session's NWB is then refreshed (step-4 end), so positions and trials carry the corrected clock; spikes and LFP are not touched. Repaired sessions are listed at the end of the step: outputs of steps 5 / v / b / m made before the repair are on the old clock, so re-run those steps for them (later steps of the same run already use the fix). A failure no repair can verify changes nothing and is listed for review (re-run step 2). Reports: `<op>/clock_qc/clock_qc.json`.
 
 Output: `<op>/<stem>_<sorter>_sorting_output/`. Curate with `phy template-gui phy_export/params.py`.
 
@@ -643,6 +654,9 @@ Menu bar: **Fix / Prepare** — *Organize drive…* (pick one of your listed dri
 These conventions hold across steps 5/w/u/v/b/m — worth internalising before touching the analysis code:
 
 - **The master session clock** is `stitched_framewise_seconds.csv` → *Seconds From Creation* (renamed to `<date>_Rat<N>_framewise_seconds.csv` when a tracker run finishes; consumers match both). NWB positions, spike times and trial windows (`Trial_start_s/Trial_end_s`, `build_trials`) all live on it; the LFP maze recording starts at its zero. The tracker's `trial_start_time`/`trial_end_time` (RecordingMeta copy) are on a *different*, drifting behavioural-sync clock — never mix them with positions.
+- **Positions are joined to the clock by `Frame_Index`** (`process_dataframe.merge_on_frame`), not by row order, so a coordinate file that skips or repeats frames cannot shift later positions in time.
+- **Check the behaviour/ephys tie with the data** — `python src/nwb/clock_qc.py <op>` (run at the end of step 4; with `--auto` after step 7). It cross-correlates running speed (video clock) with theta amplitude and population spike rate (ephys clock, both sample/fs) in 2-min windows: a healthy session sits at a constant lag *D* ≈ +0.15 s (theta leads speed; median of 39 well-synced HexMaze sessions). The clock line *D(t)* is the consensus of the windows (the line most windows agree with to 0.3 s), so spurious peaks and a poor theta channel do not move it; a signal is used only when its windows agree along its recording, and the line must be confirmed in 3 of 4 quarters of the session. LFP and spikes share the sample/fs clock, so the signals must agree: two used signals that differ, or an unused signal whose own line contradicts the verdict, give WARN (never repaired; Rat6_20260708: spike rate −0.65 s/h, theta −1.56 s/h, place coding neither). **FAIL**: drift > 0.3 s/h (and > 3 SE) or the lag > 0.5 s off — healthy sessions scatter ±0.11 s/h, and each HexMaze session beyond 0.3 s/h had an odd step-2 frame rate that predicts its drift. **UNKNOWN**: the data cannot tell. Repairs are never applied to WARN/UNKNOWN. `--auto` repairs in place as in step 7 (`--dry-run` decides without writing); `--repair` only writes repaired copies of the framewise CSVs into `<op>/clock_qc/`. The repair is slope-only, anchored where step 2 anchored (slope + offset when that is not enough), and the fit is repeated on the corrected clock (a fast drift can carry late windows beyond the ±25 s search range).
+- **Spliced Trodes gaps** (> 100 dropped packets, or timestamp repeats) make `sample/fs` stop matching the Trodes clock; step 7 records them in `<sorting_output>/spliced_gaps.json` and step u warns. Spike/LFP times are not shifted (they stay consistent with each other); check such sessions with `clock_qc.py`.
 - **Pixel frame:** everything the tracker writes is in the 1176×712 display frame. **Metre frame:** analyses divide by `SCALE_X = 2352/2/9 ≈ 130.7 px/m`, `SCALE_Y = 1424/2/5 = 142.4 px/m` into a fixed maze box `MAZE_EXTENT = (0–9, 0–5) m`; the y axis is inverted (camera y grows downward). The canonical node map is `src/tools/node_list_new.csv` (98 nodes, 4 islands + homeboxes).
 - **Speed gating:** all place-cell analyses — rate maps, spatial information, decoder tuning curves *and* evaluated bins, spike videos, precession passes — use the same run-epoch gate, **0.05 m/s**.
 - **Splits:** event/theta/gamma/precession analyses report three columns: *goal running* (type-1 trials), *free roaming* (type-4/5), *all*.
@@ -868,6 +882,8 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 ## Troubleshooting & Docs
 
 `docs/` contains: `ERROR_REFERENCE.md` (exact error message → cause/fix), `TROUBLESHOOTING.md` (LED sync), `TROUBLESHOOTING_EPHYS.md` (sorting/LFP), `TROUBLESHOOTING_PIPELINE.md` (per-step), `TROUBLESHOOTING_SETUP.md` (env/config), `RecordingMeta_README.md`, and the experiment protocol.
+
+Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range) and the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent). numpy/scipy/pandas only; no OpenCV or data needed (the LFP-rate test runs when pynwb is installed).
 
 Quick pointers:
 
