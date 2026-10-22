@@ -875,10 +875,11 @@ def session_label(folder, root):
 
 
 def post_jobs_limit(n_sessions):
-    """How many sessions run at once: POST_JOBS from the config, or 'auto' — half
+    """How many sessions run at once: POST_JOBS from the config (HM_POST_JOBS, set
+    by the GUI, wins over it), or 'auto' — half
     the CPU cores, one job per 12 GB of RAM, at most 6 (a decode or UMAP job can
     take several GB; the launch gate below keeps a margin on top of this)."""
-    raw = _str_env("POST_JOBS", default="auto").lower()
+    raw = _str_env("HM_POST_JOBS", "POST_JOBS", default="auto").lower()   # GUI's first
     if raw != "auto":
         try:
             return max(1, min(int(raw), n_sessions))

@@ -274,6 +274,13 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 | NWB units + visualise | `uv` |
 | Analysis (decode / UMAP) | `nbm` |
 | Drive scan (QC) | `t` |
+| **Session tree (e.g. the share)** | |
+| Fix NWB LFP — check only (dry run) | `l` + step l dry run |
+| Fix NWB LFP + remake theta pages | `lv` |
+| Remake figures (visualise / decode / plots / UMAP) | `vb5m` |
+| After manual curation (session tree) | `wuvb5m` |
+
+For a data root **without `ip*` folders** (e.g. the share's `task` folder) the runner works in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share). The window's **Session tree** row sets how many sessions run at once (`auto` or a number; it wins over `POST_JOBS` in the config) and whether step l only checks (dry run, nothing replaced); **Find sessions** lists the session folders it will process. While it runs, the **Session jobs** panel shows the machine's load (CPU / RAM / GPU / network), a sessions-done bar (failed ones named) and each running job's step, time and memory; every session's full log is in the folder printed at the start. **Stop** also ends the processes the runner started (its current step, the session jobs); worker terminal windows keep running, as before.
 
 ### CLI
 
@@ -941,7 +948,7 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 
 `docs/` contains: `ERROR_REFERENCE.md` (exact error message → cause/fix), `TROUBLESHOOTING.md` (LED sync), `TROUBLESHOOTING_EPHYS.md` (sorting/LFP), `TROUBLESHOOTING_PIPELINE.md` (per-step), `TROUBLESHOOTING_SETUP.md` (env/config), `RecordingMeta_README.md`, and the experiment protocol.
 
-Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) and step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone). numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed).
+Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone), the step-8 backfill's stamp check (30 kHz stamps packaged at the rate the spikes imply, right stamps kept, unverifiable ones refused) and the GUI's session-tree presets and jobs panel. numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed, the GUI tests with PyQt6).
 
 Quick pointers:
 

@@ -646,8 +646,11 @@ def main():
     ap.add_argument("--export_rate", type=float, default=None,
                     help="The export's true rate, when it cannot be worked out.")
     ap.add_argument("--work", default=None, help="Local scratch folder (default: the system temp).")
+    # the GUI's HM_LFP_FIX_DRY_RUN wins over the config file's LFP_FIX_DRY_RUN
+    dry_env = next((os.environ[k].strip() for k in ("HM_LFP_FIX_DRY_RUN", "LFP_FIX_DRY_RUN")
+                    if os.environ.get(k, "").strip()), "")
     ap.add_argument("--dry-run", action="store_true",
-                    default=os.environ.get("LFP_FIX_DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on"),
+                    default=dry_env.lower() in ("1", "true", "yes", "on"),
                     help="Do and verify everything on a local copy; change nothing in the op folder "
                          "(also LFP_FIX_DRY_RUN=1 in hm_tracker_paths.txt, e.g. for a first pass of step l).")
     ap.add_argument("--keep-work", action="store_true",

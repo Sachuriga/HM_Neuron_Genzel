@@ -5,11 +5,17 @@ Pick a data-root folder, tick the pipeline steps (or a preset), press Run.
 It just drives ``runner.py`` (the single source of truth) via a subprocess,
 passing the step selection through the ``HM_STEPS`` env var and streaming the
 runner's output into a log pane. Launch it from a terminal with ``genzeltracker``.
+
+A data root without ip* folders (e.g. the share's task folder, sessions at
+<rat>/<YYYYMMDD>/) runs in the runner's tree mode: "Find sessions" lists the
+session folders, and while it runs the "Session jobs" panel shows the machine's
+load, the sessions done and each running job, read from the runner's output.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -18,8 +24,13 @@ from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QGroupBox, QPlainTextEdit,
-    QFileDialog, QSpinBox, QSizePolicy,
+    QFileDialog, QSpinBox, QSizePolicy, QProgressBar,
 )
+
+try:
+    import psutil                              # optional: Stop also ends the runner's steps
+except Exception:                              # pragma: no cover
+    psutil = None
 
 REPO = Path(__file__).resolve().parent
 RUNNER = REPO / "runner.py"
@@ -27,10 +38,10 @@ RUNNER = REPO / "runner.py"
 # Single source of truth for the step list: import it from the runner.
 try:
     sys.path.insert(0, str(REPO))
-    from runner import MENU, SEQUENTIAL_STEPS
+    from runner import MENU, SEQUENTIAL_STEPS, POST_JOB_STEPS, find_session_folders
 except Exception as exc:                      # pragma: no cover - fallback
     print(f"[genzeltracker] could not import MENU from runner.py: {exc}")
-    MENU, SEQUENTIAL_STEPS = [], []
+    MENU, SEQUENTIAL_STEPS, POST_JOB_STEPS, find_session_folders = [], [], [], None
 
 # Presets: a name -> ordered step-key string. Order follows MENU for parallel steps.
 PRESETS = {
@@ -51,7 +62,22 @@ PRESETS = {
     "Analysis (decode / UMAP)": "nbm",
     "Spike sorting (+ continue)": "7c",
     "Full pipeline": "1234567c89wuvnbmt",
+    # a root without ip* folders, e.g. the share's task folder: one job per session
+    "— Session tree (e.g. the share) —": "",
+    "Fix NWB LFP — check only (dry run)": "l",
+    "Fix NWB LFP + remake theta pages": "lv",
+    "Remake figures (visualise / decode / plots / UMAP)": "vb5m",
+    "After manual curation (session tree)": "wuvb5m",
 }
+# presets that also set step l's dry-run box
+PRESET_DRY_RUN = {"Fix NWB LFP — check only (dry run)": True,
+                  "Fix NWB LFP + remake theta pages": False}
+
+# The runner's tree-mode lines the "Session jobs" panel follows
+_TREE_TOTAL = re.compile(r"^\[TREE\] (\d+) session\(s\) x steps \[(\w*)\]")
+_TREE_EVENT = re.compile(r"^\[TREE\] (start|done|FAILED)\s+(\S+)")
+_MON = re.compile(r"^\[MON [\d:]+\] (.*?) \| \d+ running, \d+ queued, \d+ done")
+_JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?")
 
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")
 
@@ -75,7 +101,8 @@ class TrackerGUI(QMainWindow):
 
         # --- data root + config ------------------------------------------------
         self.root_edit = QLineEdit()
-        self.root_edit.setPlaceholderText("data root folder (contains ip*/op* sub-folders)")
+        self.root_edit.setPlaceholderText(
+            "data root: ip*/op* sub-folders, or a tree of session folders (e.g. the share's task folder)")
         v.addLayout(self._path_row("Data root:", self.root_edit, self._pick_root))
 
         self.cfg_edit = QLineEdit(DEFAULT_CONFIG)
@@ -119,6 +146,28 @@ class TrackerGUI(QMainWindow):
         opt.addStretch(1)
         v.addLayout(opt)
 
+        # --- session tree (a root without ip* folders) -------------------------
+        tbox = QGroupBox("Session tree — a data root without ip* folders, e.g. the share's task folder")
+        trow = QHBoxLayout(tbox)
+        trow.addWidget(QLabel("Parallel sessions"))
+        self.post_jobs = QSpinBox(); self.post_jobs.setRange(0, 32); self.post_jobs.setValue(0)
+        self.post_jobs.setSpecialValueText("auto"); self.post_jobs.setMaximumWidth(72)
+        self.post_jobs.setToolTip("Sessions processed at once (auto: half the CPU cores, "
+                                  "one per 12 GB RAM, at most 6). New jobs also wait for the "
+                                  "CPU/GPU/MEM limits above.")
+        trow.addWidget(self.post_jobs)
+        trow.addSpacing(16)
+        self.lfp_dry_run = QCheckBox("Step l: check only (dry run — changes nothing)")
+        self.lfp_dry_run.setToolTip("Rewrite and verify each NWB's LFP on a local copy, "
+                                    "without replacing anything in the session folders.")
+        trow.addWidget(self.lfp_dry_run)
+        trow.addStretch(1)
+        find_btn = QPushButton("Find sessions")
+        find_btn.setToolTip("List the session folders below the data root.")
+        find_btn.clicked.connect(self._find_sessions)
+        trow.addWidget(find_btn)
+        v.addWidget(tbox)
+
         # --- selection preview + buttons --------------------------------------
         self.sel_label = QLabel("steps: (none)")
         self.sel_label.setStyleSheet("color:#555; font-family:monospace;")
@@ -138,6 +187,22 @@ class TrackerGUI(QMainWindow):
         brow.addStretch(1)
         brow.addWidget(clear_btn)
         v.addLayout(brow)
+
+        # --- session jobs (tree mode): load, progress, running jobs -------------
+        self.jobs_box = QGroupBox("Session jobs")
+        jv = QVBoxLayout(self.jobs_box)
+        self.progress = QProgressBar()
+        self.progress.setFormat("%v / %m sessions done")
+        jv.addWidget(self.progress)
+        self.machine = QLabel("")
+        self.jobs = QLabel("")
+        for lab in (self.machine, self.jobs):
+            lab.setStyleSheet("font-family:monospace; color:#333;")
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            jv.addWidget(lab)
+        self.jobs_box.setVisible(False)
+        v.addWidget(self.jobs_box)
+        self._reset_jobs()
 
         # --- log ---------------------------------------------------------------
         self.log = QPlainTextEdit(readOnly=True)
@@ -181,8 +246,32 @@ class TrackerGUI(QMainWindow):
             cb.blockSignals(True)
             cb.setChecked(key in keys)
             cb.blockSignals(False)
+        if name in PRESET_DRY_RUN:
+            self.lfp_dry_run.setChecked(PRESET_DRY_RUN[name])
         self._on_check_changed()
 
+    def _find_sessions(self):
+        """List the session folders the runner's tree mode would process."""
+        root = Path(self.root_edit.text().strip())
+        if not str(root) or not root.is_dir():
+            self.statusBar().showMessage("Pick a valid data-root folder first.")
+            return
+        if any(d.is_dir() for d in root.glob("ip*")):
+            self._append(f"[genzeltracker] {root} has ip* folders: it runs as ipN -> opN pairs "
+                         f"(no session tree).\n")
+            return
+        if find_session_folders is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            found = find_session_folders(root)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._append(f"[genzeltracker] {len(found)} session folder(s) below {root}:\n"
+                     + "".join(f"    {p.relative_to(root)}\n" for p in found))
+        self.statusBar().showMessage(
+            f"{len(found)} session folder(s); steps {' '.join(POST_JOB_STEPS)} run per session "
+            f"in parallel.")
     def _selection(self) -> str:
         return "".join(k for k, _ in MENU if self.checks[k].isChecked())
 
@@ -211,6 +300,10 @@ class TrackerGUI(QMainWindow):
         env.insert("MAX_MEM", str(self.mem.value()))
         env.insert("WORKER_WINDOWS", "1" if self.own_windows.isChecked() else "0")
         env.insert("PYTHONUNBUFFERED", "1")
+        # tree mode; the HM_ names win over the same settings in the config file
+        env.insert("HM_POST_JOBS", str(self.post_jobs.value() or "auto"))
+        env.insert("HM_LFP_FIX_DRY_RUN", "1" if self.lfp_dry_run.isChecked() else "0")
+        self._reset_jobs()
 
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
@@ -220,18 +313,81 @@ class TrackerGUI(QMainWindow):
         self.proc.finished.connect(self._on_finished)
         self.proc.start(sys.executable, ["-u", str(RUNNER), root])
 
-        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}\n")
+        dry = " (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
+        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}\n")
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.statusBar().showMessage(f"Running steps: {steps}")
 
     def _stop(self):
         if self.proc is not None:
+            # the runner's own child processes (the step it is running, tree-mode
+            # session jobs) would outlive it otherwise; worker terminal windows are
+            # not its children and keep running, as before
+            if psutil is not None:
+                try:
+                    for child in psutil.Process(int(self.proc.processId())).children(recursive=True):
+                        child.kill()
+                except Exception:
+                    pass
             self.proc.kill()
 
     def _read_output(self):
         data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
         self._append(data)
+        self._follow(data)
+
+    # ------------------------------------------------------------- session jobs
+    def _reset_jobs(self):
+        self._buf, self._total, self._done, self._failed = "", 0, 0, []
+        self._running, self._job_rows, self._waits = set(), {}, ""
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.machine.setText("")
+        self.jobs.setText("")
+
+    def _follow(self, data):
+        """Update the Session jobs panel from the runner's tree-mode lines."""
+        lines = (self._buf + data).replace("\r", "").split("\n")
+        self._buf = lines.pop()
+        for line in lines:
+            if m := _TREE_TOTAL.match(line):
+                self._total = int(m.group(1))
+                self.jobs_box.setTitle(f"Session jobs — steps [{m.group(2)}]")
+                self.jobs_box.setVisible(True)
+            elif m := _TREE_EVENT.match(line):
+                kind, label = m.groups()
+                if kind == "start":
+                    self._running.add(label)
+                else:
+                    self._running.discard(label)
+                    self._job_rows.pop(label, None)
+                    self._done += 1
+                    if kind == "FAILED":
+                        self._failed.append(label)
+            elif m := _MON.match(line):
+                self.machine.setText(m.group(1))
+                self._job_rows, self._waits = {}, ""
+            elif m := _JOB.match(line):
+                self._job_rows[m.group(1)] = m.groups()[1:]
+            elif line.startswith("    next start waits:"):
+                self._waits = line.strip()
+            else:
+                continue
+            self._show_jobs()
+
+    def _show_jobs(self):
+        self.progress.setRange(0, max(self._total, 1))
+        self.progress.setValue(self._done)
+        self.progress.setFormat(f"%v / %m sessions done" + (f" — {len(self._failed)} failed: "
+                                + ", ".join(self._failed) if self._failed else ""))
+        rows = []
+        for label in sorted(self._running):
+            step, minutes, gb = self._job_rows.get(label, ("-", "", None))
+            rows.append(f"{label:<28} step {step:<2} {minutes:>6} min" + (f"  {gb} GB" if gb else ""))
+        if self._waits:
+            rows.append(self._waits)
+        self.jobs.setText("\n".join(rows))
 
     def _append(self, text):
         self.log.moveCursor(QTextCursor.MoveOperation.End)

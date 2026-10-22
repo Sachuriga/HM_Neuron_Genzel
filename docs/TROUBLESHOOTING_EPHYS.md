@@ -54,6 +54,10 @@ If no `*.timestamps.dat` file is found in the `.LFP/` folder, the script generat
 
 Step 8 used to pick one LFP channel as "EMG" (the one with the most 20–200 Hz power) and build an awakeness index from it. That is no longer written: the only EMG is `acquisition/emg_from_lfp`, the cross-channel correlation. Re-running step 8 on the session removes the old containers from its NWB.
 
+**`[sleep-nwb] The LFP is stamped at 30000 Hz and its real rate cannot be told ... The LFP is NOT packaged`**
+
+The legacy backfill (`export_sleep_nwb.py`) checks an old export's LFP stamps against the session's spikes (NWB units, else the phy export) or tracking before packaging them. Stamps at the 30 kHz acquisition rate with neither to check against are refused rather than written wrong. Run the sorting/tracking first, or step `l` with `--export_rate` once the rate is known. (`[warn] ... packaged at 1000 Hz` means the stamps were wrong and the real rate was used.)
+
 **Output files not generated / folder not created**
 
 - Verify the output folder path exists and is writable.

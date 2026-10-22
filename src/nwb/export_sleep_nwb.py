@@ -18,6 +18,12 @@ the ``.npy`` with everything ``HM_rat_sleep_score`` needs:
 The ``.npy`` files stay where they are — this only adds a packaged copy, so
 nothing downstream that still reads them breaks.
 
+The LFP's stamps are checked first (some old exports stamp a ~1 kHz LFP at the
+30 kHz acquisition rate): against the session's spikes or tracking, with the rule
+step l uses. Wrong stamps are replaced by ``arange(n) / rate`` at the real rate,
+or the LFP is not packaged when nothing tells that rate. ``processing/sleep/
+session_info`` records the export's channel map, so readers find the tetrodes.
+
 Re-running is safe: containers that already exist are left untouched, and an
 NWB that step 4/u already populated is appended to rather than replaced, so a
 scoring stored in it is never lost.
@@ -29,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -94,6 +101,7 @@ def collect_inputs(lfp_dir):
 
     emg = _load(find_output(lfp_dir, "emg_from_lfp_5hz.npy"))
     emg_ts = _load(find_output(lfp_dir, "emg_from_lfp_timestamps.npy"))
+    emg_on_lfp_clock = emg is None
     if emg is None:                       # fall back to the per-sample version
         emg = _load(find_output(lfp_dir, "emg_from_lfp.npy"), mmap=True)
         emg_ts = ts
@@ -110,7 +118,90 @@ def collect_inputs(lfp_dir):
 
     return {"lfp": lfp, "lfp_timestamps": ts, "emg": emg, "emg_timestamps": emg_ts,
             "motion": motion, "motion_timestamps": motion_ts,
-            "sleep_channels": channels}
+            "sleep_channels": channels,
+            # not scorer inputs: they check / describe the LFP (see run())
+            "emg_on_lfp_clock": emg_on_lfp_clock,
+            "channel_map": _load(find_output(lfp_dir, "channel_map.npy")),
+            "session_boundaries": _load(find_output(lfp_dir, "session_boundaries.npy"))}
+
+
+def reference_ends(op, nwb_path=None):
+    """(spikes_end, tracking_end) in seconds on the spike clock, or None each: from
+    the session NWB when it holds units / positions, else from the sorter's phy
+    export (sample indices at FREQ) and the tracking's framewise seconds."""
+    spikes_end = tracking_end = None
+    if nwb_path is not None and Path(nwb_path).is_file():
+        import h5py
+        with h5py.File(str(nwb_path), "r") as f:
+            if "units/spike_times" in f and f["units/spike_times"].shape[0] > 1000:
+                spikes_end = float(np.max(f["units/spike_times"][:]))
+            pos = f.get("processing/Behavior/Position")
+            if pos is not None and len(pos):
+                first = pos[sorted(pos.keys())[0]]
+                if "timestamps" in first:
+                    tracking_end = float(np.nanmax(first["timestamps"][:]))
+    op = Path(op)
+    if spikes_end is None:
+        for st in sorted(op.glob("*_sorting_output/phy_export/spike_times.npy")):
+            t = np.load(st, mmap_mode="r")
+            if t.size > 1000:
+                spikes_end = float(np.max(t)) / float(os.environ.get("FREQ", "") or 30000)
+                break
+    if tracking_end is None:
+        for csv in sorted(op.glob("*framewise_seconds.csv")):
+            if csv.name.startswith("._"):
+                continue
+            try:
+                last = csv.read_text(errors="replace").strip().splitlines()[-1]
+                tracking_end = float(last.split(",")[1])
+                break
+            except (OSError, IndexError, ValueError):
+                continue
+    return spikes_end, tracking_end
+
+
+def checked_lfp_timestamps(op, nwb_path, n, ts):
+    """(timestamps, note) to package an n-sample LFP with.
+
+    Some old exports stamp a ~1 kHz LFP at the 30 kHz acquisition rate (Trodes put
+    the raw rate in the LFP header), so the stamps are checked against the session's
+    other clocks with step l's rule (rewrite_nwb_lfp.export_rate): the export's own
+    stamps when they hold up (note ''), ``arange(n) / rate`` at the rate the spikes
+    or tracking imply, or None when the stamps are the acquisition rate and nothing
+    tells the real one. Stamps that cannot be checked are kept, as before."""
+    import rewrite_nwb_lfp as rw
+    stamped = None
+    if ts is not None and len(ts) > 1:
+        stamped = round(float(1.0 / np.median(np.diff(ts[:200000]))), 3)
+    spikes_end, tracking_end = reference_ends(op, nwb_path)
+    fs, why = rw.export_rate(n, stamped, spikes_end, tracking_end)
+    if fs is None:
+        if stamped is None or stamped >= 20000:
+            return None, (f"The LFP is stamped at {stamped or 0:g} Hz and its real rate cannot be "
+                          f"told ({why}).")
+        return ts, f"Could not check the LFP's {stamped:g} Hz stamps ({why}); packaged as they are."
+    if stamped is None or abs(fs - stamped) > 1e-6:
+        return np.arange(n, dtype=np.float64) / fs, f"{why} — packaged at {fs:g} Hz."
+    return ts, ""
+
+
+def lfp_metadata(channel_map, boundaries, shape, ts):
+    """session_info for a packaged export: the channel map (so readers find the
+    tetrodes) and the recordings it holds. No lfp_reference: step 8's own exports
+    carry one, and step l may still replace this LFP."""
+    if channel_map is None:
+        return None
+    fs = float(1.0 / np.median(np.diff(ts[:200000])))
+    meta = {"lfp_rate_hz": round(fs, 6), "n_samples": int(shape[0]), "n_channels": int(shape[1]),
+            "time_axis": "seconds from the first sample of the export",
+            "channel_map": [dict(c) for c in channel_map],
+            "source": "LFP_Output export packaged by export_sleep_nwb.py"}
+    if boundaries is not None:
+        meta["session_boundaries"] = [
+            {"name": b["name"], "start_sample": int(b["start"]), "n_samples": int(b["n"]),
+             "start_time": int(b["start"]) / fs, "stop_time": (int(b["start"]) + int(b["n"])) / fs}
+            for b in boundaries]
+    return meta
 
 
 def run(output_folder, rat_nr=None):
@@ -169,7 +260,21 @@ def run(output_folder, rat_nr=None):
             print(f"  [warn] lfp ({lfp.shape[0]}) vs timestamps ({ts.shape[0]}): "
                   f"truncating both to {n}")
             lfp, ts = lfp[:n], ts[:n]
-        data["lfp_timestamps"] = ts
+    # Never package stamps the recording cannot have had (a 1 kHz LFP stamped at
+    # 30 kHz once "lasted" 1/30 of its session in every NWB made from it).
+    ts, note = checked_lfp_timestamps(op, existing, lfp.shape[0], ts)
+    if ts is None:
+        print(f"[sleep-nwb] {note} The LFP is NOT packaged; skipping. Run step l "
+              f"(rewrite_nwb_lfp.py, --export_rate if need be) once the session has "
+              f"spikes or tracking.")
+        return 0
+    if note:
+        print(f"  [warn] {note}")
+    if data.pop("emg_on_lfp_clock") and data.get("emg") is not None:
+        data["emg_timestamps"] = ts           # the per-sample EMG shares the LFP's clock
+    metadata = lfp_metadata(data.pop("channel_map"), data.pop("session_boundaries"),
+                            lfp.shape, ts)
+    data["lfp_timestamps"] = ts
     data["lfp"] = lfp
 
     if Path(nwb_path).is_file():
@@ -178,7 +283,7 @@ def run(output_folder, rat_nr=None):
         io = NWBHDF5IO(str(nwb_path), mode="r+")
         try:
             nwbfile = io.read()
-            added = snwb.add_sleep_inputs(nwbfile, **data)
+            added = snwb.add_sleep_inputs(nwbfile, **data, metadata=metadata)
             if added:
                 io.write(nwbfile)
         finally:
@@ -191,7 +296,7 @@ def run(output_folder, rat_nr=None):
             session_id=prefix.rstrip("_"),
             lab="Genzel Lab", institution="Radboud University",
         )
-        added = snwb.add_sleep_inputs(nwbfile, **data)
+        added = snwb.add_sleep_inputs(nwbfile, **data, metadata=metadata)
         tmp = nwb_path.with_suffix(".tmp.nwb")
         try:
             with NWBHDF5IO(str(tmp), "w") as io:
