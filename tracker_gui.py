@@ -10,13 +10,17 @@ A data root without ip* folders (e.g. the share's task folder, sessions at
 <rat>/<YYYYMMDD>/) runs in the runner's tree mode: "Find sessions" lists the
 session folders, and while it runs the "Session jobs" panel shows the machine's
 load, the sessions done and each running job, read from the runner's output.
+"Only failed of a run…" limits the next run to the sessions an earlier run did
+not finish (read from its summary.csv; passed to the runner as HM_SESSIONS_FILE).
 """
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QProcess, QProcessEnvironment
@@ -65,12 +69,14 @@ PRESETS = {
     # a root without ip* folders, e.g. the share's task folder: one job per session
     "— Session tree (e.g. the share) —": "",
     "Fix NWB LFP — check only (dry run)": "l",
+    "Fix NWB LFP only (no figures)": "l",
     "Fix NWB LFP + remake theta pages": "lv",
     "Remake figures (visualise / decode / plots / UMAP)": "vb5m",
     "After manual curation (session tree)": "wuvb5m",
 }
 # presets that also set step l's dry-run box
 PRESET_DRY_RUN = {"Fix NWB LFP — check only (dry run)": True,
+                  "Fix NWB LFP only (no figures)": False,
                   "Fix NWB LFP + remake theta pages": False}
 
 # The runner's tree-mode lines the "Session jobs" panel follows
@@ -80,6 +86,21 @@ _MON = re.compile(r"^\[MON [\d:]+\] (.*?) \| \d+ running, \d+ queued, \d+ done")
 _JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?")
 
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")
+# where the runner's tree mode keeps its per-run logs + summary.csv (POST_LOG_DIR)
+POST_LOG_DIR = Path(tempfile.gettempdir()) / "hm_post"
+
+
+def failed_sessions(summary_csv):
+    """The session folders a tree-mode run did not finish: every row of its
+    summary.csv whose status is not 'ok' (failed, interrupted, not started)."""
+    folders = []
+    with open(summary_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            status = row.get("status", "")
+            folder = row.get("folder", "")
+            if status != "ok" and folder:
+                folders.append(folder)
+    return folders
 
 
 class TrackerGUI(QMainWindow):
@@ -148,7 +169,9 @@ class TrackerGUI(QMainWindow):
 
         # --- session tree (a root without ip* folders) -------------------------
         tbox = QGroupBox("Session tree — a data root without ip* folders, e.g. the share's task folder")
-        trow = QHBoxLayout(tbox)
+        tbox_rows = QVBoxLayout(tbox)
+        trow = QHBoxLayout()
+        tbox_rows.addLayout(trow)
         trow.addWidget(QLabel("Parallel sessions"))
         self.post_jobs = QSpinBox(); self.post_jobs.setRange(0, 32); self.post_jobs.setValue(0)
         self.post_jobs.setSpecialValueText("auto"); self.post_jobs.setMaximumWidth(72)
@@ -166,6 +189,25 @@ class TrackerGUI(QMainWindow):
         find_btn.setToolTip("List the session folders below the data root.")
         find_btn.clicked.connect(self._find_sessions)
         trow.addWidget(find_btn)
+
+        # which sessions: all found below the data root, or only the ones an
+        # earlier run did not finish (read from that run's summary.csv)
+        self.only_sessions: list[str] = []
+        srow = QHBoxLayout()
+        tbox_rows.addLayout(srow)
+        self.only_label = QLabel("Sessions: all found below the data root")
+        srow.addWidget(self.only_label)
+        srow.addStretch(1)
+        failed_btn = QPushButton("Only failed of a run…")
+        failed_btn.setToolTip("Pick a run's summary.csv (in the hm_post log folder): the next "
+                              "Run processes only its sessions that are not 'ok'.")
+        failed_btn.clicked.connect(self._pick_failed_run)
+        srow.addWidget(failed_btn)
+        self.all_sessions_btn = QPushButton("All sessions")
+        self.all_sessions_btn.setToolTip("Go back to every session found below the data root.")
+        self.all_sessions_btn.clicked.connect(self._clear_only_sessions)
+        self.all_sessions_btn.setEnabled(False)
+        srow.addWidget(self.all_sessions_btn)
         v.addWidget(tbox)
 
         # --- selection preview + buttons --------------------------------------
@@ -272,6 +314,34 @@ class TrackerGUI(QMainWindow):
         self.statusBar().showMessage(
             f"{len(found)} session folder(s); steps {' '.join(POST_JOB_STEPS)} run per session "
             f"in parallel.")
+
+    def _pick_failed_run(self):
+        """Ask for a run's summary.csv, then limit the next run to its unfinished sessions."""
+        start_dir = POST_LOG_DIR if POST_LOG_DIR.is_dir() else Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, "Pick a run's summary.csv", str(start_dir),
+                                              "Run summary (summary.csv);;CSV files (*.csv)")
+        if path:
+            self._use_failed_run(path)
+
+    def _use_failed_run(self, summary_csv):
+        """Limit the next run to the sessions in summary_csv that are not 'ok'."""
+        folders = failed_sessions(summary_csv)
+        run_name = Path(summary_csv).parent.name          # the run's start time
+        if not folders:
+            self._append(f"[genzeltracker] {summary_csv}: every session is ok — nothing to re-run.\n")
+            return
+        self.only_sessions = folders
+        self.only_label.setText(f"Sessions: only the {len(folders)} not ok in run {run_name}")
+        self.all_sessions_btn.setEnabled(True)
+        self._append(f"[genzeltracker] the next run processes only these {len(folders)} session(s) "
+                     f"from {summary_csv}:\n" + "".join(f"    {p}\n" for p in folders))
+
+    def _clear_only_sessions(self):
+        """Back to every session found below the data root."""
+        self.only_sessions = []
+        self.only_label.setText("Sessions: all found below the data root")
+        self.all_sessions_btn.setEnabled(False)
+
     def _selection(self) -> str:
         return "".join(k for k, _ in MENU if self.checks[k].isChecked())
 
@@ -303,6 +373,15 @@ class TrackerGUI(QMainWindow):
         # tree mode; the HM_ names win over the same settings in the config file
         env.insert("HM_POST_JOBS", str(self.post_jobs.value() or "auto"))
         env.insert("HM_LFP_FIX_DRY_RUN", "1" if self.lfp_dry_run.isChecked() else "0")
+        # only the picked sessions: the runner reads them from a list file
+        # (always set, so an HM_SESSIONS_FILE left in the shell cannot leak in)
+        sessions_file = ""
+        if self.only_sessions:
+            list_file = POST_LOG_DIR / "only_sessions.txt"
+            list_file.parent.mkdir(parents=True, exist_ok=True)
+            list_file.write_text("\n".join(self.only_sessions) + "\n", encoding="utf-8")
+            sessions_file = str(list_file)
+        env.insert("HM_SESSIONS_FILE", sessions_file)
         self._reset_jobs()
 
         self.proc = QProcess(self)
@@ -314,7 +393,8 @@ class TrackerGUI(QMainWindow):
         self.proc.start(sys.executable, ["-u", str(RUNNER), root])
 
         dry = " (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
-        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}\n")
+        only = f" (only the {len(self.only_sessions)} listed sessions)" if self.only_sessions else ""
+        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}{only}\n")
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.statusBar().showMessage(f"Running steps: {steps}")

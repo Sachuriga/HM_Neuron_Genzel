@@ -49,3 +49,28 @@ def test_jobs_panel_follows_the_runner(gui):
     assert gui.machine.text().startswith("CPU 40% | MEM 56%")
     rows = gui.jobs.text().splitlines()
     assert rows[0].startswith("Rat5_20260701") and rows[-1].startswith("next start waits")
+
+
+def test_fix_lfp_only_preset_runs_step_l_for_real(gui):
+    gui.preset.setCurrentText("Fix NWB LFP only (no figures)")
+    assert gui._selection() == "l" and not gui.lfp_dry_run.isChecked()
+
+
+def test_only_the_unfinished_sessions_of_a_run(gui, tmp_path):
+    summary = tmp_path / "20261022_120002" / "summary.csv"
+    summary.parent.mkdir()
+    summary.write_text(
+        "session,status,minutes,folder,log\n"
+        "Rat5_20260622,failed,7.8,/share/rat5/20260622,a.log\n"
+        "Rat5_20260623,ok,23.6,/share/rat5/20260623,b.log\n"
+        "Rat6_20260626,interrupted,3.0,/share/rat6/20260626,c.log\n"
+        "Rat6_20260629,not started,0.0,/share/rat6/20260629,\n", encoding="utf-8")
+    assert G.failed_sessions(summary) == ["/share/rat5/20260622", "/share/rat6/20260626",
+                                          "/share/rat6/20260629"]
+
+    gui._use_failed_run(summary)
+    assert len(gui.only_sessions) == 3 and gui.all_sessions_btn.isEnabled()
+    assert "only the 3 not ok in run 20261022_120002" in gui.only_label.text()
+
+    gui._clear_only_sessions()
+    assert gui.only_sessions == [] and not gui.all_sessions_btn.isEnabled()

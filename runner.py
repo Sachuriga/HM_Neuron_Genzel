@@ -861,6 +861,26 @@ def find_session_folders(root, max_depth=None):
     return sorted(found)
 
 
+def read_session_list(list_file):
+    """The session folders listed in a text file, one folder per line.
+
+    Used instead of find_session_folders when HM_SESSIONS_FILE is set, e.g. by the
+    GUI's "Only failed of a run…" (the sessions a previous run did not finish).
+    Blank lines and '#' comments are skipped; a folder that does not exist is
+    reported and left out."""
+    folders = []
+    for line in Path(list_file).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        folder = Path(line)
+        if folder.is_dir():
+            folders.append(folder)
+        else:
+            print(f"[TREE] listed session folder not found, skipped: {line}")
+    return folders
+
+
 def session_label(folder, root):
     """'Rat5_20260630' from the folder's session NWB, else its path below root."""
     nwbs = [p for p in Path(folder).glob("*.nwb")
@@ -1160,13 +1180,24 @@ def main():
     # task/<rat>/<YYYYMMDD>/). They are found below the root, and the per-session
     # steps (POST_JOB_STEPS) run as parallel jobs instead of one folder at a time.
     tree = not ip_dirs
+    sessions_file = os.environ.get("HM_SESSIONS_FILE", "").strip()
     if tree:
-        print(f"[TREE] No ip* folders under {root}: looking for session folders "
-              f"(up to {_int_env('TREE_DEPTH', TREE_DEPTH)} levels deep)...")
-        seq_ops = [(d, d) for d in find_session_folders(root)]
+        if sessions_file:
+            # only the listed sessions (e.g. the failed ones of an earlier run);
+            # no tree walk, which also saves the directory listings on the share
+            print(f"[TREE] Only the session folders listed in {sessions_file}:")
+            seq_ops = [(d, d) for d in read_session_list(sessions_file)]
+        else:
+            print(f"[TREE] No ip* folders under {root}: looking for session folders "
+                  f"(up to {_int_env('TREE_DEPTH', TREE_DEPTH)} levels deep)...")
+            seq_ops = [(d, d) for d in find_session_folders(root)]
         print(f"[TREE] {len(seq_ops)} session folder(s):")
         for _ip, op in seq_ops:
-            print(f"    {op.relative_to(root)}")
+            try:
+                shown = op.relative_to(root)
+            except ValueError:                  # a listed folder outside the root
+                shown = op
+            print(f"    {shown}")
         need_ip = [k for k in "1234789dn" if k in selection]     # these read ip*/<raw>
         if need_ip:
             print(f"[TREE] Step(s) {' '.join(need_ip)} read the raw recordings (ip* folders) "
@@ -1176,6 +1207,9 @@ def main():
         # folders whose name matches a file inside them. This lets those steps run on
         # session-named folders, not just op*.
         seq_ops = sequential_targets(root, ops)
+        if sessions_file:
+            print(f"[STEPS] HM_SESSIONS_FILE applies to a session tree only; {root} has "
+                  f"ip* folders, so it is ignored.")
         if seq_ops:
             print(f"[DEBUG] ip-independent step targets: "
                   f"{', '.join(op.name for _i, op in seq_ops)}")

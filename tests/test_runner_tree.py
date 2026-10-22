@@ -106,3 +106,28 @@ def test_jobs_run_in_parallel_up_to_the_limit_and_failures_are_reported(tmp_path
     assert status == {"Rat1_20260700": "ok", "Rat1_20260701": "ok",
                       "Rat1_20260702": "failed", "Rat1_20260703": "ok"}
     assert (Path(results[0]["log"]).parent / "summary.csv").is_file()
+
+
+def test_a_session_list_replaces_the_tree_walk(share, tmp_path, monkeypatch, capsys):
+    # the GUI's "Only failed of a run…": only the listed sessions get the steps
+    wanted = share / "rat5_491390" / "20260701"
+    list_file = tmp_path / "only_sessions.txt"
+    list_file.write_text(f"# failed in run 20261022_120002\n\n{wanted}\n{share / 'gone' / '20260101'}\n",
+                         encoding="utf-8")
+    assert runner.read_session_list(list_file) == [wanted]
+    assert "not found, skipped" in capsys.readouterr().out
+
+    jobs = {}
+
+    def fake_run_post_jobs(targets, steps, config, root):
+        jobs["targets"] = [op for _ip, op in targets]
+        jobs["steps"] = steps
+        return []
+
+    monkeypatch.setattr(runner, "run_post_jobs", fake_run_post_jobs)
+    monkeypatch.setattr(runner, "load_config", lambda: "cfg.txt")
+    monkeypatch.setattr(sys, "argv", ["runner.py", str(share)])
+    monkeypatch.setenv("HM_STEPS", "l")
+    monkeypatch.setenv("HM_SESSIONS_FILE", str(list_file))
+    runner.main()
+    assert jobs == {"targets": [wanted], "steps": "l"}

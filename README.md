@@ -276,11 +276,12 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 | Drive scan (QC) | `t` |
 | **Session tree (e.g. the share)** | |
 | Fix NWB LFP — check only (dry run) | `l` + step l dry run |
+| Fix NWB LFP only (no figures) | `l` |
 | Fix NWB LFP + remake theta pages | `lv` |
 | Remake figures (visualise / decode / plots / UMAP) | `vb5m` |
 | After manual curation (session tree) | `wuvb5m` |
 
-For a data root **without `ip*` folders** (e.g. the share's `task` folder) the runner works in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share). The window's **Session tree** row sets how many sessions run at once (`auto` or a number; it wins over `POST_JOBS` in the config) and whether step l only checks (dry run, nothing replaced); **Find sessions** lists the session folders it will process. While it runs, the **Session jobs** panel shows the machine's load (CPU / RAM / GPU / network), a sessions-done bar (failed ones named) and each running job's step, time and memory; every session's full log is in the folder printed at the start. **Stop** also ends the processes the runner started (its current step, the session jobs); worker terminal windows keep running, as before.
+For a data root **without `ip*` folders** (e.g. the share's `task` folder) the runner works in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share). The window's **Session tree** row sets how many sessions run at once (`auto` or a number; it wins over `POST_JOBS` in the config) and whether step l only checks (dry run, nothing replaced); **Find sessions** lists the session folders it will process. **Only failed of a run…** takes a run's `summary.csv` (in `<tmp>/hm_post/<run time>/`) and limits the next Run to that run's sessions that are not `ok` (failed, interrupted, not started); **All sessions** goes back to every session below the data root. While it runs, the **Session jobs** panel shows the machine's load (CPU / RAM / GPU / network), a sessions-done bar (failed ones named) and each running job's step, time and memory; every session's full log is in the folder printed at the start. **Stop** also ends the processes the runner started (its current step, the session jobs); worker terminal windows keep running, as before.
 
 ### CLI
 
@@ -355,6 +356,7 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `WAIT_SECONDS` / `LAUNCH_GAP` | 30 / 20 | resource gate / launch pacing |
 | `POST_JOBS` | auto | tree mode: parallel session jobs |
 | `TREE_DEPTH` | 4 | tree mode: levels searched for session folders |
+| `HM_SESSIONS_FILE` | — (all sessions) | tree mode: a text file, one session folder per line; only those run, no tree walk (set by the GUI's "Only failed of a run…") |
 | `MONITOR_SECONDS` | 30 | tree mode: status-block interval |
 | `POST_LOG_DIR` | `<tmp>/hm_post` | tree mode: per-session logs + `summary.csv` |
 | `LFP_OUTPUT_RATE` | 1500 | step 8 export rate; step l writes the NWB LFP at it |

@@ -1,7 +1,10 @@
 """rewrite_nwb_lfp: the NWB's LFP is rebuilt from the LFP_Output export on its true
 rate, everything else in the file stays bit-identical, and the original is kept."""
 import json
+import os
+import weakref
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -141,3 +144,74 @@ def test_the_files_own_nwb_version_is_kept(tmp_path):
     assert rec["status"] == "replaced" and rec["nwb_version"]["kept"] == "9.9.9"
     with h5py.File(op / "Rat1_20260101.nwb", "r") as f:
         assert f.attrs["nwb_version"] == "9.9.9"
+
+
+def windows_replace_rule(monkeypatch):
+    """Make os.replace behave like Windows: a file that is still memory-mapped cannot
+    be replaced ("[WinError 5] Access is denied"). A Mac allows it, so without this
+    the tests would pass here and fail on the lab PC."""
+    real_load, real_replace = np.load, os.replace
+    mapped = []                                   # (path, weak reference to its memmap)
+
+    def load(path, *args, **kwargs):
+        out = real_load(path, *args, **kwargs)
+        if isinstance(out, np.memmap):
+            mapped.append((Path(path), weakref.ref(out)))
+        return out
+
+    def replace(src, dst):
+        if any(p == Path(dst) and ref() is not None for p, ref in mapped):
+            raise PermissionError(13, "Access is denied (the file is still memory-mapped)", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(np, "load", load)
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_restamping_works_where_mapped_files_cannot_be_replaced(tmp_path, monkeypatch):
+    windows_replace_rule(monkeypatch)
+    op = tmp_path / "20260101"
+    lfp = make_session(op, fs=1000, stamped=30000, old_lfp="stamped")
+    rec = R.rewrite(op, 1500.0, work=tmp_path / "work")
+    assert rec["status"] == "replaced" and rec["export_timestamps"]["now_hz"] == 1000
+    ts = np.load(op / "LFP_Output" / f"{PFX}lfp_timestamps.npy")
+    assert np.array_equal(ts, np.arange(len(lfp)) / 1000.0)
+
+
+def test_a_run_stopped_after_the_nwb_was_replaced_is_finished_by_the_next(tmp_path, monkeypatch):
+    # the lab PC's 2026-10-22 runs: NWB replaced, then the stamps' replace was refused
+    op = tmp_path / "20260101"
+    lfp = make_session(op, fs=1000, stamped=30000, old_lfp="stamped")
+    lo = op / "LFP_Output"
+    original_ts = np.load(lo / f"{PFX}lfp_timestamps.npy")
+    real_replace = os.replace
+
+    def refuse_the_stamps(src, dst):
+        if Path(dst).name.endswith("lfp_timestamps.npy"):
+            raise PermissionError(13, "Access is denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", refuse_the_stamps)
+    with pytest.raises(R.NwbReplacedError, match="NWB was replaced"):
+        R.rewrite(op, 1500.0, work=tmp_path / "work")
+    monkeypatch.undo()
+
+    # the NWB is the new one, the run is on record, and no temp file is left behind
+    _, rate, _, info = stored(op)
+    assert rate == 1500 and info["rewritten"]["export_rate_hz"] == 1000
+    history = json.loads((op / "lfp_fix_backup" / "lfp_fix.json").read_text())
+    assert history[0]["status"] == "replaced" and "error" in history[0]["export_timestamps"]
+    assert not list(lo.glob("*.lfpfix.tmp"))
+    assert np.array_equal(np.load(lo / f"{PFX}lfp_timestamps.npy"), original_ts)
+
+    # the next run leaves the NWB alone and only restamps the export
+    nwb_before = R.sha256(op / "Rat1_20260101.nwb")
+    rec = R.rewrite(op, 1500.0, work=tmp_path / "work2")
+    assert rec["status"] == "restamped" and rec["export_timestamps"]["was_hz"] == 30000
+    assert R.sha256(op / "Rat1_20260101.nwb") == nwb_before
+    assert np.array_equal(np.load(lo / f"{PFX}lfp_timestamps.npy"), np.arange(len(lfp)) / 1000.0)
+    assert np.array_equal(np.load(lo / "lfp_fix_backup" / f"{PFX}lfp_timestamps.npy"), original_ts)
+    assert len(json.loads((op / "lfp_fix_backup" / "lfp_fix.json").read_text())) == 2
+
+    # and after that there is nothing left to do
+    assert R.rewrite(op, 1500.0, work=tmp_path / "work3")["status"] == "skipped"

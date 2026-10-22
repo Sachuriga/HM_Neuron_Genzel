@@ -32,7 +32,8 @@ WHAT IT DOES (one op folder)
    record in lfp_fix_backup/lfp_fix.json. A mis-stamped LFP_Output lfp_timestamps.npy
    is rewritten too (original in LFP_Output/lfp_fix_backup/).
 A session whose NWB already holds the rewritten LFP, or step 8's own LFP, is left
-alone, and so is a session without LFP_Output.
+alone, and so is a session without LFP_Output — except that a mis-stamped
+lfp_timestamps.npy left by an interrupted earlier run is still restamped.
 
 Freed space: dropping a full-length old LFP leaves its space inside the HDF5 file.
 It is given back with h5repack when that is installed (conda: hdf5 package), else
@@ -41,7 +42,8 @@ the file keeps it until `python src/nwb/compact_nwb.py <op>`.
 USAGE
 -----
     python src/nwb/rewrite_nwb_lfp.py --output_folder <op> [--rate 1500] [--dry-run]
-Exit code 0: rewritten, or nothing to do. 1: stopped — the op folder is untouched.
+Exit code 0: rewritten, or nothing to do. 1: stopped — the op folder is untouched,
+unless the log says "STOPPED after replacing the NWB" (then run it again to finish).
 """
 
 import argparse
@@ -158,6 +160,60 @@ def sidecars(*dirs):
     """macOS AppleDouble files ("._*") in these folders. A Mac writes one next to
     each file it creates on an SMB share; they are not data."""
     return {str(p) for d in dirs if Path(d).is_dir() for p in Path(d).glob("._*")}
+
+
+class NwbReplacedError(RuntimeError):
+    """Stopped AFTER the NWB was replaced: the op folder is NOT untouched."""
+
+
+def append_record(backup, rec):
+    """Add rec to <op>/lfp_fix_backup/lfp_fix.json (written whole, then renamed)."""
+    log = backup / "lfp_fix.json"
+    history = json.loads(log.read_text()) if log.exists() else []
+    history.append(rec)
+    tmp_log = log.with_name(log.name + ".tmp")
+    tmp_log.write_text(json.dumps(history, indent=1, default=str))
+    os.replace(tmp_log, log)
+
+
+def stamps_rate(ts):
+    """The rate a timestamps array claims, in Hz."""
+    # k/fs stamps give fs back only to ~1e-9 (1499.999999998): take the rate itself
+    return round(float(1.0 / np.median(np.diff(ts[:200000]))), 3)
+
+
+def restamp_export(op, lfp_dir, tsf, fs):
+    """Rewrite LFP_Output's lfp_timestamps.npy at the export's true rate fs when it
+    is stamped at the acquisition rate (the Trodes header bug); the original goes to
+    LFP_Output/lfp_fix_backup/. Returns the record for lfp_fix.json, or None when the
+    stamps need no fix."""
+    # into memory, never memory-mapped: Windows cannot replace a mapped file
+    ts = np.load(tsf)
+    if len(ts) < 2:
+        return None
+    stamped = stamps_rate(ts)
+    if stamped < 20000 or abs(stamped - fs) < 1e-6:
+        return None
+    (lfp_dir / BACKUP_DIR).mkdir(exist_ok=True)
+    kept_ts = lfp_dir / BACKUP_DIR / tsf.name
+    if not kept_ts.exists():
+        shutil.copy2(tsf, kept_ts)
+    if sha256(kept_ts) != sha256(tsf):
+        raise RuntimeError(f"{kept_ts} is not a copy of {tsf.name}; left as is")
+    new_ts = np.arange(len(ts), dtype=np.float64) / fs
+    tmp_ts = lfp_dir / (tsf.name + ".lfpfix.tmp")
+    try:
+        with open(tmp_ts, "wb") as fo:
+            np.save(fo, new_ts)
+        os.replace(tmp_ts, tsf)
+    finally:
+        # a failed replace must not leave the half-done copy on the share
+        if tmp_ts.exists():
+            tmp_ts.unlink()
+    if not np.array_equal(np.load(tsf), new_ts):
+        raise RuntimeError(f"{tsf} did not read back")
+    return {"file": str(tsf.relative_to(op)), "was_hz": stamped, "now_hz": fs,
+            "backup": str(kept_ts.relative_to(op))}
 
 
 # ---------------------------------------------------------------------------- #
@@ -352,9 +408,10 @@ def leave_alone(stored, target, force=False):
 # ---------------------------------------------------------------------------- #
 def rewrite(op, target_rate=1500.0, work=None, dry_run=False, given_rate=None, force=False,
             keep_work=False):
-    """Rewrite op's NWB LFP. Returns the record (status 'replaced', 'rehearsed' or
-    'skipped'); raises when it stops (the op folder is then untouched). A dry run
-    keeps its rewritten local copy only with keep_work."""
+    """Rewrite op's NWB LFP. Returns the record (status 'replaced', 'restamped',
+    'rehearsed' or 'skipped'); raises when it stops (the op folder is then untouched,
+    except after NwbReplacedError: the NWB is replaced, the export's stamps are not).
+    A dry run keeps its rewritten local copy only with keep_work."""
     t0 = time.time()
     op = Path(op).resolve()
     nwb = snwb.find_session_nwb(op)
@@ -375,6 +432,18 @@ def rewrite(op, target_rate=1500.0, work=None, dry_run=False, given_rate=None, f
     keep = leave_alone(stored, target_rate, force)
     if keep:
         rec.update(status="skipped", why=keep)
+        # an earlier run may have replaced the NWB but stopped before restamping the
+        # export's lfp_timestamps.npy (on Windows the stamps used to stay memory-mapped,
+        # and a mapped file cannot be replaced): finish that part now
+        export_rate_hz = ((stored["info"] or {}).get("rewritten") or {}).get("export_rate_hz")
+        if export_rate_hz and files["lfp_timestamps"] and not dry_run:
+            done = restamp_export(op, lfp_dir, files["lfp_timestamps"], float(export_rate_hz))
+            if done:
+                rec.update(status="restamped", export_timestamps=done,
+                           minutes=round((time.time() - t0) / 60, 1))
+                append_record(op / BACKUP_DIR, rec)
+                say(f"{nwb.name}: NWB already rewritten; {files['lfp_timestamps'].name} restamped "
+                    f"{done['was_hz']:g} -> {done['now_hz']:g} Hz")
         return rec
     export = np.load(files["lfp_data"], mmap_mode="r")
     if stored and stored["shape"][1] > export.shape[1] and not force:
@@ -409,7 +478,10 @@ def _rewrite_in(work, op, nwb, lfp_dir, files, stored, rec, target_rate, dry_run
     shutil.copyfile(files["lfp_data"], local_export)
     lfp = np.load(local_export, mmap_mode="r")
     n, n_ch = lfp.shape
-    ts = (np.asarray(np.load(files["lfp_timestamps"], mmap_mode="r"), float)
+    # read the stamps into memory, NOT memory-mapped: step 6 may replace this file,
+    # and Windows refuses to replace a file that is still mapped ("[WinError 5]
+    # Access is denied"); for float64 stamps asarray() would not even make a copy
+    ts = (np.asarray(np.load(files["lfp_timestamps"]), float)
           if files["lfp_timestamps"] else None)
     say(f"{nwb.name}: copied ({st.st_size / 1e9:.2f} GB NWB, export {n} x {n_ch})")
 
@@ -429,8 +501,7 @@ def _rewrite_in(work, op, nwb, lfp_dir, files, stored, rec, target_rate, dry_run
     # 3. the export's true rate
     stamped, uniform = None, None
     if ts is not None and len(ts) > 1:
-        # k/fs stamps give fs back only to ~1e-9 (1499.999999998): take the rate itself
-        stamped = round(float(1.0 / np.median(np.diff(ts[:200000]))), 3)
+        stamped = stamps_rate(ts)
         # evenly spaced, and (stamps in seconds) sample 0 at time 0 like the spikes
         uniform = bool(np.max(np.abs(np.diff(ts) - 1.0 / stamped)) < 1e-3 / stamped
                        and (stamped < 100 or abs(ts[0]) < 0.5 / stamped))
@@ -584,37 +655,28 @@ def _rewrite_in(work, op, nwb, lfp_dir, files, stored, rec, target_rate, dry_run
     os.replace(tmp, nwb)
     rec["new"] = {"size": nwb.stat().st_size, "sha256": new_sha}
     rec["backup"] = str(kept.relative_to(op))
+    rec["status"] = "replaced"
     say(f"{nwb.name}: replaced (original -> {rec['backup']})")
 
-    if stamped and stamped >= 20000 and abs(stamped - fs) > 1e-6 and files["lfp_timestamps"]:
-        # stamped at the acquisition rate (the Trodes header bug): restamp at the real one
-        tsf = files["lfp_timestamps"]
-        (lfp_dir / BACKUP_DIR).mkdir(exist_ok=True)
-        kept_ts = lfp_dir / BACKUP_DIR / tsf.name
-        if not kept_ts.exists():
-            shutil.copy2(tsf, kept_ts)
-        if sha256(kept_ts) != sha256(tsf):
-            raise RuntimeError(f"{kept_ts} is not a copy of {tsf.name}; left as is")
-        new_ts = np.arange(len(ts), dtype=np.float64) / fs
-        tmp_ts = lfp_dir / (tsf.name + ".lfpfix.tmp")
-        with open(tmp_ts, "wb") as fo:
-            np.save(fo, new_ts)
-        os.replace(tmp_ts, tsf)
-        if not np.array_equal(np.load(tsf), new_ts):
-            raise RuntimeError(f"{tsf} did not read back")
-        rec["export_timestamps"] = {"file": str(tsf.relative_to(op)), "was_hz": stamped, "now_hz": fs,
-                                    "backup": str(kept_ts.relative_to(op))}
-        say(f"{nwb.name}: {tsf.name} restamped {stamped:g} -> {fs:g} Hz")
-
-    rec.update(status="replaced", minutes=round((time.time() - t0) / 60, 1))
-    log = backup / "lfp_fix.json"
-    history = json.loads(log.read_text()) if log.exists() else []
-    history.append(rec)
-    tmp_log = log.with_name(log.name + ".tmp")
-    tmp_log.write_text(json.dumps(history, indent=1, default=str))
-    os.replace(tmp_log, log)
-    for p in sorted(sidecars(op, backup, lfp_dir, lfp_dir / BACKUP_DIR) - known):
-        os.remove(p)
+    # from here on the NWB IS replaced: whatever happens to the stamps, record it
+    try:
+        if files["lfp_timestamps"]:
+            done = restamp_export(op, lfp_dir, files["lfp_timestamps"], fs)
+            if done:
+                rec["export_timestamps"] = done
+                say(f"{nwb.name}: {files['lfp_timestamps'].name} restamped "
+                    f"{done['was_hz']:g} -> {done['now_hz']:g} Hz")
+    except Exception as e:
+        rec["export_timestamps"] = {"error": f"{type(e).__name__}: {e}"}
+        raise NwbReplacedError(
+            f"the NWB was replaced (original in {rec['backup']}), but "
+            f"LFP_Output/{files['lfp_timestamps'].name} was not restamped: "
+            f"{type(e).__name__}: {e} — run step l again to finish it") from e
+    finally:
+        rec["minutes"] = round((time.time() - t0) / 60, 1)
+        append_record(backup, rec)
+        for p in sorted(sidecars(op, backup, lfp_dir, lfp_dir / BACKUP_DIR) - known):
+            os.remove(p)
     return rec
 
 
@@ -660,6 +722,11 @@ def main():
     a = ap.parse_args()
     try:
         rec = rewrite(a.output_folder, a.rate, a.work, a.dry_run, a.export_rate, a.force, a.keep_work)
+    except NwbReplacedError as e:
+        import traceback
+        traceback.print_exc()
+        say(f"STOPPED after replacing the NWB: {e}")
+        return 1
     except Exception as e:
         import traceback
         traceback.print_exc()
