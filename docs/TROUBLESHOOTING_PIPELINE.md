@@ -174,3 +174,23 @@ Common causes:
 **No `.xlsx` found in input folder**
 
 Confirm the `RecordingMeta.xlsx` file (filled in with start/goal nodes and trial metadata) is in the input folder before running Step n.
+
+---
+
+## Tree mode — runner.py on a folder of session folders (e.g. the share)
+
+**`[TREE] 0 session folder(s)`**
+
+A session folder holds its `*.nwb`, or is named `YYYYMMDD` and holds a file with that date in its name. Sessions deeper than `TREE_DEPTH` (4) levels below the root are not searched: point the runner at a lower folder or raise `TREE_DEPTH`. Folders named like outputs (`LFP_Output`, `visualization`, `decoding`, `videos`, `umap`, `*_sorting_output`, backups) are never searched.
+
+**Jobs start slowly / `next start waits: MEM 70% > 65%`**
+
+A new session job starts only while CPU / GPU / RAM are under `MAX_CPU` / `MAX_GPU` / `MAX_MEM` (90 / 90 / 65 %) and fewer than `POST_JOBS` run. Lower `POST_JOBS` if jobs run out of memory; raise `MAX_MEM` on a machine with RAM to spare. Without `psutil` (`pip install psutil`) CPU and RAM read as 0 and do not gate anything.
+
+**`[TREE] FAILED <session>`**
+
+Open the session's log (path printed, and listed in `summary.csv` of the run's log folder); each step starts with a `[POST-STEP]` line. A failed step does not stop that session's later steps or the other sessions; re-run with only the failed sessions' folder as the root (or the failed steps) once fixed.
+
+**Steps `1 2 3 4 7 8 9 d n` are skipped**
+
+They read the raw recordings in `ip*` folders, which a tree of processed session folders does not have. Run them on a root with `ipN`/`opN` pairs as before.

@@ -274,6 +274,10 @@ def _lfp_rate_problem(source, t):
         return f"{fs or 0:.0f} Hz is not an LFP rate"
     expected = float(np.nanmax(t)) if t is not None and len(t) else 0.0
     if source["boundaries"] or expected <= 0:
+        # only the rate can be checked here — and 30 kHz is the acquisition rate,
+        # which some exports stamp on their ~1 kHz LFP, never an LFP's own
+        if fs >= 20000:
+            return f"{fs:.0f} Hz is the acquisition rate, not an LFP rate"
         return None
     # the duration matches, or a standard rate and the ephys merely ran longer or
     # shorter than the camera (both are started by hand)
@@ -471,7 +475,11 @@ def load_theta(op_folder, x, y, t, band=THETA_BAND, sel_block_s=300.0, config=No
         if why:
             n, expected = source["data"].shape[0], float(np.nanmax(t))
             fit = min(STANDARD_LFP_RATES, key=lambda r: abs(n / r - expected))
-            if not source["boundaries"] and abs(n / fit - expected) < 0.2 * expected:
+            # a duration says nothing about the rate of a multi-recording export; one
+            # recording from sample 0 is a maze-only export that records its name
+            bounds = source["boundaries"] or []
+            one_recording = len(bounds) <= 1 and all(int(b.get("start", 0)) == 0 for b in bounds)
+            if one_recording and abs(n / fit - expected) < 0.2 * expected:
                 print(f"  [theta] LFP_Output: {why}; using {fit:.0f} Hz, the standard rate "
                       f"whose duration fits.")
                 source["fs"] = fit

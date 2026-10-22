@@ -217,6 +217,37 @@ data_root/
 - **Sequential steps** (`7 c r 9 f w u v b m t`) run at master level after all workers finish — steps `7 c r 9 f u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
 - **Step 6** (compression) is always pulled out and runs **last**, over every top-level `.mp4` of every `op*` folder.
 
+### Tree mode (renamed / grouped session folders, e.g. the share)
+
+A root **without `ip*` folders** — e.g. the processed share, where each session's op folder was renamed and grouped as `task/<rat>_<id>/<YYYYMMDD>/` — is searched for session folders instead (up to `TREE_DEPTH`, default 4 levels): a folder holding a session `*.nwb`, or named `YYYYMMDD` and holding a file with that date in its name, or a top-level `op*`. Output folders (`LFP_Output`, `visualization`, `decoding`, `*_sorting_output`, backups, …) are never searched, so this takes only a few directory listings even on a network drive.
+
+```text
+task/                          ← python runner.py <...>/task
+├── rat5_491390/
+│   ├── 20260630/              ← session: Rat5_20260630.nwb, LFP_Output/, ...
+│   └── 20260701/
+└── rat6_491391/
+    └── ...
+```
+
+The per-session steps **`l u v b 5 m`** then run as **parallel jobs, one per session** (`runner.py --post-job <op> <steps> <config>`), each running its steps in the order `l → u → v → b → 5 → m` (the LFP before the theta pages; units before everything that reads them; the decode before `plot_trials`, which overlays it). Step 5 takes the session folder as its input folder too. Steps `c`, `r` and the NWB refresh (`w`) still run one folder at a time over the found folders; steps that read the raw recordings (`1 2 3 4 7 8 9 d n`) are skipped with a notice. A root **with** `ip*` folders runs exactly as before.
+
+Jobs start while fewer than `POST_JOBS` run (default `auto`: half the CPU cores, one job per 12 GB RAM, at most 6), `LAUNCH_GAP` s apart, and only while CPU / GPU / RAM are under `MAX_CPU` / `MAX_GPU` / `MAX_MEM`. Every `MONITOR_SECONDS` (30) a status block shows the machine and each job:
+
+```text
+[MON 14:02:31] CPU 54% | MEM 61% (19.5/32 GB) | GPU 0% | net in 41.2 out 3.0 MB/s | 3 running, 30 queued, 7 done (0 failed)
+    Rat5_20260630                step b    12.3 min    4.1 GB
+    Rat5_20260701                step v     3.0 min    1.2 GB
+    next start waits: MEM 70% > 65%
+```
+
+One log per session goes to `<tmp>/hm_post/<run time>/<session>.log` (`POST_LOG_DIR` to change), with a `summary.csv`; the failed sessions are listed at the end. Ctrl-C stops the running jobs (and the step each is in). Run it on any machine that mounts the share, e.g. on Windows:
+
+```bat
+set HM_STEPS=lvb5m
+python runner.py "\\genzel.z.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\task"
+```
+
 ---
 
 ## Running the Pipeline
@@ -262,10 +293,11 @@ The interactive menu:
 [4] Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)
 [5] Plotting
 [6] Compression (always runs LAST, over all op folders)
-[7] Sorting
+[7] Sorting + clock QC/repair
 [c] Continue After Sorting (metrics + BombCell + Phy, no re-sort)
 [r] Recompute Metrics (after manual Phy curation)
-[8] LFP + Motion (IMU Accel) + EMG-from-LFP
+[8] LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB
+[l] Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)
 [d] deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)
 [9] Cleaning
 [n] Node Analysis
@@ -276,7 +308,7 @@ The interactive menu:
 [t] Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)
 ```
 
-Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→c→r→9→f→w→u→v→b→m→t`, then `6` last). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo.
+Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→c→r→9→f→w→l→u→v→b→m→t`, then `6` last; in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share) `l u v b 5 m` run per session as parallel jobs). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo.
 
 Each parallel worker opens its **own terminal window** by default (`runner.py --worker <ip> <op> <steps> <marker>`); the master polls a `<tmp>/hm_worker_<name>.done` marker. Set `WORKER_WINDOWS=0` to run workers as background threads logging to `<tmp>/hm_worker_<name>.log`. Workers are launched `LAUNCH_GAP` (20 s) apart.
 
@@ -296,6 +328,10 @@ Before each worker launch, the master checks system load (psutil for CPU/RAM, `n
 | `WAIT_SECONDS` | 30 | pause between rechecks |
 | `LAUNCH_GAP` | 20 | seconds between worker launches |
 | `DISABLE_RESOURCE_CHECK` | 0 | `1` skips the gate entirely |
+| `POST_JOBS` | auto | tree mode: sessions run at once (`auto` = min(cores/2, RAM/12 GB, 6)) |
+| `MONITOR_SECONDS` | 30 | tree mode: interval of the status block |
+
+In tree mode the same gate decides when the next session job may start (without blocking the jobs already running), and the status block shows CPU, RAM, GPU, network traffic (the share is read over the network) and each job's step, run time and memory.
 
 ---
 
@@ -310,6 +346,12 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `WORKER_WINDOWS` | 1 | runner: 0 = background-thread workers |
 | `MAX_CPU` / `MAX_GPU` / `MAX_MEM` | 90 / 90 / 65 | resource gate |
 | `WAIT_SECONDS` / `LAUNCH_GAP` | 30 / 20 | resource gate / launch pacing |
+| `POST_JOBS` | auto | tree mode: parallel session jobs |
+| `TREE_DEPTH` | 4 | tree mode: levels searched for session folders |
+| `MONITOR_SECONDS` | 30 | tree mode: status-block interval |
+| `POST_LOG_DIR` | `<tmp>/hm_post` | tree mode: per-session logs + `summary.csv` |
+| `LFP_OUTPUT_RATE` | 1500 | step 8 export rate; step l writes the NWB LFP at it |
+| `LFP_FIX_DRY_RUN` | 0 | step l: 1 = verify on local copies, change nothing |
 | `DISABLE_RESOURCE_CHECK` | 0 | 1 disables the gate |
 | `FREQ` | 30000 | step 2: Trodes DIO sample rate (`-f`) |
 | `SYNC_START_SEC` | 45 | step 2: LED detection skip window (0 = off) |
@@ -509,6 +551,22 @@ The per-sample data goes into the session NWB as `acquisition/lfp` (float32 µV,
 > - **Timestamps are synthetic** (sample/fs, gapless): real inter-recording gaps are not represented — use `session_boundaries.npy`.
 > - The only EMG is `emg_from_lfp*` (cross-channel correlation across all channels). The old single-channel `emg_data`/`emg_rms` and `awakeness` are no longer written.
 > - Running `export_lfp.py` by hand **must** include `--output_rate 1500` or downstream timestamps can be ~20× off.
+
+### Step l — Rewrite the NWB LFP from the old LFP_Output export
+
+```bash
+python src/nwb/rewrite_nwb_lfp.py --output_folder <op> [--rate 1500] [--dry-run]
+```
+
+For sessions whose NWB got its LFP from an `LFP_Output/*lfp_data.npy` export before step 8 wrote the NWB itself. Two faults are repaired there: `create_nwb` paired that LFP with the 5 Hz `*_emg_from_lfp_timestamps.npy` and cut it to their length (a ~20 000-sample stub stamped at 5 Hz), and some exports stamped a 1 kHz LFP at the 30 kHz acquisition rate (the trace "lasts" 1/30 of the session) — in the NWB and in `lfp_timestamps.npy` alike. The export's samples are right in both cases.
+
+Per session, on a **local copy** (the share is slow, and an interrupted write must not leave a broken NWB there):
+1. the export's true rate — its stamped rate when the export ends with the spikes, else the standard rate that does (or, for an export that runs on after the spikes, the rate at which the LFP's high-frequency power follows the population spike rate); with spikes, that covariation always cross-checks the rate;
+2. the old `acquisition/lfp` (with `session_info` / `theta_delta_ratio`; EMG, motion and scorings stay) is dropped, its space given back with `h5repack` when installed (else `compact_nwb.py` later), and the export is written in step 8's layout — float32 on a rate, gzip chunks, `processing/sleep/session_info` with the `channel_map` and `lfp_reference = trodes_exportlfp` — at `LFP_OUTPUT_RATE` (1500 Hz; a 1000 Hz export is resampled 3/2 with `resample_poly`, recorded in `session_info.rewritten`);
+3. verified: every other object bit-identical, the LFP equal to what was meant to be written, `theta_events` accepts it with its channel map;
+4. only then swapped in: the original NWB → `<op>/lfp_fix_backup/<name>.nwb.prelfpfix`, record in `lfp_fix_backup/lfp_fix.json`; a 30 kHz-stamped `lfp_timestamps.npy` is restamped (`arange(n)/fs`, original in `LFP_Output/lfp_fix_backup/`).
+
+Re-running is safe: an NWB already rewritten at that rate, or holding step 8's own LFP, or a session without `LFP_Output`, is left alone (`--force` overrides). Exit code 1 = stopped, nothing in the op folder changed. `LFP_FIX_DRY_RUN=1` in `hm_tracker_paths.txt` (or `--dry-run`) does and verifies everything on the local copy and changes nothing — a safe first pass over a whole tree. Re-run step `v` afterwards: its theta pages read this LFP.
 
 ### Step d — DeepLabCut Export + Inference
 
@@ -883,7 +941,7 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 
 `docs/` contains: `ERROR_REFERENCE.md` (exact error message → cause/fix), `TROUBLESHOOTING.md` (LED sync), `TROUBLESHOOTING_EPHYS.md` (sorting/LFP), `TROUBLESHOOTING_PIPELINE.md` (per-step), `TROUBLESHOOTING_SETUP.md` (env/config), `RecordingMeta_README.md`, and the experiment protocol.
 
-Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range) and the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent). numpy/scipy/pandas only; no OpenCV or data needed (the LFP-rate test runs when pynwb is installed).
+Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) and step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone). numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed).
 
 Quick pointers:
 

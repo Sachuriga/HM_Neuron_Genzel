@@ -11,6 +11,24 @@ ONNX_WEIGHTS_PATH=C:\Users\YOUR_NAME\Desktop\data\yolov\bests_1280_mosiac_close.
 TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport.exe
 
 # -------------------------------------------------------------------
+# Tree mode: runner.py pointed at a folder WITHOUT ip* folders (e.g. the share's
+# task folder, sessions at <rat>_<id>/<YYYYMMDD>/) finds the session folders and
+# runs steps l u v b 5 m as parallel jobs, one per session.
+# POST_JOBS       : sessions at once. auto = half the CPU cores, one per 12 GB of
+#                   RAM, at most 6. A new job also waits while CPU/GPU/RAM are over
+#                   MAX_CPU / MAX_GPU / MAX_MEM (90 / 90 / 65 %).
+# MONITOR_SECONDS : how often the status block (machine + each job) is printed.
+# TREE_DEPTH      : how many folder levels below the root are searched.
+# LFP_OUTPUT_RATE : step 8's LFP rate; step l writes the NWB LFP at this rate.
+# LFP_FIX_DRY_RUN : 1 = step l rewrites and verifies each NWB on a local copy only
+#                   and changes nothing (a first pass); 0 = really replace them.
+POST_JOBS=auto
+MONITOR_SECONDS=30
+TREE_DEPTH=4
+LFP_OUTPUT_RATE=1500
+LFP_FIX_DRY_RUN=0
+
+# -------------------------------------------------------------------
 # DeepLabCut inference (menu [d] part 2, src/dlc/dlc_coordinates.py).
 # DLC_CONFIG_PATH : full path to your trained DLC project's config.yaml. Step [d]
 #                   runs DeepLabCut on the collected_frames.mp4 it just exported,

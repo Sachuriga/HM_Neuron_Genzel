@@ -16,10 +16,15 @@
 #       folder at a time, in that order.
 #     - Each parallel worker logs to <tmp>/hm_worker_<name>.log.
 #     - A missing tool (nvidia-smi, trodes, ...) never blocks the run.
+#     - TREE MODE — a root without ip* folders, e.g. the share's task folder
+#       where each session sits at <rat>/<YYYYMMDD>/: the session folders are
+#       found below the root, and the per-session steps (l u v b 5 m) run as
+#       parallel jobs, one per session, with a live resource monitor (see
+#       run_post_jobs). A root with ip* folders runs exactly as before.
 #
 #   Env overrides: MAX_CPU MAX_GPU MAX_MEM WAIT_SECONDS LAUNCH_GAP
 #   FFMPEG_VCODEC SYNC_START_SEC NWB_RAT_NR DISABLE_RESOURCE_CHECK
-#   HM_CONFIG_FILE
+#   HM_CONFIG_FILE POST_JOBS TREE_DEPTH MONITOR_SECONDS POST_LOG_DIR
 # ============================================================
 
 import os
@@ -62,6 +67,7 @@ MENU = [
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
     ("r", "Recompute Metrics (after manual Phy curation)"),
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
+    ("l", "Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
     ("n", "Node Analysis"),
@@ -74,7 +80,12 @@ MENU = [
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "u", "v", "b", "m", "t"]
+SEQUENTIAL_STEPS = ["7", "c", "r", "9", "l", "u", "v", "b", "m", "t"]
+
+# Tree mode (a root without ip* folders): these steps run per session, as parallel
+# jobs, in this order — l before v (the theta pages read the LFP), u before v/b/m
+# (they read the units), b before 5 (plot_trials overlays the decoded track).
+POST_JOB_STEPS = ["l", "u", "v", "b", "5", "m"]
 
 # Retired keys, still accepted so saved presets / HM_STEPS strings keep working:
 # both now run inside step 4. Typed alone, they refresh the NWB of every op target.
@@ -118,6 +129,9 @@ MAX_GPU = _int_env("MAX_GPU", 90)
 MAX_MEM = _int_env("MAX_MEM", 65)
 WAIT_SECONDS = _int_env("WAIT_SECONDS", 30)
 LAUNCH_GAP = _int_env("LAUNCH_GAP", 20)   # seconds between worker launches
+TREE_DEPTH = _int_env("TREE_DEPTH", 4)    # tree mode: how deep to look for session folders
+MONITOR_SECONDS = _int_env("MONITOR_SECONDS", 30)   # tree mode: status line interval
+POLL_SECONDS = 2.0                        # tree mode: how often jobs are checked
 FREQ = 30000
 
 
@@ -648,6 +662,432 @@ def compress_all_op_videos(op_dirs):
 
 
 # ------------------------------------------------------------
+#        PER-SESSION STEP BODIES (master loops and tree jobs)
+# ------------------------------------------------------------
+def decode_settings():
+    """Step b's settings, from the config / environment."""
+    return {
+        # viz_folds=1 -> the continuous decoded_*.npz track plot_trials overlays is
+        # full-data (smooth). cv_folds -> the reported accuracy (comparison PDF +
+        # step-s summary) is cross-validated, i.e. tested on held-out data.
+        "folds": os.environ.get("DECODE_FOLDS", "1"),          # visualisation track
+        "cv_folds": os.environ.get("DECODE_CV_FOLDS", "5"),    # accuracy (held-out)
+        # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
+        # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
+        "leads": os.environ.get("DECODE_LEADS", "0 1 3").split(),
+        # after decoding, overlay analysis onto the real behaviour video via
+        # make_videos.py (one mp4 per goal trial): the decoded position per quality
+        # set, plus a spikes-on-path video (top-20 good pyramidal by spatial info,
+        # once per op). DECODE_VIDEO=0 disables both; DECODE_VIDEO_LEADS picks the
+        # decoded-overlay leads (default 0 1 2 3).
+        "make_vid": os.environ.get("DECODE_VIDEO", "1") != "0",
+        "vid_leads": os.environ.get("DECODE_VIDEO_LEADS", "0 1 2 3").split(),
+        # predictive-coding test: is the long-lead 'prediction' genuine, or behaviour/
+        # occupancy? figures -> <op>/predictive_coding/. PREDICTIVE_CODING=0 disables.
+        "run_pc": os.environ.get("PREDICTIVE_CODING", "1") != "0",
+        "pc_cv": os.environ.get("PC_CV_FOLDS", "5"),
+        "pc_shuf": os.environ.get("PC_SHUFFLE", "8"),
+        # always produce BOTH a good-only and a good+mua decode per session.
+        "qual_sets": [["good"], ["good", "mua"]],
+    }
+
+
+def decode_session(op, config, tag, out=None):
+    """Step b for one op folder: decode (good, good+mua), the decoded-on-video and
+    spikes-on-video overlays, and the predictive-coding test. Returns the exit codes."""
+    say = (lambda m: log(out, m)) if out else print
+    s = decode_settings()
+    folds, cv_folds, leads = s["folds"], s["cv_folds"], s["leads"]
+    rcs = []
+    if not Path("./src/nwb/decode_position.py").exists():
+        say("[DECODE] decode_position.py NOT found.")
+        return [127]
+    for quals in s["qual_sets"]:
+        cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
+               "--config", config, "--folds", folds, "--quality", *quals]
+        if leads:                   # CV accuracy PDF + full-data lead-0 npz
+            cmd += ["--leads", *leads, "--cv_folds", cv_folds]
+        rc = run(cmd, out=out)
+        rcs.append(rc)
+        say(f"{tag} units {'+'.join(quals)}: "
+            f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+        # overlay the decoded position on the real behaviour video
+        # (one mp4 per goal trial) for this quality set.
+        if s["make_vid"] and s["vid_leads"] and Path("./src/nwb/make_videos.py").exists():
+            vcmd = [PYTHON, "-u", "./src/nwb/make_videos.py", "--output_folder", op,
+                    "--config", config, "--which", "decoded", "--quality", *quals,
+                    "--leads", *s["vid_leads"]]
+            vrc = run(vcmd, out=out)
+            rcs.append(vrc)
+            say(f"{tag} units {'+'.join(quals)} decoded-video: "
+                f"{'Done.' if vrc == 0 else 'Python exited with error. Continuing...'}")
+        # predictive-coding test (neural vs behaviour/kinematics/shuffle
+        # baselines + overshoot + decode-density figures) for this quality.
+        if s["run_pc"] and Path("./src/nwb/predictive_coding.py").exists():
+            prc = run([PYTHON, "-u", "./src/nwb/predictive_coding.py",
+                       "--output_folder", op, "--config", config,
+                       "--quality", *quals, "--cv_folds", s["pc_cv"],
+                       "--n_shuffle", s["pc_shuf"]], out=out)
+            rcs.append(prc)
+            say(f"{tag} units {'+'.join(quals)} predictive-coding: "
+                f"{'Done.' if prc == 0 else 'Python exited with error. Continuing...'}")
+    # spikes-on-video (top-N good pyramidal cells by spatial info),
+    # once per op — the goal-trial spike-path overlay on the real video.
+    if s["make_vid"] and Path("./src/nwb/make_videos.py").exists():
+        src = run([PYTHON, "-u", "./src/nwb/make_videos.py", "--output_folder", op,
+                   "--config", config, "--which", "spikes", "--quality", "good"], out=out)
+        rcs.append(src)
+        say(f"{tag} spikes-on-video: "
+            f"{'Done.' if src == 0 else 'Python exited with error. Continuing...'}")
+    return rcs
+
+
+def umap_session(op, config, tag, out=None):
+    """Step m for one op folder: good and good+mua, each all cell types and
+    pyramidal-only (4 embeddings). Returns the exit codes."""
+    say = (lambda m: log(out, m)) if out else print
+    if not Path("./src/nwb/neural_umap.py").exists():
+        say("[UMAP] neural_umap.py NOT found.")
+        return [127]
+    rcs = []
+    for quals in (["good"], ["good", "mua"]):
+        for ct in (None, "pyramidal"):
+            cmd = [PYTHON, "-u", "./src/nwb/neural_umap.py", "--output_folder", op,
+                   "--config", config, "--quality", *quals]
+            if ct:
+                cmd += ["--cell_type", ct]
+            rc = run(cmd, out=out)
+            rcs.append(rc)
+            say(f"{tag} units {'+'.join(quals)}"
+                f"{' ' + ct if ct else ''}: "
+                f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
+    return rcs
+
+
+def run_post_job(op, steps, config, out):
+    """Tree mode, one session: run the selected POST_JOB_STEPS for `op`, in that
+    order. A step that fails does not stop the next one. Returns the failed keys."""
+    op = Path(op)
+    labels = dict(MENU)
+    failed = []
+    for key in POST_JOB_STEPS:
+        if key not in steps:
+            continue
+        log(out, f"\n[POST-STEP] {key} — {labels[key]}")     # the monitor shows this
+        t0 = time.time()
+        if key == "b":
+            rcs = decode_session(op, config, "[DECODE]", out)
+        elif key == "m":
+            rcs = umap_session(op, config, "[UMAP]", out)
+        else:
+            script, extra = {
+                "l": ("./src/nwb/rewrite_nwb_lfp.py", []),
+                "u": ("./src/nwb/add_units.py", []),
+                "v": ("./src/nwb/visualize_nwb.py", []),
+                # the op folder holds what plot_trials reads; there is no ip here
+                "5": ("./src/tracker/plot_trials.py", ["--input_folder", op]),
+            }[key]
+            if not Path(script).exists():
+                log(out, f"[POST-STEP] {script} NOT found.")
+                rcs = [127]
+            elif key == "5":
+                rcs = [run([PYTHON, "-u", script, *extra, "--output_folder", op], out=out)]
+            else:
+                rcs = [run([PYTHON, "-u", script, "--output_folder", op, "--config", config], out=out)]
+        ok = all(rc == 0 for rc in rcs)
+        log(out, f"[POST-STEP] {key} {'done' if ok else 'FAILED'} "
+                 f"({(time.time() - t0) / 60:.1f} min)")
+        if not ok:
+            failed.append(key)
+    log(out, f"\n[POST] {op}: " + ("all steps done." if not failed
+                                   else f"failed step(s): {' '.join(failed)}"))
+    return failed
+
+
+# ------------------------------------------------------------
+#        TREE MODE: session folders below the root, parallel jobs
+# ------------------------------------------------------------
+# Folders that are never a session and never hold one: outputs written into a
+# session folder, and Trodes/sorter export folders.
+_NOT_SESSION_DIRS = {"lfp_output", "visualization", "decoding", "videos", "umap",
+                     "predictive_coding", "clock_qc", "clock_repair_backup",
+                     "lfp_fix_backup", "channels_npy", "figures", "__pycache__"}
+_NOT_SESSION_SUFFIXES = ("_sorting_output", ".raw", ".dio", ".lfp", ".rec",
+                         ".analog", ".time", ".spikes", ".mountainsort")
+
+
+def _is_session_folder(d, names, top_level):
+    """An op folder of this pipeline: it holds a session NWB, or it is named after
+    a session date that also appears in a file inside it (sequential_targets' rule:
+    '20260629' holding 'Rat6_20260629.nwb'), or it is a top-level op* folder."""
+    if any(n.lower().endswith(".nwb") and not n.startswith("._") and ".tmp." not in n
+           for n in names):
+        return True
+    if _is_date_name(d.name) and any(d.name in n for n in names):
+        return True
+    return top_level and d.name.startswith("op")
+
+
+def find_session_folders(root, max_depth=None):
+    """Every session op folder at most `max_depth` levels below `root`, sorted.
+
+    For trees where op folders have been renamed and grouped, e.g. the share's
+    task/rat5_491390/20260630/. A session folder is not searched further (its
+    subfolders are its outputs), and output/export folders are skipped, so only a
+    few directory listings are made — this matters on a network drive."""
+    root = Path(root)
+    max_depth = _int_env("TREE_DEPTH", TREE_DEPTH) if max_depth is None else max_depth
+    found, todo = [], [(root, 0)]
+    while todo:
+        folder, depth = todo.pop(0)
+        try:
+            subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
+        except OSError as e:
+            print(f"[TREE] cannot list {folder}: {e}")
+            continue
+        for d in subdirs:
+            low = d.name.lower()
+            if d.name.startswith((".", "~")) or low in _NOT_SESSION_DIRS \
+                    or low.endswith(_NOT_SESSION_SUFFIXES):
+                continue
+            try:
+                names = [c.name for c in d.iterdir()]
+            except OSError:
+                continue
+            if _is_session_folder(d, names, top_level=(depth == 0)):
+                found.append(d)
+            elif depth + 1 < max_depth:
+                todo.append((d, depth + 1))
+    return sorted(found)
+
+
+def session_label(folder, root):
+    """'Rat5_20260630' from the folder's session NWB, else its path below root."""
+    nwbs = [p for p in Path(folder).glob("*.nwb")
+            if not p.name.startswith("._") and ".tmp." not in p.name]
+    if len(nwbs) == 1:
+        return nwbs[0].stem
+    try:
+        parts = Path(folder).relative_to(root).parts
+    except ValueError:
+        parts = (Path(folder).name,)
+    return "_".join(parts) or Path(folder).name
+
+
+def post_jobs_limit(n_sessions):
+    """How many sessions run at once: POST_JOBS from the config, or 'auto' — half
+    the CPU cores, one job per 12 GB of RAM, at most 6 (a decode or UMAP job can
+    take several GB; the launch gate below keeps a margin on top of this)."""
+    raw = _str_env("POST_JOBS", default="auto").lower()
+    if raw != "auto":
+        try:
+            return max(1, min(int(raw), n_sessions))
+        except ValueError:
+            print(f"[WARN] POST_JOBS={raw!r} is not a number — using auto.")
+    cpus = os.cpu_count() or 2
+    mem_gb = psutil.virtual_memory().total / 2 ** 30 if psutil is not None else 16.0
+    return max(1, min(cpus // 2, int(mem_gb // 12), 6, n_sessions))
+
+
+def resources_free():
+    """(True, '') when a new job may start, else (False, why). Same limits as the
+    parallel workers' wait_for_resources(), without blocking; read now, so the
+    config file's values count too (load_config runs after import)."""
+    if os.environ.get("DISABLE_RESOURCE_CHECK", "0") == "1":
+        return True, ""
+    cpu, gpu, mem = get_cpu_load(), get_gpu_load(), get_mem_usage()
+    for name, val, lim in (("CPU", cpu, _int_env("MAX_CPU", MAX_CPU)),
+                           ("GPU", gpu, _int_env("MAX_GPU", MAX_GPU)),
+                           ("MEM", mem, _int_env("MAX_MEM", MAX_MEM))):
+        if val > lim:
+            return False, f"{name} {val}% > {lim}%"
+    return True, ""
+
+
+class ResourceMonitor:
+    """CPU / memory / GPU load and network traffic (a share is read over the
+    network) for the tree-mode status lines."""
+
+    def __init__(self):
+        self.t, self.net = time.time(), self._net()
+
+    @staticmethod
+    def _net():
+        if psutil is None:
+            return None
+        try:
+            c = psutil.net_io_counters()
+            return c.bytes_recv, c.bytes_sent
+        except Exception:
+            return None
+
+    def line(self):
+        cpu, mem, gpu = get_cpu_load(), get_mem_usage(), get_gpu_load()
+        now, net = time.time(), self._net()
+        traffic = ""
+        if net and self.net:
+            secs = max(now - self.t, 1e-3)
+            traffic = (f" | net in {(net[0] - self.net[0]) / secs / 1e6:.1f} "
+                       f"out {(net[1] - self.net[1]) / secs / 1e6:.1f} MB/s")
+        self.t, self.net = now, net
+        mem_txt = f"{mem}%"
+        if psutil is not None:
+            vm = psutil.virtual_memory()
+            mem_txt += f" ({(vm.total - vm.available) / 2 ** 30:.1f}/{vm.total / 2 ** 30:.0f} GB)"
+        return f"CPU {cpu}% | MEM {mem_txt} | GPU {gpu}%{traffic}"
+
+
+def _job_memory_gb(pid):
+    """Resident memory of a job and its children (GB), or None without psutil."""
+    if psutil is None:
+        return None
+    try:
+        p = psutil.Process(pid)
+        return sum(q.memory_info().rss for q in [p] + p.children(recursive=True)) / 2 ** 30
+    except Exception:
+        return None
+
+
+def _job_step(logpath):
+    """The step a job is on: the last '[POST-STEP] <key>' line of its log."""
+    try:
+        with open(logpath, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 32768))
+            tail = f.read().decode("utf-8", "replace")
+        marks = [ln for ln in tail.splitlines() if ln.startswith("[POST-STEP] ")]
+        return marks[-1].split()[1] if marks else "-"
+    except OSError:
+        return "?"
+
+
+def _stop_job(proc):
+    """Stop a job and the step script it is running."""
+    try:
+        if psutil is not None:
+            for c in psutil.Process(proc.pid).children(recursive=True):
+                c.kill()
+        proc.kill()
+    except Exception:
+        pass
+
+
+def run_post_jobs(targets, steps, config, root, job_cmd=None):
+    """Tree mode: run the per-session steps for every session folder as parallel
+    jobs — one child process per session (runner.py --post-job), each logging to its
+    own file. A job starts only while fewer than POST_JOBS run, LAUNCH_GAP seconds
+    after the previous one, and while CPU / GPU / MEM are under MAX_CPU / MAX_GPU /
+    MAX_MEM; every MONITOR_SECONDS a status block shows the machine and each job.
+    `job_cmd(op, steps, config)` builds a job's command (tests swap in a stand-in).
+    Returns one result dict per session."""
+    order = "".join(k for k in POST_JOB_STEPS if k in steps)
+    n_jobs = post_jobs_limit(len(targets))
+    gap = _int_env("LAUNCH_GAP", LAUNCH_GAP)                 # the config file's, if set
+    every = _int_env("MONITOR_SECONDS", MONITOR_SECONDS)
+    limits = tuple(_int_env(k, d) for k, d in (("MAX_CPU", MAX_CPU), ("MAX_GPU", MAX_GPU),
+                                                ("MAX_MEM", MAX_MEM)))
+    logdir = Path(_str_env("POST_LOG_DIR", default=str(Path(tempfile.gettempdir()) / "hm_post")))
+    logdir = logdir / time.strftime("%Y%m%d_%H%M%S")
+    logdir.mkdir(parents=True, exist_ok=True)
+    queue, seen = [], {}
+    for _ip, op in targets:
+        label = session_label(op, root)
+        seen[label] = seen.get(label, 0) + 1
+        queue.append((label if seen[label] == 1 else f"{label}_{seen[label]}", op))
+
+    print("\n" + "=" * 56)
+    print(f"[TREE] {len(queue)} session(s) x steps [{order}], up to {n_jobs} at a time "
+          f"(POST_JOBS), {gap} s apart, started while CPU<={limits[0]}% GPU<={limits[1]}% "
+          f"MEM<={limits[2]}%")
+    print(f"[TREE] One log per session in {logdir}")
+    print("=" * 56)
+    if psutil is None:
+        print("[TREE] psutil is not installed: CPU/MEM are not monitored or gated "
+              "(pip install psutil).")
+
+    running, results = {}, []
+    monitor = ResourceMonitor()
+    last_launch = last_status = 0.0
+    waiting = ""
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    try:
+        while queue or running:
+            for label, job in list(running.items()):            # finished jobs
+                rc = job["proc"].poll()
+                if rc is None:
+                    continue
+                job["logf"].close()
+                minutes = (time.time() - job["start"]) / 60
+                results.append({"session": label, "folder": str(job["op"]), "status":
+                                "ok" if rc == 0 else "failed", "minutes": round(minutes, 1),
+                                "log": str(job["log"])})
+                print(f"[TREE] {'done  ' if rc == 0 else 'FAILED'} {label} ({minutes:.1f} min)"
+                      + ("" if rc == 0 else f" — see {job['log']}"))
+                del running[label]
+
+            now = time.time()
+            if queue and len(running) < n_jobs and now - last_launch >= gap:
+                ok, waiting = resources_free()
+                if ok:
+                    label, op = queue.pop(0)
+                    logpath = logdir / f"{label}.log"
+                    logf = open(logpath, "w", encoding="utf-8")
+                    cmd = (job_cmd(op, order, config) if job_cmd else
+                           [PYTHON, "-u", str(SCRIPT_DIR / "runner.py"), "--post-job",
+                            str(op), order, str(config)])
+                    proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR), stdout=logf,
+                                            stderr=subprocess.STDOUT, env=env)
+                    running[label] = {"proc": proc, "op": op, "start": now,
+                                      "log": logpath, "logf": logf}
+                    last_launch = now
+                    print(f"[TREE] start  {label}  ({len(running)} running, {len(queue)} queued)")
+
+            if now - last_status >= every:
+                last_status = now
+                n_failed = sum(r["status"] != "ok" for r in results)
+                print(f"\n[MON {time.strftime('%H:%M:%S')}] {monitor.line()} | {len(running)} "
+                      f"running, {len(queue)} queued, {len(results)} done ({n_failed} failed)")
+                for label, job in running.items():
+                    gb = _job_memory_gb(job["proc"].pid)
+                    print(f"    {label:<28} step {_job_step(job['log']):<2} "
+                          f"{(now - job['start']) / 60:6.1f} min"
+                          + (f"  {gb:5.1f} GB" if gb is not None else ""))
+                if queue and waiting and len(running) < n_jobs:
+                    print(f"    next start waits: {waiting}")
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        print("\n[TREE] Interrupted — stopping the running jobs...")
+        for label, job in running.items():
+            _stop_job(job["proc"])
+            job["logf"].close()
+            results.append({"session": label, "folder": str(job["op"]), "status": "interrupted",
+                            "minutes": round((time.time() - job["start"]) / 60, 1),
+                            "log": str(job["log"])})
+        results += [{"session": label, "folder": str(op), "status": "not started",
+                     "minutes": 0.0, "log": ""} for label, op in queue]
+        _post_summary(results, logdir)
+        raise
+    _post_summary(results, logdir)
+    return results
+
+
+def _post_summary(results, logdir):
+    import csv
+    with open(logdir / "summary.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["session", "status", "minutes", "folder", "log"])
+        w.writeheader()
+        w.writerows(results)
+    bad = [r for r in results if r["status"] != "ok"]
+    print("\n" + "=" * 56)
+    print(f"[TREE] {len(results) - len(bad)} of {len(results)} session(s) done"
+          + (f"; {len(bad)} not:" if bad else "."))
+    for r in bad:
+        print(f"    {r['status']:<11} {r['session']}  {r['log']}")
+    print(f"[TREE] Summary: {logdir / 'summary.csv'}")
+    print("=" * 56)
+
+
+# ------------------------------------------------------------
 #                 MASTER
 # ------------------------------------------------------------
 def main():
@@ -709,20 +1149,35 @@ def main():
 
     # Scan ip* folders. Each ipN -> opN.
     ip_dirs = sorted(d for d in root.glob("ip*") if d.is_dir())
-    if not ip_dirs:
-        print(f"[WARNING] No ip* folders found under {root}")
     ops = []  # list of (ip_path, op_path) — for ip-dependent steps (workers/7/9)
     for ip_path in ip_dirs:
         num = ip_path.name[len("ip"):]
         ops.append((ip_path, root / f"op{num}"))
 
-    # Targets for the ip-INDEPENDENT steps (c/r/u/v): op* folders + session-date
-    # folders whose name matches a file inside them. This lets those steps run on
-    # session-named folders, not just op*.
-    seq_ops = sequential_targets(root, ops)
-    if seq_ops:
-        print(f"[DEBUG] ip-independent step targets: "
-              f"{', '.join(op.name for _i, op in seq_ops)}")
+    # TREE MODE: no ip* folders — the root holds session folders that already went
+    # through tracking/sorting, possibly renamed and grouped (the share's
+    # task/<rat>/<YYYYMMDD>/). They are found below the root, and the per-session
+    # steps (POST_JOB_STEPS) run as parallel jobs instead of one folder at a time.
+    tree = not ip_dirs
+    if tree:
+        print(f"[TREE] No ip* folders under {root}: looking for session folders "
+              f"(up to {_int_env('TREE_DEPTH', TREE_DEPTH)} levels deep)...")
+        seq_ops = [(d, d) for d in find_session_folders(root)]
+        print(f"[TREE] {len(seq_ops)} session folder(s):")
+        for _ip, op in seq_ops:
+            print(f"    {op.relative_to(root)}")
+        need_ip = [k for k in "1234789dn" if k in selection]     # these read ip*/<raw>
+        if need_ip:
+            print(f"[TREE] Step(s) {' '.join(need_ip)} read the raw recordings (ip* folders) "
+                  f"and are skipped here.")
+    else:
+        # Targets for the ip-INDEPENDENT steps (c/r/u/v): op* folders + session-date
+        # folders whose name matches a file inside them. This lets those steps run on
+        # session-named folders, not just op*.
+        seq_ops = sequential_targets(root, ops)
+        if seq_ops:
+            print(f"[DEBUG] ip-independent step targets: "
+                  f"{', '.join(op.name for _i, op in seq_ops)}")
 
     # --- Launch parallel workers. By default each opens its OWN terminal window so
     # its progress is visible live (set WORKER_WINDOWS=0 to run them as quiet
@@ -805,81 +1260,39 @@ def main():
                 print(f"\n[NWB {i}/{len(seq_ops)}] Refreshing: {op}")
                 refresh_session_nwb(op)
 
-    if has["u"]:
+    # Tree mode: the per-session steps run as parallel jobs, one per session.
+    post = "".join(k for k in POST_JOB_STEPS if k in selection) if tree else ""
+    post_results = []
+    if post:
+        if seq_ops:
+            post_results = run_post_jobs(seq_ops, post, config, root)
+        else:
+            print(f"[TREE] No session folders found below {root} — steps {post} not run.")
+
+    if has["l"] and not tree:
+        _run_per_op("REWRITE-NWB-LFP (old LFP_Output export -> NWB)", "LFP",
+                    "./src/nwb/rewrite_nwb_lfp.py", seq_ops, config)
+
+    if has["u"] and not tree:
         _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", seq_ops, config)
 
-    if has["v"]:
+    if has["v"] and not tree:
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)
 
-    if has["b"]:
-        # viz_folds=1 -> the continuous decoded_*.npz track plot_trials overlays is
-        # full-data (smooth). cv_folds -> the reported accuracy (comparison PDF +
-        # step-s summary) is cross-validated, i.e. tested on held-out data.
-        folds = os.environ.get("DECODE_FOLDS", "1")          # visualisation track
-        cv_folds = os.environ.get("DECODE_CV_FOLDS", "5")    # accuracy (held-out)
-        # prediction leads (seconds ahead) compared in one PDF; lead 0 also saves the
-        # decoded_*.npz that plot_trials overlays. Set DECODE_LEADS="" to disable.
-        leads = os.environ.get("DECODE_LEADS", "0 1 3").split()
-        # after decoding, overlay analysis onto the real behaviour video via
-        # make_videos.py (one mp4 per goal trial): the decoded position per quality
-        # set, plus a spikes-on-path video (top-20 good pyramidal by spatial info,
-        # once per op). DECODE_VIDEO=0 disables both; DECODE_VIDEO_LEADS picks the
-        # decoded-overlay leads (default 0 1 2 3).
-        make_vid = os.environ.get("DECODE_VIDEO", "1") != "0"
-        vid_leads = os.environ.get("DECODE_VIDEO_LEADS", "0 1 2 3").split()
-        # predictive-coding test: is the long-lead 'prediction' genuine, or behaviour/
-        # occupancy? figures -> <op>/predictive_coding/. PREDICTIVE_CODING=0 disables.
-        run_pc = os.environ.get("PREDICTIVE_CODING", "1") != "0"
-        pc_cv = os.environ.get("PC_CV_FOLDS", "5")
-        pc_shuf = os.environ.get("PC_SHUFFLE", "8")
-        # always produce BOTH a good-only and a good+mua decode per session.
-        qual_sets = [["good"], ["good", "mua"]]
+    if has["b"] and not tree:
+        dec = decode_settings()
         print("\n" + "=" * 56)
         print(f"[MASTER] Running POSITION-DECODER sequentially (good and good+mua, "
-              f"viz folds: {folds}, CV folds: {cv_folds}, leads: {' '.join(leads) or 'none'})...")
+              f"viz folds: {dec['folds']}, CV folds: {dec['cv_folds']}, "
+              f"leads: {' '.join(dec['leads']) or 'none'})...")
         print("=" * 56)
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
             print(f"\n[DECODE {i}/{total}] Decoding: {op}")
-            if Path("./src/nwb/decode_position.py").exists():
-                for quals in qual_sets:
-                    cmd = [PYTHON, "-u", "./src/nwb/decode_position.py", "--output_folder", op,
-                           "--config", config, "--folds", folds, "--quality", *quals]
-                    if leads:                   # CV accuracy PDF + full-data lead-0 npz
-                        cmd += ["--leads", *leads, "--cv_folds", cv_folds]
-                    rc = run(cmd)
-                    print(f"[DECODE {i}/{total}] units {'+'.join(quals)}: "
-                          f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
-                    # overlay the decoded position on the real behaviour video
-                    # (one mp4 per goal trial) for this quality set.
-                    if make_vid and vid_leads and Path("./src/nwb/make_videos.py").exists():
-                        vcmd = [PYTHON, "-u", "./src/nwb/make_videos.py", "--output_folder", op,
-                                "--config", config, "--which", "decoded", "--quality", *quals,
-                                "--leads", *vid_leads]
-                        vrc = run(vcmd)
-                        print(f"[DECODE {i}/{total}] units {'+'.join(quals)} decoded-video: "
-                              f"{'Done.' if vrc == 0 else 'Python exited with error. Continuing...'}")
-                    # predictive-coding test (neural vs behaviour/kinematics/shuffle
-                    # baselines + overshoot + decode-density figures) for this quality.
-                    if run_pc and Path("./src/nwb/predictive_coding.py").exists():
-                        prc = run([PYTHON, "-u", "./src/nwb/predictive_coding.py",
-                                   "--output_folder", op, "--config", config,
-                                   "--quality", *quals, "--cv_folds", pc_cv,
-                                   "--n_shuffle", pc_shuf])
-                        print(f"[DECODE {i}/{total}] units {'+'.join(quals)} predictive-coding: "
-                              f"{'Done.' if prc == 0 else 'Python exited with error. Continuing...'}")
-                # spikes-on-video (top-N good pyramidal cells by spatial info),
-                # once per op — the goal-trial spike-path overlay on the real video.
-                if make_vid and Path("./src/nwb/make_videos.py").exists():
-                    src = run([PYTHON, "-u", "./src/nwb/make_videos.py", "--output_folder", op,
-                               "--config", config, "--which", "spikes", "--quality", "good"])
-                    print(f"[DECODE {i}/{total}] spikes-on-video: "
-                          f"{'Done.' if src == 0 else 'Python exited with error. Continuing...'}")
-            else:
-                print("[DECODE] decode_position.py NOT found.")
+            decode_session(op, config, f"[DECODE {i}/{total}]")
         print(f"\n[MASTER] Position-decoder complete for all {total} folder(s).")
 
-    if has["m"]:
+    if has["m"] and not tree:
         # UMAP population embedding per session: good and good+mua, each ALL cell
         # types and a PYRAMIDAL-only version (4 embeddings/session).
         print("\n" + "=" * 56)
@@ -888,19 +1301,7 @@ def main():
         total = len(seq_ops)
         for i, (_ip, op) in enumerate(seq_ops, 1):
             print(f"\n[UMAP {i}/{total}] Embedding: {op}")
-            if Path("./src/nwb/neural_umap.py").exists():
-                for quals in (["good"], ["good", "mua"]):
-                    for ct in (None, "pyramidal"):
-                        cmd = [PYTHON, "-u", "./src/nwb/neural_umap.py", "--output_folder", op,
-                               "--config", config, "--quality", *quals]
-                        if ct:
-                            cmd += ["--cell_type", ct]
-                        rc = run(cmd)
-                        print(f"[UMAP {i}/{total}] units {'+'.join(quals)}"
-                              f"{' ' + ct if ct else ''}: "
-                              f"{'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
-            else:
-                print("[UMAP] neural_umap.py NOT found.")
+            umap_session(op, config, f"[UMAP {i}/{total}]")
         print(f"\n[MASTER] Neural-UMAP complete for all {total} folder(s).")
 
     if has["t"]:
@@ -920,8 +1321,10 @@ def main():
         compress_all_op_videos(op_dirs)
 
     flags = " | ".join(f"{k}:{int(has[k])}" for k in SEQUENTIAL_STEPS)
+    tree_txt = (f" | tree: {sum(r['status'] == 'ok' for r in post_results)}/{len(post_results)} "
+                f"sessions [{post}]") if post else ""
     print("\n" + "=" * 56)
-    print(f"[MASTER] Done. Parallel jobs: {count} | 6:{int(do_compress)} | {flags}")
+    print(f"[MASTER] Done. Parallel jobs: {count} | 6:{int(do_compress)} | {flags}{tree_txt}")
     print("=" * 56)
 
 
@@ -944,6 +1347,19 @@ def _worker_main(argv):
         print("\n[WORKER] Finished. You can close this window.")
 
 
+def _post_job_main(argv):
+    """Entry point for one tree-mode job (see run_post_jobs):
+    `runner.py --post-job <op> <steps> <config>`. Runs the per-session steps with
+    output to stdout (the master points it at the session's log file). Exit code 1
+    when any step failed."""
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))   # scripts use ./src/... paths
+    op, steps, config = argv[0], argv[1], argv[2]
+    os.environ["HM_CONFIG_FILE"] = config                  # the master's config file
+    load_config()
+    print(f"[POST] {op}: steps [{steps}]", flush=True)
+    return 1 if run_post_job(Path(op), steps, config, sys.stdout) else 0
+
+
 if __name__ == "__main__":
     for _s in (sys.stdout, sys.stderr):        # UTF-8 console so '->' etc. never crash
         try:
@@ -952,5 +1368,7 @@ if __name__ == "__main__":
             pass
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         _worker_main(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--post-job":
+        sys.exit(_post_job_main(sys.argv[2:]))
     else:
         main()

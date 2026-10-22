@@ -25,6 +25,13 @@ def test_multi_session_export_is_only_rate_checked():
     assert TE._lfp_rate_problem(source(10_800_000, 1000.0, boundaries=[{}]), t) is None
 
 
+def test_acquisition_rate_is_rejected_even_with_boundaries():
+    # a 1 kHz export stamped at 30 kHz that records its recording as one boundary
+    one = [{"name": "Rat5_maze_merged", "start": 0}]
+    problem = TE._lfp_rate_problem(source(4_083_435, 30000.0, boundaries=one), np.array([0.0, 4108.0]))
+    assert "acquisition rate" in problem
+
+
 def test_ephys_longer_or_shorter_than_the_video_is_accepted():
     assert TE._lfp_rate_problem(source(int(3908 * 1500), 1500.0), np.array([0.0, 3215.0])) is None
     assert TE._lfp_rate_problem(source(int(2214 * 1500), 1500.0), np.array([0.0, 3807.0])) is None

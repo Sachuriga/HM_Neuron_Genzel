@@ -58,3 +58,27 @@ Step 8 used to pick one LFP channel as "EMG" (the one with the most 20–200 Hz 
 
 - Verify the output folder path exists and is writable.
 - Check that there is sufficient disk space (LFP output for a full session can be several GB).
+
+---
+
+## Step l — Rewrite the NWB LFP from LFP_Output
+
+**Theta pages skipped, or `[theta] the NWB's LFP is not usable (5 Hz is not an LFP rate)` / `(... samples at 30000 Hz last 136 s ...)`**
+
+The NWB holds a 5 Hz-stamped stub, or an LFP stamped at the 30 kHz acquisition rate (sessions exported before step 8 wrote the NWB itself). Run step `l` on the session (or the whole tree), then step `v` again.
+
+**`STOPPED: no rate makes the export (...) end with the spikes (...)`**
+
+The export neither ends with the spikes at its stamped rate nor at any standard rate, and its LFP power does not single out a rate either. Check the session (an export of a different recording?); when the rate is known, pass it: `python src/nwb/rewrite_nwb_lfp.py --output_folder <op> --export_rate 1000`.
+
+**`STOPPED: the LFP follows the spikes better at another rate than ...`**
+
+The length points to one rate, the LFP-vs-spike-rate correlation clearly to another. Nothing was changed. Look at the numbers in the message before forcing a rate with `--export_rate`.
+
+**`no h5repack here — the old LFP's ~0.5 GB stay inside the file`**
+
+Dropping a full-length old LFP leaves its space inside the HDF5 file. Install the HDF5 tools into the environment (`conda install -c conda-forge hdf5`, which puts `h5repack` in `bin/` or `Library\bin\`) and run `python src/nwb/compact_nwb.py <op>`.
+
+**Undoing a rewrite**
+
+The original NWB is in `<op>/lfp_fix_backup/<name>.nwb.prelfpfix` (and a restamped `lfp_timestamps.npy` in `LFP_Output/lfp_fix_backup/`): move it back over the session NWB. `lfp_fix_backup/lfp_fix.json` records what was done and why.
