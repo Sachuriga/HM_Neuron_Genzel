@@ -118,6 +118,12 @@ def label_units_quality_check(analyzer):
         return None
 
 
+# Two spikes of the SAME unit at most this far apart are one spike counted twice
+# (e.g. after merging, in Phy, two clusters that both caught that spike). Used
+# by the sorting pipeline (run_auto_curation), step r (metrics) and step u (NWB).
+DUPLICATE_CENSORED_PERIOD_MS = 0.3
+
+
 def run_auto_curation(sorting, recording, n_jobs=4):
     """Automatic cluster refinement via SpikeInterface curation, best-effort:
       1. remove_duplicated_spikes — drop double-counted spikes within a unit
@@ -150,7 +156,8 @@ def run_auto_curation(sorting, recording, n_jobs=4):
 
     # 1. Remove duplicated spikes (operates on the Sorting; cheap, no analyzer).
     try:
-        sorting = remove_duplicated_spikes(sorting, censored_period_ms=0.3, method="keep_first")
+        sorting = remove_duplicated_spikes(
+            sorting, censored_period_ms=DUPLICATE_CENSORED_PERIOD_MS, method="keep_first")
     except Exception as e:
         print(f"[curate] remove_duplicated_spikes failed ({e}); continuing.")
 
@@ -315,6 +322,11 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
 # splits only live in the phy_export folder. This recomputes ALL quality metrics
 # and waveform (template) metrics on that CURATED sorting and writes them back
 # into the phy folder — WITHOUT re-exporting (so your manual curation is kept).
+#
+# Before computing, duplicated spikes are dropped from each unit (the same rule
+# the sorting pipeline uses), and pairs of units that are the same neuron twice
+# are REPORTED (redundant_units.csv + a 'redundant_with' column in Phy) — never
+# removed, because which one to keep is your curation decision.
 
 def attach_probe(recording, probe):
     """Attach `probe` and return the recording that carries it.
@@ -338,10 +350,38 @@ def _read_phy_params(phy_folder):
     return {k: v for k, v in ns.items() if not k.startswith("__")}
 
 
+def find_duplicated_phy_spikes(spike_samples, spike_clusters, sample_rate,
+                               censored_period_ms=DUPLICATE_CENSORED_PERIOD_MS):
+    """Mask over phy's spike arrays: True for every duplicated spike.
+
+    Same rule as spikeinterface's remove_duplicated_spikes(method="keep_first"):
+    inside one unit, a spike that comes at most `censored_period_ms` after the
+    previous spike of that unit is a duplicate; the earlier spike is kept.
+
+    Plain numpy (no spikeinterface), so step u can apply exactly the same rule
+    to the spike times it writes into the NWB."""
+    censored_samples = int(round(censored_period_ms * 1e-3 * sample_rate))
+
+    # Order the spikes by unit, and by time inside each unit. Neighbours in this
+    # order are then consecutive spikes of the same unit (or a unit boundary).
+    order = np.lexsort((spike_samples, spike_clusters))
+    samples_in_order = spike_samples[order]
+    clusters_in_order = spike_clusters[order]
+
+    same_unit = clusters_in_order[1:] == clusters_in_order[:-1]
+    too_close = np.diff(samples_in_order) <= censored_samples
+
+    is_duplicate = np.zeros(len(spike_samples), dtype=bool)
+    # order[1:] = the LATER spike of each neighbour pair -> that one is dropped.
+    is_duplicate[order[1:][same_unit & too_close]] = True
+    return is_duplicate
+
+
 def _load_curated_sorting_from_phy(phy_folder):
     """Build the curated Sorting DIRECTLY from phy's spike_times + spike_clusters,
     so EVERY phy cluster id (including manually-split ones) becomes a unit with
-    the exact ids / spike counts Phy shows.
+    the exact ids Phy shows. Duplicated spikes (find_duplicated_phy_spikes) are
+    dropped, so spike counts can be a little lower than in Phy.
 
     si.read_phy can return a stale/remapped assignment that drops split clusters
     (observed: split ids 266+ missing, spike counts mismatched), so we read the
@@ -352,6 +392,19 @@ def _load_curated_sorting_from_phy(phy_folder):
     # phy 'spike_times.npy' stores spike SAMPLE indices (not seconds).
     spike_samples = np.load(phy / "spike_times.npy").astype("int64").flatten()
     spike_clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
+
+    # Drop duplicated spikes. The first spike of a unit is never a duplicate, so
+    # every unit keeps at least one spike and the unit list is unchanged.
+    is_duplicate = find_duplicated_phy_spikes(spike_samples, spike_clusters, fs)
+    if is_duplicate.any():
+        dup_units, dup_counts = np.unique(spike_clusters[is_duplicate], return_counts=True)
+        print(f"[phy] Dropped {int(is_duplicate.sum())} duplicated spike(s) "
+              f"(same unit, <= {DUPLICATE_CENSORED_PERIOD_MS} ms apart) in "
+              f"{len(dup_units)} unit(s): "
+              + ", ".join(f"{u}={n}" for u, n in zip(dup_units, dup_counts)))
+    spike_samples = spike_samples[~is_duplicate]
+    spike_clusters = spike_clusters[~is_duplicate]
+
     # Factory name changed across spikeinterface versions:
     #   0.104: NumpySorting.from_samples_and_labels(samples, labels, fs)
     #   older: NumpySorting.from_times_labels(frames, labels, fs)  (also samples)
@@ -485,14 +538,72 @@ def _write_df_as_phy_tsv(df, phy_folder):
         out.reset_index().to_csv(phy / f"cluster_{col}.tsv", sep="\t", index=False)
 
 
+def _flag_redundant_units(analyzer, phy_folder):
+    """Find pairs of curated units that are the same neuron twice and REPORT
+    them; nothing is removed. Same detector as the sorting pipeline
+    (run_auto_curation): after aligning the template peaks, more than 80% of
+    one unit's spikes coincide (within 0.4 ms) with the other unit's spikes.
+
+    Writes, rewritten on every run (so a pair you fixed in Phy disappears):
+      redundant_units.csv         one row per pair, plus the unit the sorting
+                                  pipeline's 'minimum_shift' rule would drop
+      cluster_redundant_with.tsv  a 'redundant_with' column in Phy
+    Returns the names of the files written. Needs the 'templates' extension."""
+    from spikeinterface.curation import remove_redundant_units
+    import pandas as pd
+
+    phy = Path(phy_folder)
+    kept_sorting, pairs = remove_redundant_units(
+        analyzer, remove_strategy="minimum_shift", extra_outputs=True)
+    would_drop = set(analyzer.unit_ids) - set(kept_sorting.unit_ids)
+    counts = dict(analyzer.sorting.count_num_spikes_per_unit())
+
+    rows = []
+    partners = {}   # unit id -> ids of the units it is redundant with
+    for unit_a, unit_b in pairs:
+        unit_a, unit_b = int(unit_a), int(unit_b)
+        rows.append({
+            "unit_a": unit_a,
+            "unit_b": unit_b,
+            "n_spikes_a": int(counts.get(unit_a, 0)),
+            "n_spikes_b": int(counts.get(unit_b, 0)),
+            "suggested_drop": ";".join(str(u) for u in (unit_a, unit_b) if u in would_drop),
+        })
+        partners.setdefault(unit_a, []).append(unit_b)
+        partners.setdefault(unit_b, []).append(unit_a)
+
+    columns = ["unit_a", "unit_b", "n_spikes_a", "n_spikes_b", "suggested_drop"]
+    pd.DataFrame(rows, columns=columns).to_csv(phy / "redundant_units.csv", index=False)
+
+    # Phy column: e.g. unit 12 -> "40" or "40;57". Units without a partner are
+    # left out, so their cell stays empty in Phy.
+    phy_column = pd.DataFrame(
+        [{"cluster_id": u, "redundant_with": ";".join(str(p) for p in sorted(ps))}
+         for u, ps in sorted(partners.items())],
+        columns=["cluster_id", "redundant_with"])
+    phy_column.to_csv(phy / "cluster_redundant_with.tsv", sep="\t", index=False)
+
+    if pairs:
+        print(f"[recompute] {len(pairs)} redundant unit pair(s) (same neuron twice) — "
+              "merge or delete in Phy: "
+              + ", ".join(f"{r['unit_a']}&{r['unit_b']}" for r in rows))
+    else:
+        print("[recompute] No redundant unit pairs.")
+    return ["redundant_units.csv", "cluster_redundant_with.tsv"]
+
+
 def recompute_curated_metrics(phy_folder, n_jobs=4):
     """Recompute all quality + template (waveform) metrics on the curated phy
     sorting and write them back into the phy folder. Best-effort; never raises.
 
+    Duplicated spikes are dropped before computing (see
+    find_duplicated_phy_spikes); step u drops the same spikes from the NWB.
+
     Writes: curated_quality_metrics.csv, curated_template_metrics.csv, one
-    cluster_<metric>.tsv per metric, and the refreshed automated good/mua/noise
-    label as quality_check_labels.csv + cluster_auto_group.tsv. Phy's own
-    cluster_group.tsv (your manual labels) is left untouched.
+    cluster_<metric>.tsv per metric, the refreshed automated good/mua/noise
+    label as quality_check_labels.csv + cluster_auto_group.tsv, and the
+    redundant-unit report as redundant_units.csv + cluster_redundant_with.tsv.
+    Phy's own cluster_group.tsv (your manual labels) is left untouched.
     """
     phy = Path(phy_folder)
     if not (phy / "params.py").exists():
@@ -507,6 +618,8 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     except Exception as e:
         print(f"[recompute] Direct load failed ({e}); falling back to si.read_phy.")
         sorting = si.read_phy(phy, load_all_cluster_properties=True)
+        sorting = si.remove_duplicated_spikes(
+            sorting, censored_period_ms=DUPLICATE_CENSORED_PERIOD_MS, method="keep_first")
     recording = _load_recording_from_phy(phy)
     print(f"[recompute] {sorting.get_num_units()} curated unit(s), "
           f"{recording.get_num_channels()} channel(s).")
@@ -572,6 +685,13 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     except Exception as e:
         print(f"[recompute] template_metrics failed ({e}).")
 
+    # Redundant units (same neuron twice) are only REPORTED — you decide in Phy.
+    redundant_files = []
+    try:
+        redundant_files = _flag_redundant_units(analyzer, phy)
+    except Exception as e:
+        print(f"[recompute] Redundant-unit check failed ({e}).")
+
     # --- DEBUG: which curated units got metrics vs not (helps spot split units
     #     that read_phy or the metric computation dropped) ----------------------
     try:
@@ -601,7 +721,7 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     # -------------------------------------------------------------------------
 
     # Persist results into the phy folder (no re-export -> curation preserved).
-    wrote = []
+    wrote = list(redundant_files)
     for ext_name, csv_name in (("quality_metrics", "curated_quality_metrics.csv"),
                                ("template_metrics", "curated_template_metrics.csv")):
         try:

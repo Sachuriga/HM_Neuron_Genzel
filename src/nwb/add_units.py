@@ -5,7 +5,8 @@ Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each o
   - finds the session NWB (step 4 / step 8):    <op>/Rat*_*.nwb
   - finds the curated phy folder(s):            <op>/*_sorting_output/phy_export
   - reads, per curated unit:
-      * spike times (seconds)      from spike_times.npy + spike_clusters.npy
+      * spike times (seconds)      from spike_times.npy + spike_clusters.npy,
+                                   duplicated spikes dropped (same rule as step r)
       * quality metrics            from curated_quality_metrics.csv
       * waveform/template metrics  from curated_template_metrics.csv
       * good/mua/noise label       from cluster_group.tsv (Phy's MANUAL group —
@@ -166,12 +167,17 @@ def _extract_waveforms(phy, n_jobs=4):
         import spikeinterface.full as si
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
         from sorter_common import (  # noqa: E402
-            _load_curated_sorting_from_phy, _load_recording_from_phy)
+            _load_curated_sorting_from_phy, _load_recording_from_phy,
+            DUPLICATE_CENSORED_PERIOD_MS)
         try:
-            sorting = _load_curated_sorting_from_phy(phy)
+            sorting = _load_curated_sorting_from_phy(phy)   # duplicates dropped
         except Exception as e:
             print(f"  Direct load failed ({e}); falling back to si.read_phy.")
             sorting = si.read_phy(phy, load_all_cluster_properties=True)
+            # Same duplicate rule as _spike_times_by_unit, so waveforms_spike_index
+            # points into the same spike train that is written as spike_times.
+            sorting = si.remove_duplicated_spikes(
+                sorting, censored_period_ms=DUPLICATE_CENSORED_PERIOD_MS, method="keep_first")
         recording = _load_recording_from_phy(phy)
         jk = {"n_jobs": n_jobs, "chunk_duration": "1s", "progress_bar": True}
 
@@ -234,11 +240,19 @@ def _extract_waveforms(phy, n_jobs=4):
 
 
 def _spike_times_by_unit(phy, unit_ids):
-    """Per-unit spike times in SECONDS, from phy's spike_times/spike_clusters."""
+    """Per-unit spike times in SECONDS, from phy's spike_times/spike_clusters,
+    with duplicated spikes dropped by the same rule step r used for the metrics
+    (and _extract_waveforms used for waveforms_spike_index)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
+    from sorter_common import find_duplicated_phy_spikes  # noqa: E402
+
     p = _read_phy_params(phy)
     fs = float(p["sample_rate"])
     samples = np.load(phy / "spike_times.npy").astype("int64").flatten()
     clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
+    is_duplicate = find_duplicated_phy_spikes(samples, clusters, fs)
+    samples = samples[~is_duplicate]
+    clusters = clusters[~is_duplicate]
     wanted = set(int(u) for u in unit_ids)
     # Sort by cluster once, then slice each unit's contiguous block — fast even
     # for millions of spikes.

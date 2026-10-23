@@ -3,11 +3,14 @@ Recompute quality + waveform (template) metrics on a MANUALLY-CURATED phy folder
 (runner step 'r'), AFTER you have merged / split / labeled units in Phy.
 
 For each per-recording phy_export/ under the output (op) folder it:
-  - loads the curated sorting (si.read_phy — merges/splits/labels applied),
+  - loads the curated sorting (spike_times + spike_clusters — merges/splits
+    applied) and drops duplicated spikes (same unit, <= 0.3 ms apart),
   - rebuilds the preprocessed recording from recording.dat + params.py,
   - recomputes ALL quality metrics + template (waveform) metrics on the curated
     units, and writes them back into the phy folder as CSVs + cluster_*.tsv
-    (visible in Phy) — WITHOUT re-exporting, so your manual curation is kept.
+    (visible in Phy) — WITHOUT re-exporting, so your manual curation is kept,
+  - reports redundant unit pairs (same neuron twice) in redundant_units.csv and
+    a 'redundant_with' Phy column; nothing is removed.
 
 Usage:
     python recompute_metrics.py --output_folder <op_folder> [--n_jobs 4]
