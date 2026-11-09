@@ -12,19 +12,23 @@ session folders, and while it runs the "Session jobs" panel shows the machine's
 load, the sessions done and each running job, read from the runner's output.
 "Only failed of a run…" limits the next run to the sessions an earlier run did
 not finish (read from its summary.csv; passed to the runner as HM_SESSIONS_FILE).
+While a run is going, the Run button turns orange, shows a turning arrow and the
+time since the run started ("Running…  12:34").
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QProcess, QProcessEnvironment
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QRectF, QPointF, QSize
+from PyQt6.QtGui import QFont, QTextCursor, QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QGroupBox, QPlainTextEdit,
@@ -88,6 +92,72 @@ _JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?")
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")
 # where the runner's tree mode keeps its per-run logs + summary.csv (POST_LOG_DIR)
 POST_LOG_DIR = Path(tempfile.gettempdir()) / "hm_post"
+
+# The Run button's two looks. The colour is given for the :disabled state too:
+# the button is disabled while a run is going, and without it Qt would keep
+# drawing the same green, so a running GUI looked exactly like an idle one.
+RUN_BUTTON_STYLE = ("QPushButton, QPushButton:disabled {{ background:{color}; color:white; "
+                    "font-weight:700; padding:8px 20px; }}")
+IDLE_GREEN = "#2e8b2e"
+RUNNING_ORANGE = "#d9822b"
+SPINNER_STEP_DEGREES = 30          # 12 frames per turn ...
+SPINNER_INTERVAL_MS = 80           # ... x 80 ms = about one turn per second
+
+
+def format_elapsed(seconds):
+    """Seconds as "m:ss", or "h:mm:ss" once a run passes an hour."""
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def spinner_icon(angle, size=18, color="white"):
+    """One frame of the Run button's spinner: a circular "refresh" arrow, turned
+    clockwise by `angle` degrees.
+
+    It is drawn with QPainter instead of using a text symbol, so it looks the
+    same on the Mac and on the lab's Windows PC (no font has to have the glyph)."""
+    scale = 2                                    # draw at 2x so it stays sharp on retina screens
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.setDevicePixelRatio(scale)            # ... but keep using `size` as the coordinates
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.translate(size / 2, size / 2)        # (0, 0) is now the icon's centre ...
+    painter.rotate(angle)                        # ... so the rotation turns it in place
+
+    # an open circle: 300 of the 360 degrees, drawn clockwise from 3 o'clock.
+    # Qt counts arc angles in 1/16 degree, counter-clockwise positive.
+    radius = size / 2 - 3
+    pen = QPen(QColor(color), 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.drawArc(QRectF(-radius, -radius, 2 * radius, 2 * radius), 0, -300 * 16)
+
+    # the arrow head, where the arc ends (60 degrees = about 1 o'clock); it points
+    # the way the arc was drawn (clockwise). Screen y points down, hence the minus signs.
+    end = math.radians(60)
+    end_x, end_y = radius * math.cos(end), -radius * math.sin(end)
+    along_x, along_y = math.sin(end), math.cos(end)          # clockwise direction
+    out_x, out_y = math.cos(end), -math.sin(end)             # away from the centre
+    head = 3.5
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawPolygon(QPolygonF([
+        QPointF(end_x + along_x * head, end_y + along_y * head),   # tip
+        QPointF(end_x + out_x * head, end_y + out_y * head),       # outer corner
+        QPointF(end_x - out_x * head, end_y - out_y * head),       # inner corner
+    ]))
+    painter.end()
+
+    icon = QIcon(pixmap)
+    # the button is disabled while it spins: give the same white picture for the
+    # disabled mode too, or Qt would draw a greyed-out copy of it
+    icon.addPixmap(pixmap, QIcon.Mode.Disabled)
+    return icon
 
 
 def failed_sessions(summary_csv):
@@ -217,7 +287,11 @@ class TrackerGUI(QMainWindow):
 
         brow = QHBoxLayout()
         self.run_btn = QPushButton("▶  Run")
-        self.run_btn.setStyleSheet("background:#2e8b2e; color:white; font-weight:700; padding:8px 20px;")
+        self.run_btn.setStyleSheet(RUN_BUTTON_STYLE.format(color=IDLE_GREEN))
+        self.run_btn.setIconSize(QSize(18, 18))
+        # wide enough for "Running…  1:23:45", so the buttons next to it do not
+        # jump around while the clock counts up
+        self.run_btn.setMinimumWidth(200)
         self.run_btn.clicked.connect(self._run)
         self.stop_btn = QPushButton("■  Stop")
         self.stop_btn.setEnabled(False)
@@ -229,6 +303,15 @@ class TrackerGUI(QMainWindow):
         brow.addStretch(1)
         brow.addWidget(clear_btn)
         v.addLayout(brow)
+
+        # the Run button's spinner: a timer swaps in the next frame (and updates
+        # the elapsed time) every SPINNER_INTERVAL_MS while the runner is running
+        self.spinner_frames = [spinner_icon(angle) for angle in range(0, 360, SPINNER_STEP_DEGREES)]
+        self.spinner_index = 0
+        self.run_started = 0.0                   # time.monotonic() when Run was pressed
+        self.spinner_timer = QTimer(self)
+        self.spinner_timer.setInterval(SPINNER_INTERVAL_MS)
+        self.spinner_timer.timeout.connect(self._turn_spinner)
 
         # --- session jobs (tree mode): load, progress, running jobs -------------
         self.jobs_box = QGroupBox("Session jobs")
@@ -395,9 +478,37 @@ class TrackerGUI(QMainWindow):
         dry = " (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
         only = f" (only the {len(self.only_sessions)} listed sessions)" if self.only_sessions else ""
         self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}{only}\n")
-        self.run_btn.setEnabled(False)
+        self._show_running(steps)
         self.stop_btn.setEnabled(True)
         self.statusBar().showMessage(f"Running steps: {steps}")
+
+    # ---------------------------------------------------------- run button looks
+    def _show_running(self, steps):
+        """Run button -> orange "Running…  m:ss" with a turning arrow."""
+        self.run_started = time.monotonic()
+        self.spinner_index = 0
+        self.run_btn.setEnabled(False)           # one run at a time
+        self.run_btn.setStyleSheet(RUN_BUTTON_STYLE.format(color=RUNNING_ORANGE))
+        self._turn_spinner()                     # show the first frame now, not 80 ms later
+        self.spinner_timer.start()
+        # the title shows in the taskbar / Dock too, so a run is visible there as well
+        self.setWindowTitle(f"Genzel Tracker — running steps {steps}")
+
+    def _turn_spinner(self):
+        """Next spinner frame + the time since Run was pressed."""
+        self.run_btn.setIcon(self.spinner_frames[self.spinner_index])
+        self.spinner_index = (self.spinner_index + 1) % len(self.spinner_frames)
+        elapsed = format_elapsed(time.monotonic() - self.run_started)
+        self.run_btn.setText(f"Running…  {elapsed}")
+
+    def _show_idle(self):
+        """Run button back to the green "▶  Run"."""
+        self.spinner_timer.stop()
+        self.run_btn.setIcon(QIcon())            # an empty icon removes the spinner
+        self.run_btn.setText("▶  Run")
+        self.run_btn.setStyleSheet(RUN_BUTTON_STYLE.format(color=IDLE_GREEN))
+        self.run_btn.setEnabled(True)
+        self.setWindowTitle("Genzel Tracker")
 
     def _stop(self):
         if self.proc is not None:
@@ -476,8 +587,9 @@ class TrackerGUI(QMainWindow):
 
     def _on_finished(self, code, _status):
         self._append(f"\n[genzeltracker] runner exited with code {code}.\n")
-        self.statusBar().showMessage(f"Finished (exit {code}).")
-        self.run_btn.setEnabled(True)
+        elapsed = format_elapsed(time.monotonic() - self.run_started)
+        self.statusBar().showMessage(f"Finished (exit {code}) after {elapsed}.")
+        self._show_idle()
         self.stop_btn.setEnabled(False)
         self.proc = None
 

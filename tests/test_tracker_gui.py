@@ -74,3 +74,27 @@ def test_only_the_unfinished_sessions_of_a_run(gui, tmp_path):
 
     gui._clear_only_sessions()
     assert gui.only_sessions == [] and not gui.all_sessions_btn.isEnabled()
+
+
+def test_elapsed_time_on_the_run_button():
+    assert G.format_elapsed(7) == "0:07"
+    assert G.format_elapsed(754.9) == "12:34"
+    assert G.format_elapsed(3 * 3600 + 5 * 60 + 9) == "3:05:09"
+
+
+def test_run_button_shows_running_then_idle(gui):
+    gui._show_running("lv")
+    assert gui.run_btn.text().startswith("Running…") and not gui.run_btn.isEnabled()
+    assert gui.spinner_timer.isActive() and not gui.run_btn.icon().isNull()
+    assert G.RUNNING_ORANGE in gui.run_btn.styleSheet()
+    assert "running steps lv" in gui.windowTitle()
+
+    first_frame = gui.spinner_index
+    gui._turn_spinner()                                   # the arrow moves on each tick
+    assert gui.spinner_index == (first_frame + 1) % len(gui.spinner_frames)
+
+    gui._show_idle()
+    assert gui.run_btn.text() == "▶  Run" and gui.run_btn.isEnabled()
+    assert not gui.spinner_timer.isActive() and gui.run_btn.icon().isNull()
+    assert G.IDLE_GREEN in gui.run_btn.styleSheet()
+    assert gui.windowTitle() == "Genzel Tracker"

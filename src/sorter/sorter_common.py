@@ -34,13 +34,22 @@ import spikeinterface.full as si
 #                                Mahalanobis separation of the cluster; higher is
 #                                better (lenient 8; typical 15-20). NaN when the
 #                                cluster holds >half the region's spikes -> mua.
-#   isi_violations_ratio < 0.2 : ISI refractory violations (Hill et al., 2011) —
-#                                violation firing rate normalised by the unit's
-#                                overall rate; 0 = clean gap, higher = contaminated.
-#                                It is a RATIO, not a %: common cutoffs ~0.5
-#                                (lenient) / 0.2 (moderate) / 0.1 (strict).
-#                                Implemented via SI's 'isi_violation' metric, which
-#                                OUTPUTS the 'isi_violations_ratio' column.
+#   ISI violations, passed when EITHER of (ISI_GATE):
+#   isi_violations_ratio <= 0.2      : ISI refractory violations (Hill et al., 2011) —
+#                                      violation firing rate normalised by the unit's
+#                                      overall rate; 0 = clean gap, higher = contaminated.
+#                                      It is a RATIO, not a %: common cutoffs ~0.5
+#                                      (lenient) / 0.2 (moderate) / 0.1 (strict).
+#                                      Implemented via SI's 'isi_violation' metric, which
+#                                      OUTPUTS the 'isi_violations_ratio' column.
+#   isi_violations_fraction <= 0.005 : isi_violations_count / (num_spikes - 1), the
+#                                      fraction of ISIs < 1.5 ms (0.5%). The ratio
+#                                      scales with 1 / firing_rate**2: in a 0.4 Hz CA1
+#                                      pyramidal cell over 70 min each violation adds
+#                                      0.5, so ratio <= 0.2 alone means NO violation.
+#                                      The fraction does not depend on the firing rate,
+#                                      so such a cell with 4 violations (0.0024) passes.
+#                                      Not an SI metric: see add_isi_violations_fraction.
 #
 # isolation_distance is an OUTPUT column of the 'mahalanobis' metric on
 # spikeinterface 0.104 (requestable directly on 0.103); it needs the
@@ -54,15 +63,63 @@ QUALITY_CHECK_THRESHOLDS = {
     },
     "mua": {
         "isolation_distance": {"greater": 8, "less": None},
-        "isi_violations_ratio": {"greater": None, "less": 0.2},
     },
 }
+
+# The MUA gate on ISI violations: {metric: the value it must not exceed}. A unit
+# passes when EITHER metric is at or under its cutoff. bombcell_label_units can
+# only AND its gates, so this one is applied after it (_apply_isi_gate).
+ISI_GATE = {
+    "isi_violations_ratio": 0.2,
+    "isi_violations_fraction": 0.005,
+}
+
+
+def add_isi_violations_fraction(qm):
+    """Return a copy of the quality-metrics DataFrame `qm` with an
+    isi_violations_fraction column, isi_violations_count / (num_spikes - 1)
+    (NaN below 2 spikes), right after isi_violations_count. phy_genzel shows the
+    same number as a live column. `qm` comes back as is if it lacks either
+    input column."""
+    if "isi_violations_count" not in qm.columns or "num_spikes" not in qm.columns:
+        return qm
+    n_isis = qm["num_spikes"].astype(float) - 1
+    fraction = qm["isi_violations_count"] / n_isis.where(n_isis > 0)
+    out = qm.drop(columns="isi_violations_fraction", errors="ignore")
+    out.insert(out.columns.get_loc("isi_violations_count") + 1,
+               "isi_violations_fraction", fraction)
+    return out
+
+
+def _apply_isi_gate(labels_df, qm, cutoffs):
+    """Relabel the 'good' units of `labels_df` that fail the ISI gate as 'mua'
+    (a noise unit stays noise, as with the other MUA gates). A unit fails when
+    no metric of `cutoffs` is at or under its cutoff. A NaN value cannot pass,
+    but a unit with every value NaN is not failed: as in bombcell's MUA gate,
+    NaN means the metric could not be computed."""
+    import pandas as pd
+
+    values = qm.reindex(labels_df.index)[list(cutoffs)]
+    passes = values.le(pd.Series(cutoffs)).any(axis=1) | values.isna().all(axis=1)
+    failed = (labels_df["quality_label"] == "good") & ~passes
+    labels_df = labels_df.copy()
+    labels_df.loc[failed, "quality_label"] = "mua"
+
+    if "isi_violations_ratio" in cutoffs and len(cutoffs) > 1:
+        over_ratio = values["isi_violations_ratio"] > cutoffs["isi_violations_ratio"]
+        kept = (labels_df["quality_label"] == "good") & over_ratio
+        print(f"[QC] ISI gate: {int(kept.sum())} unit(s) over isi_violations_ratio "
+              f"{cutoffs['isi_violations_ratio']} kept as good by "
+              f"{', '.join(m for m in cutoffs if m != 'isi_violations_ratio')}; "
+              f"{int(failed.sum())} unit(s) -> mua.")
+    return labels_df
 
 
 def label_units_quality_check(analyzer):
     """Label units good / mua / noise via the classic tetrode quality metrics
-    (see QUALITY_CHECK_THRESHOLDS). Uses spikeinterface's bombcell_label_units
-    purely as the thresholding engine.
+    (see QUALITY_CHECK_THRESHOLDS and ISI_GATE). Uses spikeinterface's
+    bombcell_label_units purely as the thresholding engine, then applies the
+    ISI gate itself.
 
     Best-effort: returns a DataFrame (unit-id index, 'quality_label' column) or
     None if unavailable or anything fails. It NEVER raises into the sorting
@@ -70,7 +127,7 @@ def label_units_quality_check(analyzer):
     missing metric column would otherwise KeyError inside the engine).
 
     Requires the quality_metrics extension (snr, num_spikes, isolation_distance,
-    isi_violations_ratio) to be computed first.
+    isi_violations_ratio, isi_violations_count) to be computed first.
     """
     try:
         from spikeinterface.curation import bombcell_label_units
@@ -82,10 +139,12 @@ def label_units_quality_check(analyzer):
     # Collect the metric columns that actually exist, so we can drop thresholds
     # for anything that wasn't computed.
     available = set()
+    qm = None
     try:
         ext = analyzer.get_extension("quality_metrics")
         if ext is not None:
-            available.update(ext.get_data().columns)
+            qm = add_isi_violations_fraction(ext.get_data())
+            available.update(qm.columns)
     except Exception:
         pass
 
@@ -96,9 +155,11 @@ def label_units_quality_check(analyzer):
         dropped += [f"{cat}/{m}" for m in rules if m not in available]
         if kept:
             thresholds[cat] = kept
+    isi_cutoffs = {m: c for m, c in ISI_GATE.items() if m in available}
+    dropped += [f"mua/{m}" for m in ISI_GATE if m not in available]
     if dropped:
         print(f"[QC] Metrics not computed, thresholds skipped: {dropped}")
-    if not thresholds:
+    if not thresholds and not isi_cutoffs:
         print("[QC] No usable metrics available; skipping quality-check labeling.")
         return None
 
@@ -110,6 +171,8 @@ def label_units_quality_check(analyzer):
         )
         # Re-label the engine's output column to our quality-check naming.
         labels_df = labels_df.rename(columns={"bombcell_label": "quality_label"})
+        if isi_cutoffs:
+            labels_df = _apply_isi_gate(labels_df, qm, isi_cutoffs)
         counts = labels_df["quality_label"].value_counts().to_dict()
         print(f"[QC] Unit labels ({sum(counts.values())} units): {counts}")
         return labels_df
@@ -500,6 +563,9 @@ def _quality_metric_names():
 _COLUMN_TO_REQUEST = {
     "rp_contamination": ("rp_contamination", "rp_violation"),
     "isi_violations_ratio": ("isi_violations_ratio", "isi_violation"),
+    # Not an SI metric: add_isi_violations_fraction derives it from
+    # isi_violation's isi_violations_count (and num_spikes, a noise gate).
+    "isi_violations_fraction": ("isi_violation",),
     "isolation_distance": ("isolation_distance", "mahalanobis"),
     "l_ratio": ("l_ratio", "mahalanobis"),
     "nn_isolation": ("nn_isolation", "nn_advanced"),
@@ -521,10 +587,12 @@ def _request_names_for_columns(columns):
 
 
 def _quality_check_request_names():
-    """The metric REQUEST names needed for every column in QUALITY_CHECK_THRESHOLDS."""
+    """The metric REQUEST names needed for every column in QUALITY_CHECK_THRESHOLDS
+    and ISI_GATE."""
     cols = []
     for rules in QUALITY_CHECK_THRESHOLDS.values():
         cols += list(rules.keys())
+    cols += list(ISI_GATE)
     return _request_names_for_columns(cols)
 
 
@@ -661,8 +729,9 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         print(f"[recompute] principal_components failed ({e}); isolation metrics skipped.")
 
     # ONLY the metrics the quality check uses (resolved to this version's request
-    # names): snr + num_spikes (noise), rp_violation -> rp_contamination, and the
-    # isolation metrics nn_isolation / nn_noise_overlap (via 'nn_advanced' on 0.104).
+    # names): snr + num_spikes (noise), isolation_distance (via 'mahalanobis' on
+    # 0.104) and isi_violation -> isi_violations_ratio + isi_violations_count
+    # (the ISI gate; the fraction is derived from the count when written below).
     qc_names = _quality_check_request_names()
     # PCA-dependent isolation metrics vs the rest, so we can drop them if PCA failed.
     pca_reqs = {'mahalanobis', 'nn_advanced', 'nn_isolation', 'nn_noise_overlap',
@@ -729,6 +798,8 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
             if ext is None:
                 continue
             df = ext.get_data()
+            if ext_name == "quality_metrics":
+                df = add_isi_violations_fraction(df)
             df.to_csv(phy / csv_name)
             _write_df_as_phy_tsv(df, phy)
             wrote.append(csv_name)
