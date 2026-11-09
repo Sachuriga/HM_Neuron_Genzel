@@ -131,3 +131,23 @@ def test_a_session_list_replaces_the_tree_walk(share, tmp_path, monkeypatch, cap
     monkeypatch.setenv("HM_SESSIONS_FILE", str(list_file))
     runner.main()
     assert jobs == {"targets": [wanted], "steps": "l"}
+
+
+@pytest.mark.parametrize("typed, runs", [("r", "u"), ("ru", "u"), ("rv", "uv")])
+def test_old_step_r_runs_step_u(share, monkeypatch, typed, runs):
+    # step r (recompute metrics) is the first part of step u now; old presets and
+    # HM_STEPS strings that still say "r" must not silently do nothing
+    jobs = {}
+
+    def fake_run_post_jobs(targets, steps, config, root):
+        jobs["steps"] = steps
+        return []
+
+    monkeypatch.setattr(runner, "run_post_jobs", fake_run_post_jobs)
+    monkeypatch.setattr(runner, "load_config", lambda: "cfg.txt")
+    monkeypatch.setattr(sys, "argv", ["runner.py", str(share)])
+    monkeypatch.setenv("HM_STEPS", typed)
+    monkeypatch.delenv("HM_SESSIONS_FILE", raising=False)
+    runner.main()
+    assert jobs["steps"] == runs
+    assert "r" not in dict(runner.MENU) and "r" not in runner.SEQUENTIAL_STEPS

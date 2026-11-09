@@ -87,9 +87,10 @@ Navigate to ...\phy_export in your op folder, for example:
 `cd C:\Users\gl_pc\Desktop\data\sleep\Rat6_20260727\op1\Rat6_HM_Neurons_20260727_092437_pre.raw_group0_mountainsort4_sorting_output\phy_export`  
 And then: `phy template-gui params.py`
 
-After the initial round of spike sorting is finished, step r ("recompute metrics") of the GenzelTracker may be run.
-This will prepare the data for spike quality labelling.  
-Be careful not to recompute metrics for op folders in which the spike sorting has not yet been finished.
+After the initial round of spike sorting is finished, step u ("Curated Units -> NWB") of the GenzelTracker may be run.
+It first recomputes the metrics on your curated units, which prepares the data for spike quality labelling, and then writes the units into the session NWB (if the session already has one). It never changes any good/mua/noise label.  
+Be careful not to run step u for op folders in which the spike sorting has not yet been finished.  
+After labelling, run step u again so the NWB gets your final labels.
 
 ### 4.3 Maze video (W.I.P.)
 

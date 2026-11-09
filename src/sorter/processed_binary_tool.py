@@ -4,8 +4,8 @@ Free disk space by deleting processed_binary/ — and rebuild it when needed.
 WHY THIS EXISTS
 ---------------
 Every sorted recording keeps <op>/<recording>_<sorter>_sorting_output/processed_binary/:
-the band-passed, re-referenced copy of the raw data that Phy's trace view,
-step r and step u read. It is as big as the raw data itself (~27 GiB per
+the band-passed, re-referenced copy of the raw data that Phy's trace view
+and step u read. It is as big as the raw data itself (~27 GiB per
 recording hour), and it is only needed while you are still curating.
 
 It can be deleted safely because it is NOT original data: it is rebuilt from
@@ -32,7 +32,7 @@ USAGE
     # 2. really delete
     python src/sorter/processed_binary_tool.py --clean --output_folder <op> --yes
 
-    # 3. later, to curate again / re-run step r or u: rebuild from the .rec
+    # 3. later, to curate again / re-run step u: rebuild from the .rec
     python src/sorter/processed_binary_tool.py --restore --input_folder <ip> \
         --output_folder <op> --config ~/Desktop/hm_tracker_paths.txt
 """
@@ -191,8 +191,8 @@ def clean(output_folder, really_delete=False):
 
         shutil.rmtree(processed)
         (out_dir / REMOVED_NOTE_FILE).write_text(
-            "processed_binary/ was deleted to save disk space. Phy's trace view, step r\n"
-            "and step u need it. Rebuild it from the .rec with:\n\n"
+            "processed_binary/ was deleted to save disk space. Phy's trace view and\n"
+            "step u need it. Rebuild it from the .rec with:\n\n"
             "  python src/sorter/processed_binary_tool.py --restore "
             "--input_folder <ip folder> --output_folder <this op folder> --config <hm_tracker_paths.txt>\n")
         print(f"  deleted processed_binary/ — freed {human_size(size)}.")

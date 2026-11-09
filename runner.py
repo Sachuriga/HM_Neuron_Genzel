@@ -65,13 +65,12 @@ MENU = [
     ("6", "Compression (always runs LAST, over all op folders)"),
     ("7", "Sorting + clock QC/repair"),
     ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
-    ("r", "Recompute Metrics (after manual Phy curation)"),
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
     ("l", "Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
     ("n", "Node Analysis"),
-    ("u", "Add curated Units (metrics + waveforms) to NWB (runs after 4)"),
+    ("u", "Curated Units -> NWB: recompute metrics after Phy curation + waveforms (runs after 4)"),
     ("v", "Visualize NWB units (summary + per-unit rate-map PDFs; runs after u)"),
     ("b", "Bayesian position decoder + spikes/decoded-on-video overlays per session (good and good+mua)"),
     ("m", "Neural population UMAP per session (good & good+mua, all + pyramidal-only; Gardner et al. 2022)"),
@@ -80,7 +79,7 @@ MENU = [
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "r", "9", "l", "u", "v", "b", "m", "t"]
+SEQUENTIAL_STEPS = ["7", "c", "9", "l", "u", "v", "b", "m", "t"]
 
 # Tree mode (a root without ip* folders): these steps run per session, as parallel
 # jobs, in this order — l before v (the theta pages read the LFP), u before v/b/m
@@ -532,7 +531,7 @@ def clean_folder(target):
 #                 SEQUENTIAL (master) STEP RUNNERS
 # ------------------------------------------------------------
 def _run_per_op(label, tag, script, ops, config, extra_ip=None):
-    """Run a python step sequentially over every op folder (used by 7/c/r/u)."""
+    """Run a python step sequentially over every op folder (used by 7/c/l/u/v)."""
     print("\n" + "=" * 56)
     print(f"[MASTER] Running {label} sequentially...")
     print("=" * 56)
@@ -556,7 +555,7 @@ def _is_date_name(name):
 
 
 def sequential_targets(root, ops):
-    """Folder targets for the steps that don't need an ip folder (c/r/u/v). Besides
+    """Folder targets for the steps that don't need an ip folder (c/u/v). Besides
     the op* folders derived from ip*, include every op* folder in the root AND every
     session-date-named folder (YYYYMMDD) whose name ALSO appears in a file/subfolder
     inside it — i.e. the folder really belongs to that session (e.g. '20260629'
@@ -1150,6 +1149,15 @@ def main():
               "and step 1 exports the analog (IMU) data. Running step 1 for 'e'.")
         selection = selection.replace("e", "" if "1" in selection else "1")
 
+    # Step [r] (recompute metrics after Phy curation) is now the first part of
+    # step u: u always recomputes the curated metrics before it writes the units,
+    # and only recomputes them when the session has no NWB yet. So an "r" in an
+    # old preset or HM_STEPS string (e.g. "ru") runs step u.
+    if "r" in selection:
+        print("[STEPS] Step [r] is now part of step u (recompute the curated metrics, "
+              "then write the units to the NWB). Running step u for 'r'.")
+        selection = selection.replace("r", "" if "u" in selection else "u")
+
     # Split the selection into sequential master steps and parallel worker steps.
     # Step 6 (compression) is special: it always runs LAST at master level over all
     # op folders, so pull it out of the parallel worker steps here.
@@ -1203,7 +1211,7 @@ def main():
             print(f"[TREE] Step(s) {' '.join(need_ip)} read the raw recordings (ip* folders) "
                   f"and are skipped here.")
     else:
-        # Targets for the ip-INDEPENDENT steps (c/r/u/v): op* folders + session-date
+        # Targets for the ip-INDEPENDENT steps (c/u/v): op* folders + session-date
         # folders whose name matches a file inside them. This lets those steps run on
         # session-named folders, not just op*.
         seq_ops = sequential_targets(root, ops)
@@ -1272,8 +1280,6 @@ def main():
         clock_qc_after_sorting(ops)
     if has["c"]:
         _run_per_op("CONTINUE-AFTER-SORTING", "CONT", "./src/sorter/continue_sorting.py", seq_ops, config)
-    if has["r"]:
-        _run_per_op("RECOMPUTE-METRICS (curated Phy)", "RECOMP", "./src/sorter/recompute_metrics.py", seq_ops, config)
 
     if has["9"]:
         print("\n" + "=" * 56)
@@ -1309,7 +1315,8 @@ def main():
                     "./src/nwb/rewrite_nwb_lfp.py", seq_ops, config)
 
     if has["u"] and not tree:
-        _run_per_op("ADD-UNITS (curated Phy -> NWB)", "UNITS", "./src/nwb/add_units.py", seq_ops, config)
+        _run_per_op("ADD-UNITS (recompute curated metrics + curated Phy -> NWB)", "UNITS",
+                    "./src/nwb/add_units.py", seq_ops, config)
 
     if has["v"] and not tree:
         _run_per_op("VISUALIZE-NWB (summary + per-unit PDFs)", "VIZ", "./src/nwb/visualize_nwb.py", seq_ops, config)

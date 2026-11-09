@@ -1,14 +1,24 @@
 """
-Runner step [u]: add the curated spike-sorting Units table to the session NWB.
+Runner step [u]: recompute the curated metrics, then add the curated spike-sorting
+Units table to the session NWB. (The metric part used to be its own step, r; it
+is now always run first, so the NWB can never get metrics from before the last
+Phy curation.)
 
 Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each op folder it:
-  - finds the session NWB (step 4 / step 8):    <op>/Rat*_*.nwb
   - finds the curated phy folder(s):            <op>/*_sorting_output/phy_export
-  - reads, per curated unit:
+  - PART 1 (the former step r), per phy folder: recomputes the quality + template
+    metrics on the curated sorting and writes them into the phy folder
+    (sorter_common.recompute_curated_metrics; Phy shows them as columns). It does
+    NOT change any label: the manual cluster_group.tsv and the automated
+    quality_check_labels.csv / cluster_auto_group.tsv stay as they are. This also
+    runs when the session has no NWB yet, so it can be used to prepare a session
+    for labelling in Phy.
+  - PART 2, only when there is a session NWB (step 4 / step 8: <op>/Rat*_*.nwb).
+    It reads, per curated unit:
       * spike times (seconds)      from spike_times.npy + spike_clusters.npy,
-                                   duplicated spikes dropped (same rule as step r)
-      * quality metrics            from curated_quality_metrics.csv
-      * waveform/template metrics  from curated_template_metrics.csv
+                                   duplicated spikes dropped (same rule as part 1)
+      * quality metrics            from curated_quality_metrics.csv (just written)
+      * waveform/template metrics  from curated_template_metrics.csv (just written)
       * good/mua/noise label       from cluster_group.tsv (Phy's MANUAL group —
                                    the human good/noise truth) -> quality_label;
                                    quality_check_labels.csv (automated) is also
@@ -32,11 +42,14 @@ Runs AFTER step 4 (which writes the behaviour NWB via create_nwb.py). For each o
       waveforms_spike_index  which of the unit's spike_times each row belongs to
       waveforms_channel_ids  the tetrode channels, in the order of axis 1
 
-Waveforms are ALWAYS extracted and stored. Every run REPLACES an existing Units
-table, so re-curating in Phy and re-running u updates the NWB. If the waveforms
-cannot be extracted for any phy folder, nothing is written (the old Units table
-stays) and the step exits with an error — a Units table without waveform_mean
-is never written.
+Metrics are ALWAYS recomputed and waveforms ALWAYS extracted. Every run REPLACES
+an existing Units table, so after re-curating in Phy just re-run u. If the
+quality metrics or the waveforms fail for any phy folder, nothing is written
+(the old Units table stays) and the step exits with an error — a Units table
+with stale metrics or without waveform_mean is never written.
+
+Each phy folder is read from disk twice (once per part): part 1 keeps exactly
+the metric settings step r had, so the metric values stay the same as step r's.
 
 Phy's own templates.npy is NOT used: it is keyed by the pre-curation cluster ids
 and goes stale after merges/splits.
@@ -76,7 +89,7 @@ def _read_phy_params(phy_folder):
 
 def find_phy_folders(output_folder):
     """Find curated phy_export folders under the op folder (same logic as
-    recompute_metrics.py so the two steps agree on what to process)."""
+    src/sorter/recompute_metrics.py, so both find the same folders)."""
     op = Path(output_folder)
     if (op / "params.py").exists():                 # pointed straight at a phy folder
         return [op]
@@ -241,7 +254,7 @@ def _extract_waveforms(phy, n_jobs=4):
 
 def _spike_times_by_unit(phy, unit_ids):
     """Per-unit spike times in SECONDS, from phy's spike_times/spike_clusters,
-    with duplicated spikes dropped by the same rule step r used for the metrics
+    with duplicated spikes dropped by the same rule part 1 used for the metrics
     (and _extract_waveforms used for waveforms_spike_index)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
     from sorter_common import find_duplicated_phy_spikes  # noqa: E402
@@ -371,27 +384,62 @@ def _num(v):
         return np.nan
 
 
+def recompute_metrics(phy, n_jobs=4):
+    """PART 1 of step u (it was step r): recompute the quality + template metrics
+    on the curated sorting, written into the phy folder. Labels are not changed
+    (manual or automated) — unlike step r, which also rewrote the automated ones.
+
+    Raises when the quality metrics were not refreshed: part 2 reads its unit
+    list and metric columns from curated_quality_metrics.csv, and an old copy of
+    that file would put pre-curation units/metrics into the NWB."""
+    # imported here, not at the top: sorter_common needs spikeinterface
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sorter"))
+    from sorter_common import recompute_curated_metrics  # noqa: E402
+
+    print(f"\n--- Part 1: recomputing the curated metrics in {phy} ---")
+    wrote = recompute_curated_metrics(phy, n_jobs=n_jobs, refresh_auto_labels=False)
+    if "curated_quality_metrics.csv" not in wrote:
+        raise RuntimeError(f"the quality metrics could not be recomputed in {phy}")
+    if "curated_template_metrics.csv" not in wrote:
+        # Not fatal: step u recomputes its own waveform metrics (trough-to-peak,
+        # half-widths, cell_type) from the fresh templates anyway.
+        print(f"  WARNING: template metrics could not be recomputed; the "
+              f"curated_template_metrics.csv columns in the NWB are from an earlier run.")
+
+
 def add_units_to_nwb(output_folder, n_jobs=4):
-    """Write the curated Units table(s) for one op folder into its NWB, replacing
-    any existing one. Returns False when the waveforms could not be extracted
-    (nothing is written then)."""
-    nwb_path = find_nwb_file(output_folder)
-    if nwb_path is None:
-        print(f"No .nwb file found under '{output_folder}' (run step 4 or 8 first). Skipping.")
-        return True
+    """Step u for one op folder: recompute the curated metrics of every phy folder
+    (part 1), then write the curated Units table(s) into the session NWB,
+    replacing any existing one (part 2). Returns False when part 1 or the
+    waveform extraction failed for any phy folder (no units are written then)."""
     phys = find_phy_folders(output_folder)
     if not phys:
         print(f"No 'phy_export' folder found under '{output_folder}'. Nothing to add.")
         return True
+    nwb_path = find_nwb_file(output_folder)
 
-    print(f"NWB target: {nwb_path}")
     print(f"Found {len(phys)} phy folder(s).")
+    if nwb_path is None:
+        print(f"No .nwb file found under '{output_folder}' (run step 4 or 8 first): "
+              f"recomputing the metrics only, no units are written.")
+    else:
+        print(f"NWB target: {nwb_path}")
 
     all_units = []
     metric_cols = []
     failed = []
     for phy in phys:
-        print(f"\n--- Reading units from {phy} ---")
+        try:
+            recompute_metrics(phy, n_jobs=n_jobs)
+        except Exception as e:
+            print(f"  Failed to recompute the metrics in {phy}: {e}")
+            traceback.print_exc()
+            failed.append(phy)
+            continue
+        if nwb_path is None:
+            continue                     # no NWB to write the units into
+
+        print(f"\n--- Part 2: reading units from {phy} ---")
         gaps_file = phy.parent / "spliced_gaps.json"
         if gaps_file.exists():
             import json
@@ -421,9 +469,9 @@ def add_units_to_nwb(output_folder, n_jobs=4):
 
     if failed:
         # Writing only the folders that worked would silently drop units, so the
-        # whole session is left as it is until every folder extracts.
+        # whole session is left as it is until every folder works.
         print("\n" + "*" * 70)
-        print(f"ERROR: waveforms could not be extracted for {len(failed)} phy folder(s):")
+        print(f"ERROR: metrics or waveforms failed for {len(failed)} phy folder(s):")
         for phy in failed:
             print(f"  {phy}")
         print("Nothing was written; the NWB keeps its previous Units table (if any).")
@@ -431,6 +479,10 @@ def add_units_to_nwb(output_folder, n_jobs=4):
         print("exists and spikeinterface is installed, then re-run step u.")
         print("*" * 70)
         return False
+
+    if nwb_path is None:
+        print("\nMetrics recomputed. Units not written: no session NWB yet.")
+        return True
 
     if not all_units:
         print("No units collected; nothing to write.")
@@ -532,13 +584,14 @@ def _write_units(nwb_path, all_units, metric_cols):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Add curated Units (metrics + waveform templates) to the session NWB.")
+        description="Recompute the curated metrics, then add the curated Units "
+                    "(metrics + waveforms) to the session NWB.")
     parser.add_argument("--output_folder", required=True,
                         help="op folder containing the NWB and *_sorting_output/phy_export.")
     parser.add_argument("--config", required=False, default=None,
                         help="Accepted for runner consistency (unused).")
     parser.add_argument("--n_jobs", type=int, default=4,
-                        help="Parallel jobs for the waveform extraction.")
+                        help="Parallel jobs for the metric recompute and the waveform extraction.")
     args = parser.parse_args()
 
     try:

@@ -183,7 +183,7 @@ def label_units_quality_check(analyzer):
 
 # Two spikes of the SAME unit at most this far apart are one spike counted twice
 # (e.g. after merging, in Phy, two clusters that both caught that spike). Used
-# by the sorting pipeline (run_auto_curation), step r (metrics) and step u (NWB).
+# by the sorting pipeline (run_auto_curation) and step u (curated metrics + NWB).
 DUPLICATE_CENSORED_PERIOD_MS = 0.3
 
 
@@ -379,7 +379,8 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RECOMPUTE METRICS ON A MANUALLY-CURATED PHY FOLDER  (runner step 'r')
+# RECOMPUTE METRICS ON A MANUALLY-CURATED PHY FOLDER  (first part of runner step 'u';
+# it was step 'r' before r was merged into u)
 # ──────────────────────────────────────────────────────────────────────────────
 # After you curate in Phy (merge / split / label good-mua-noise), the merges and
 # splits only live in the phy_export folder. This recomputes ALL quality metrics
@@ -660,23 +661,29 @@ def _flag_redundant_units(analyzer, phy_folder):
     return ["redundant_units.csv", "cluster_redundant_with.tsv"]
 
 
-def recompute_curated_metrics(phy_folder, n_jobs=4):
+def recompute_curated_metrics(phy_folder, n_jobs=4, refresh_auto_labels=True):
     """Recompute all quality + template (waveform) metrics on the curated phy
-    sorting and write them back into the phy folder. Best-effort; never raises.
+    sorting and write them back into the phy folder. Best-effort: a metric that
+    fails is skipped (raises only when the sorting or recording cannot be loaded).
 
     Duplicated spikes are dropped before computing (see
     find_duplicated_phy_spikes); step u drops the same spikes from the NWB.
 
     Writes: curated_quality_metrics.csv, curated_template_metrics.csv, one
-    cluster_<metric>.tsv per metric, the refreshed automated good/mua/noise
-    label as quality_check_labels.csv + cluster_auto_group.tsv, and the
-    redundant-unit report as redundant_units.csv + cluster_redundant_with.tsv.
-    Phy's own cluster_group.tsv (your manual labels) is left untouched.
+    cluster_<metric>.tsv per metric, and the redundant-unit report as
+    redundant_units.csv + cluster_redundant_with.tsv. With refresh_auto_labels
+    (the standalone recompute_metrics.py) it also rewrites the automated
+    good/mua/noise label as quality_check_labels.csv + cluster_auto_group.tsv;
+    step u passes False, so the labels stay as they are.
+    Phy's own cluster_group.tsv (your manual labels) is never touched.
+
+    Returns the names of the files written. Step u checks it: a metric CSV
+    missing from it was NOT refreshed, so the copy on disk is from an older run.
     """
     phy = Path(phy_folder)
     if not (phy / "params.py").exists():
         print(f"[recompute] Not a phy folder (no params.py): {phy}; skipping.")
-        return
+        return []
 
     print(f"[recompute] Loading curated sorting from {phy} ...")
     try:
@@ -806,11 +813,10 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         except Exception as e:
             print(f"[recompute] Could not save {ext_name} ({e}).")
 
-    # Save the curated per-unit waveform templates so the NWB units step (runner
-    # step 'u') can attach them without rebuilding the analyzer from the (huge)
-    # recording.dat. Phy's own templates.npy is stale after merges/splits (its
-    # rows are keyed by the ORIGINAL cluster ids), so we persist the freshly
-    # computed ones here, keyed by the curated unit ids.
+    # Save the curated per-unit waveform templates, keyed by the curated unit ids
+    # (Phy's own templates.npy is stale after merges/splits: its rows are keyed by
+    # the ORIGINAL cluster ids). Step u overwrites them right after with its own
+    # tetrode-sparse templates; they are kept here for anyone running this alone.
     try:
         tpl_ext = analyzer.get_extension("templates")
         if tpl_ext is not None:
@@ -824,12 +830,18 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
     except Exception as e:
         print(f"[recompute] Could not save curated templates ({e}).")
 
-    # Refresh the AUTOMATED good/mua/noise label on the curated units.
-    #
-    # It goes to its own files and NEVER into cluster_group.tsv: that file is
-    # where Phy saves the labels you set by hand, and step u reads it as the
-    # human truth. Overwriting it here used to replace your manual labels with
-    # the automated ones without telling you.
+    # Refresh the AUTOMATED good/mua/noise label on the curated units — only when
+    # asked. Step u does not ask: re-running u must not change any label.
+    if not refresh_auto_labels:
+        print("[recompute] Labels left as they are (quality_check_labels.csv, "
+              "cluster_auto_group.tsv, cluster_group.tsv).")
+        print(f"[recompute] Done. Wrote to {phy}: {wrote if wrote else 'nothing'}")
+        return wrote
+
+    # The automated label goes to its own files and NEVER into cluster_group.tsv:
+    # that file is where Phy saves the labels you set by hand, and step u reads
+    # it as the human truth. Overwriting it here used to replace your manual
+    # labels with the automated ones without telling you.
     try:
         qc = label_units_quality_check(analyzer)
         if qc is not None:
@@ -849,3 +861,4 @@ def recompute_curated_metrics(phy_folder, n_jobs=4):
         print(f"[recompute] Quality-check relabel failed ({e}).")
 
     print(f"[recompute] Done. Wrote to {phy}: {wrote if wrote else 'nothing'}")
+    return wrote

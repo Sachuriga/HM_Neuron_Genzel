@@ -1,6 +1,14 @@
 """
-Recompute quality + waveform (template) metrics on a MANUALLY-CURATED phy folder
-(runner step 'r'), AFTER you have merged / split / labeled units in Phy.
+Recompute quality + waveform (template) metrics on a MANUALLY-CURATED phy folder,
+AFTER you have merged / split / labeled units in Phy.
+
+This is a standalone tool: the runner's old step 'r' is now the first part of
+step 'u' (src/nwb/add_units.py), which always runs this same recompute before it
+writes the units into the NWB. Use this script only to refresh the metric columns
+in Phy without touching the NWB (it is faster: no per-spike waveforms), or to
+refresh the AUTOMATED labels (quality_check_labels.csv + the auto_group column in
+Phy) — step u leaves every label as it is; this script still rewrites the
+automated ones, as step r did. Your manual cluster_group.tsv is never touched.
 
 For each per-recording phy_export/ under the output (op) folder it:
   - loads the curated sorting (spike_times + spike_clusters — merges/splits
