@@ -31,7 +31,7 @@ A batch-processing pipeline for rat hexmaze neuroscience experiments — from ra
    - [Step 5 — Trial Plotting](#step-5--trial-plotting)
    - [Step 6 — Video Compression](#step-6--video-compression)
    - [Step 7 — Spike Sorting](#step-7--spike-sorting)
-   - [Step c — Continue After Sorting](#step-c--continue-after-sorting)
+   - [Step a — Phy Auto-curation (recluster + cut + label)](#step-a--phy-auto-curation-recluster--cut--label)
    - [Recompute Metrics after Phy curation (part 1 of step u, formerly step r)](#recompute-metrics-after-phy-curation-part-1-of-step-u-formerly-step-r)
    - [Step 8 — LFP + Motion + EMG-from-LFP](#step-8--lfp--motion--emg-from-lfp)
    - [Step d — DeepLabCut Export + Inference](#step-d--deeplabcut-export--inference)
@@ -106,7 +106,7 @@ HM_Tracker_2025/
 │                              # experiment protocol, media/
 └── src/
     ├── tracker/               # steps 2–5: sync, stitching, YOLOv11 tracker, trial plotting
-    ├── sorter/                # steps 7/c/r/8: sorting, curation tools, LFP/motion/EMG export,
+    ├── sorter/                # steps 7/a/8: sorting, Phy auto-curation, LFP/motion/EMG export,
     │                          # make_channel_map.py, Trodes reader
     ├── dlc/                   # step d: eye-frame export + DeepLabCut inference
     ├── node_analysis/         # step n: hex_maze_analysis.py (+ its own README)
@@ -150,7 +150,7 @@ Dependencies live in `pyproject.toml` (extras `[gpu]` / `[mac]`); installing als
 | [Trodes](https://spikegadgets.com/trodes/) (`trodesexport`) | `.rec` export: DIO, analog (IMU) |
 | [FFmpeg](https://ffmpeg.org/) (+ffprobe) | Stitching, compression, drive-scan video checks |
 | YOLOv11 weights (`.pt`) | Tracker detection model — see [Model](#model) |
-| [Phy](https://github.com/cortex-lab/phy) | Manual spike-sorting curation (between steps 7/c and r) |
+| [Phy](https://github.com/cortex-lab/phy) | Checking / correcting the curation (between steps 7 and u) |
 
 ### 3. Path config (`hm_tracker_paths.txt`)
 
@@ -214,7 +214,7 @@ data_root/
 ```
 
 - **Parallel steps** (`1 e 2 3 4 5 8 d n`) process each `ipN → opN` pair in its own worker.
-- **Sequential steps** (`7 c r 9 f w u v b m t`) run at master level after all workers finish — steps `7 c r 9 f u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps c/r/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
+- **Sequential steps** (`7 a 9 f w u v b m t`) run at master level after all workers finish — steps `7 a 9 f u v b m` loop one folder at a time; steps `w` and `t` run **once over the whole root**. Steps a/u/v/b/m also accept **session-date folders** (`YYYYMMDD/` whose name appears in a file inside them) as targets — the layout used on the processed network share.
 - **Step 6** (compression) is always pulled out and runs **last**, over every top-level `.mp4` of every `op*` folder.
 
 ### Tree mode (renamed / grouped session folders, e.g. the share)
@@ -266,10 +266,11 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 | Tracker non-implanted | `23456d` |
 | After manual curation | `uvbm` |
 | Retrack | `346d` |
-| Full pipeline | `1234567c89uvnbmt` |
+| Full pipeline | `123456789uvnbmt` |
 | Trodes export (DIO + analog/IMU) | `1` |
 | Sync + stitch + track | `234` |
-| Spike sorting (+ continue) | `7c` |
+| Spike sorting (+ Phy auto-curation) | `7` |
+| Auto-curate existing Phy exports | `a` |
 | LFP + motion + EMG (sleep) | `18` |
 | NWB units + visualise | `uv` |
 | Analysis (decode / UMAP) | `nbm` |
@@ -301,8 +302,8 @@ The interactive menu:
 [4] Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)
 [5] Plotting
 [6] Compression (always runs LAST, over all op folders)
-[7] Sorting + clock QC/repair
-[c] Continue After Sorting (metrics + BombCell + Phy, no re-sort)
+[7] Sorting + clock QC/repair (+ Phy auto-curation: recluster + cut + label)
+[a] Auto-curate existing Phy exports (recluster + cut + label; skips curated ones)
 [8] LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB
 [l] Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)
 [d] deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)
@@ -315,7 +316,7 @@ The interactive menu:
 [t] Drive scan (videos playable + ephys has pre/task/post + non-zero .rec)
 ```
 
-Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→c→9→f→w→l→u→v→b→m→t`, then `6` last; in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share) `l u v b 5 m` run per session as parallel jobs). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo. The old step `r` is part of step `u` now; an `r` in an old preset or `HM_STEPS` string runs step `u`.
+Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→a→9→f→w→l→u→v→b→m→t`, then `6` last; in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share) `l u v b 5 m` run per session as parallel jobs). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo. The old step `r` is part of step `u` now; an `r` in an old preset or `HM_STEPS` string runs step `u`. Step `c` (continue after sorting) was removed; a `c` is ignored with a notice (a sort that crashed before its Phy export has no `phy_export/`, so re-running step 7 sorts it again).
 
 Each parallel worker opens its **own terminal window** by default (`runner.py --worker <ip> <op> <steps> <marker>`); the master polls a `<tmp>/hm_worker_<name>.done` marker. Set `WORKER_WINDOWS=0` to run workers as background threads logging to `<tmp>/hm_worker_<name>.log`. Workers are launched `LAUNCH_GAP` (20 s) apart.
 
@@ -501,7 +502,7 @@ python src/sorter/sorting.py --input_folder <ip> --output_folder <op> --config <
 3. **Probe** — 8×4 tetrode grid (32 tetrodes × 4 = 128 channels), 250 µm spacing, ±10 µm diamond contacts, `group` per tetrode.
 4. **Preprocessing** — drop `EEG_TETRODES_<RAT>` channels → bandpass `FREQ_MIN`–`FREQ_MAX` (600–8000) → interpolate `BAD_CHANNELS_<RAT>` (50 µm) → optional `REF_CHANNEL_<RAT>` single-reference → global-median CAR → saved to `processed_binary/`. (The global-median CAR cancels any single reference exactly — the median shifts with a common offset — so `REF_CHANNEL_<RAT>` does not change the sorted data.) No manual whitening (the sorter whitens itself).
 5. **Sorting** — MountainSort5 (default, scheme 2) or MountainSort4 per tetrode (`run_sorter_by_property('group')`), selectable via `SORTER`.
-6. **Post-sorting** (shared with step c): duplicate-spike removal (0.3 ms censor) + redundant-unit removal → SortingAnalyzer (waveforms 1/2 ms, 3-PC, quality metrics) → automated **good/mua/noise** labels (noise gate: SNR > 2.5 & >100 spikes; mua gate: isolation distance > 8 & ISI violations — ratio ≤ 0.2 **or** ≤ 0.5 % of ISIs < 1.5 ms) → **Phy export** with `copy_binary=False` (`params.py` points at `processed_binary/` — the >100 GB recording is not duplicated) → writes `quality_check_labels.csv` and pre-fills `cluster_group.tsv` so units arrive pre-labelled in Phy.
+6. **Post-sorting**: duplicate-spike removal (0.3 ms censor) + redundant-unit removal → SortingAnalyzer (waveforms 1/2 ms, 3-PC, quality metrics) → automated **good/mua/noise** labels (noise gate: SNR > 2.5 & >100 spikes; mua gate: isolation distance > 8 & ISI violations — ratio ≤ 0.2 **or** ≤ 0.5 % of ISIs < 1.5 ms) → **Phy export** with `copy_binary=False` (`params.py` points at `processed_binary/` — the >100 GB recording is not duplicated) → writes `quality_check_labels.csv` and pre-fills `cluster_group.tsv` with these threshold labels → **Phy auto-curation** ([step a](#step-a--phy-auto-curation-recluster--cut--label)): the units are reclustered, cut and labelled the way they are curated by hand, so they arrive in Phy pre-curated (`PHY_AUTOCURATE=0` keeps the threshold labels).
 7. **Cleanup** — everything deleted except `phy_export/` and `processed_binary/`.
 8. **Clock QC with automatic repair** (master level, after sorting every op) — `src/nwb/clock_qc.py <op> --auto` checks the behaviour clock against the ephys clock from the data (running speed vs theta amplitude and spike rate; see *Analysis Conventions*). On **FAIL** it re-times the op folder's video-clock files in place — `*framewise_seconds.csv`, `*framewise_ts.csv`, the coordinates' `Timestamp`, the tracker `.txt` (Sync Seconds, durations, speeds) and `.log` (UTC times) — but only if the repaired clock passes the same check; every original is copied once to `<op>/clock_repair_backup/` and the repair is logged in `clock_repair_backup/clock_repair.json`. A repaired session's NWB is then refreshed (step-4 end), so positions and trials carry the corrected clock; spikes and LFP are not touched. Repaired sessions are listed at the end of the step: outputs of steps 5 / v / b / m made before the repair are on the old clock, so re-run those steps for them (later steps of the same run already use the fix). A failure no repair can verify changes nothing and is listed for review (re-run step 2). Reports: `<op>/clock_qc/clock_qc.json`.
 
@@ -515,11 +516,58 @@ Output: `<op>/<stem>_<sorter>_sorting_output/`. Curate with `phy template-gui ph
 
 `channel = (NT − 1) × 4 + (ch − 1)`, NT 1–32, ch 1–4 → channels 0–127 (NT1 = 0–3, NT2 = 4–7, … NT32 = 124–127).
 
-### Step c — Continue After Sorting
+### Step a — Phy Auto-curation (recluster + cut + label)
 
-**Script:** `src/sorter/continue_sorting.py --output_folder <op> [--n_jobs 4] [--keep-intermediates]`
+**Script:** `src/sorter/phy_autocurate.py --output_folder <op|*_sorting_output|phy_export> [--redo] [--n_jobs 4]`. The same code also runs at the end of step 7's post-sorting, so a new sort arrives in Phy already curated; step a runs it again on exports that already exist.
 
-Re-runs the shared post-sorting stage (metrics, labels, Phy export, cleanup) on an existing `final_sorting_result/` + `processed_binary/` — for sorts that crashed *after* the sorting itself. Skips folders already finalized (only `phy_export` left). The "BombCell" in the menu label is `spikeinterface.curation.bombcell_label_units` used purely as the thresholding engine.
+Starting from the sorter's units (`spike_templates.npy`), each `phy_export` is curated the way it is done by hand in Phy:
+
+1. **Keep or recluster each unit** — the unit is labelled good / mua / noise as a whole, or reclustered with the phy_genzel `recluster_n` (Gaussian mixture on the unit's PC features, n = 2 or 4 — the exact computation of the Template GUI action, so `shift+alt+k` with the same n gives the same pieces, up to a few spikes).
+2. **Label each piece** good / mua / noise, or recluster it once more (n = 4). A split whose pieces all come out noise is undone (the unit is noise whole). Nothing is merged.
+3. **Interneurons** — a narrow waveform (CellExplorer trough-to-peak ≤ 0.425 ms) has its P(good) weighted ×1.5: fast-spiking interneurons are kept with more ISIs < 1.5 ms than a pyramidal cell may have (a 30 Hz interneuron with 1–3 % short ISIs is good; a 1 Hz pyramidal cell with 1 % is mua).
+4. **Unsorted** — a good call with confidence < 0.4 is left `unsorted` for you to decide.
+5. **Amplitude cut** — in every good cluster, spikes with |amplitude| > mean + 4 SD are split off as a separate noise cluster (amplitude artefacts).
+
+The decisions come from three random forests (unit decision, piece label, mua vs noise) fit at run time (seconds) on `src/sorter/phy_autocurate_data/` — one row per unit and per candidate piece of the curations listed in `training_datasets.tsv`, with the curator's decision derived from the final curation by spike overlap. The features are computed here, without phy: ISI violations (ratio / fraction), isolation distance and L-ratio (as SpikeInterface's), SNR and shape of the mean raw waveform, trough-to-peak and acg_tau_rise (CellExplorer), amplitude spread, presence and stability, and the same for the unit a piece comes from, its sibling pieces and the tetrode.
+
+**Written into `phy_export/`** (as Phy itself would save them): `spike_clusters.npy`, `cluster_group.tsv`, the `cluster_<metric>.tsv` columns (a piece inherits its unit's values, as on a split in Phy — step u recomputes them), two review columns `auto_conf` (model confidence) and `auto_step` (`asis`, `L1-n4`, `L2-n4`, `asis(split4-reverted)`, `…+amp4SD`), and `_auto_curation/` with `cutting_log.txt` / `.tsv` (every decision with its probabilities, every cut, the cluster ids), `units.tsv`, `amplitude_cuts.tsv`, `review_list.tsv` (unsorted and low-confidence clusters), `same_neuron_candidates.tsv` (good clusters cut from one unit that share a refractory period — cross-ISIs < 1.5 ms far below chance — so probably one neuron: merge them in Phy if the waveforms agree; nothing is merged for you) and `original/` (the step-7 metric files). Phy's cache in `.phy/` is cleared (the GUI layout is kept).
+
+**Checking it in Phy** — sort the cluster view by `auto_conf` to see the least certain calls first, or work through `review_list.tsv`; then run step u as before. Step u reads `cluster_group.tsv` as your curation, so check before step u.
+
+**Never overwrites a curation.** Step a skips a `phy_export` that was curated — by hand (splits/merges in `spike_clusters.npy`, labels that differ from the threshold labels, or label/split actions in `phy.log`) or by step a/7 (`_auto_curation/curation.json`). To curate it again from the sorter's units, pass `--redo` or set `AUTO_CURATE_REDO=1`: the current curation is first copied to `_auto_curation/backup_<YYYYMMDD_HHMMSS>/`. The recording (`processed_binary/`) is needed for the waveform features; ~0.5–2 min per recording with 6 jobs.
+
+| Setting (`hm_tracker_paths.txt`) | Default | Meaning |
+|---|---|---|
+| `PHY_AUTOCURATE` | 1 | 0 = step 7 leaves the threshold labels (no recluster / cut / label) |
+| `AUTO_CURATE_REDO` | 0 | 1 = step a backs up and redoes curated exports |
+| `AUTO_GOOD_MIN_CONF` | 0.4 | good calls below this confidence → unsorted (0 = never unsorted) |
+| `AUTO_GOOD_BOOST_NARROW` | 1.5 | weight on P(good) of narrow-waveform clusters (1 = same rule as pyramidal) |
+| `AUTO_SPLIT_BIAS` | 1 | > 1 reclusters more readily, < 1 less |
+| `AUTO_AMP_CUT_SD` | 4 | amplitude cut at mean + this × SD (0 = no cut) |
+| `AUTO_CURATE_JOBS` | 4 | parallel worker processes |
+
+**How well it agrees with manual curation** — leave-one-recording-out over the three curations it is trained on (fit on two, curate the third from its sorter units, compare with its curation). Good-cluster F1 = matching good clusters (Jaccard ≥ 0.5) on both sides; spike accuracy = same good/mua/noise label:
+
+| Held-out recording | Good F1 | Good recall | Good precision | Spike accuracy | Interneurons recall / precision | Pyramidal recall / precision | Unsorted |
+|---|---|---|---|---|---|---|---|
+| Rat6 op2 (curated from scratch) | 0.61 → **0.65** | 0.59 → 0.67 | 0.64 → 0.62 | 0.87 → 0.92 | 0.35 / 0.59 → 0.51 / 0.63 | 0.72 / 0.66 → 0.76 / 0.62 | 19 → 7 |
+| Rat5 op2 (checked) | 0.82 → **0.84** | 0.71 → 0.80 | 0.95 → 0.87 | 0.92 → 0.94 | 0.53 / 0.90 → 0.69 / 0.71 | 0.79 / 0.97 → 0.85 / 0.94 | 25 → 11 |
+| Rat5 op1 (checked) | 0.84 → **0.88** | 0.73 → 0.85 | 0.99 → 0.91 | 0.92 → 0.95 | 0.48 / 1.00 → 0.79 / 0.77 | 0.85 / 0.98 → 0.88 / 0.98 | 19 → 7 |
+| **mean** | 0.76 → **0.79** | 0.68 → 0.78 | 0.86 → 0.80 | 0.91 → 0.94 | 0.46 / 0.83 → 0.67 / 0.70 | 0.78 / 0.87 → 0.83 / 0.85 | 21 → 8 |
+
+Left of the arrow: one rule for all cells and an unsorted threshold of 0.5; right: the defaults (threshold 0.4, interneuron P(good) ×1.5). Tried and not kept (mean good F1): separate models for narrow and wide waveforms 0.74 (too few interneurons to train two models), a separate unsorted threshold for interneurons only 0.78, gradient boosting 0.73, extra trees 0.74, no second-level recluster 0.73, recluster more / less readily (split bias 1.3 / 0.8) 0.76 / 0.75, threshold 0.6 0.72; never unsorted (threshold 0) ties at 0.79 but gives you nothing flagged to check.
+
+Rat6 op2 was curated from scratch by hand; the two Rat5 curations are checked-and-corrected versions of an earlier automatic curation, so they are a little easier to agree with. Interneurons are the harder case: they hide in high-rate multi-unit clusters and are accepted with more short ISIs, which is what the narrow-waveform weighting is for.
+
+**Adding a curation (re-training)** — after checking a recording in Phy, add it to the training tables (an existing dataset of the same name is replaced; rows of the others are kept):
+
+```bash
+python src/sorter/phy_autocurate.py train --curated <phy_export> --names Rat7_20261201_op2 --cache <scratch folder>
+python src/sorter/phy_autocurate.py evaluate --curated <phy_export_1> <phy_export_2> <phy_export_3> \
+       --names A B C --cache <scratch folder>     # leave-one-recording-out agreement
+```
+
+`train` computes every candidate of every unit (the whole unit, its n = 2 and n = 4 pieces, and every piece ≥ 1000 spikes split again) once, into `--cache` (a few GB for a 5-h recording; delete it afterwards). Commit the three `phy_autocurate_data/*.tsv` files.
 
 ### Recompute Metrics after Phy curation (part 1 of step u, formerly step r)
 
@@ -527,7 +575,7 @@ Re-runs the shared post-sorting stage (metrics, labels, Phy export, cleanup) on 
 
 Recomputes all quality + template metrics on the **curated** sorting (loaded directly from `spike_times.npy` + `spike_clusters.npy` so manual splits/merges are honoured) and writes into `phy_export/`: `curated_quality_metrics.csv`, `curated_template_metrics.csv`, per-metric `cluster_<metric>.tsv` (visible as Phy columns), **`curated_templates.npy`** (+ unit/channel id files — Phy's own `templates.npy` is stale after merges).
 
-**Step u changes no label.** `cluster_group.tsv` — your manual good/mua/noise labels — is never touched; step u reads it as the human truth (`quality_label`) and falls back to the automated label only for units you did not label. The automated labels (`quality_check_labels.csv` → NWB `auto_quality_label`, and `cluster_auto_group.tsv`, the `auto_group` column in Phy) also stay as step 7/c wrote them, so a unit you made by a merge or split in Phy has no automated label (`unsorted`). Only the standalone `recompute_metrics.py` still rewrites the automated labels, as step r did.
+**Step u changes no label.** `cluster_group.tsv` — your manual good/mua/noise labels — is never touched; step u reads it as the human truth (`quality_label`) and falls back to the automated label only for units you did not label. The automated labels (`quality_check_labels.csv` → NWB `auto_quality_label`, and `cluster_auto_group.tsv`, the `auto_group` column in Phy) also stay as step 7 wrote them, so a unit you made by a merge or split in Phy has no automated label (`unsorted`). Only the standalone `recompute_metrics.py` still rewrites the automated labels, as step r did.
 
 Before computing, **duplicated spikes** are dropped from each unit: a spike ≤ 0.3 ms after the previous spike of the same unit (typically from merging two clusters that both caught it), keeping the first — the same rule the sorting pipeline uses. Step u drops exactly the same spikes from the NWB `spike_times`, so metrics and NWB describe the same spike trains. Phy's own files are not changed, so Phy's ISI view still shows those spikes in its first bin. **Redundant units** (two units where > 80 % of one's spikes coincide within 0.4 ms with the other's, after aligning template peaks) are only **reported**, never removed: `redundant_units.csv` (one row per pair, with `suggested_drop` = the unit the sorting pipeline's `minimum_shift` rule would drop) and a `redundant_with` column in Phy (`cluster_redundant_with.tsv`). Merge or delete them in Phy, then re-run step u.
 
@@ -957,7 +1005,7 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 
 `docs/` contains: `ERROR_REFERENCE.md` (exact error message → cause/fix), `TROUBLESHOOTING.md` (LED sync), `TROUBLESHOOTING_EPHYS.md` (sorting/LFP), `TROUBLESHOOTING_PIPELINE.md` (per-step), `TROUBLESHOOTING_SETUP.md` (env/config), `RecordingMeta_README.md`, and the experiment protocol.
 
-Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone), the step-8 backfill's stamp check (30 kHz stamps packaged at the rate the spikes imply, right stamps kept, unverifiable ones refused) and the GUI's session-tree presets and jobs panel, the quality check's ISI gate (ratio or fraction; needs spikeinterface ≥ 0.104 for the labelling part), and step u recomputing the curated metrics before it writes the units (stale quality metrics write nothing; an old `r` runs `u`). numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed, the GUI tests with PyQt6).
+Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone), the step-8 backfill's stamp check (30 kHz stamps packaged at the rate the spikes imply, right stamps kept, unverifiable ones refused) and the GUI's session-tree presets and jobs panel, the quality check's ISI gate (ratio or fraction; needs spikeinterface ≥ 0.104 for the labelling part), and step u recomputing the curated metrics before it writes the units (stale quality metrics write nothing; an old `r` runs `u`), the Phy auto-curation on a synthetic tetrode export (the recluster is deterministic, training targets follow the curated spikes, a curated folder is never overwritten without `--redo`, a full run writes a consistent curation; needs scikit-learn), and an old `c` being ignored while `a` runs the auto-curation. numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed, the GUI tests with PyQt6).
 
 Quick pointers:
 

@@ -12,7 +12,7 @@
 #   Behaviour (ported from both old runners):
 #     - Parallel steps (1 e 2 3 4 5 8 d n) run one background
 #       worker per ip*/op* pair, gated by a CPU/GPU/MEM monitor.
-#     - Sequential master steps (7 c r 9 w u) run afterwards, one
+#     - Sequential master steps (7 a 9 l u ...) run afterwards, one
 #       folder at a time, in that order.
 #     - Each parallel worker logs to <tmp>/hm_worker_<name>.log.
 #     - A missing tool (nvidia-smi, trodes, ...) never blocks the run.
@@ -63,8 +63,8 @@ MENU = [
     ("4", "Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)"),
     ("5", "Plotting"),
     ("6", "Compression (always runs LAST, over all op folders)"),
-    ("7", "Sorting + clock QC/repair"),
-    ("c", "Continue After Sorting (metrics + BombCell + Phy, no re-sort)"),
+    ("7", "Sorting + clock QC/repair (+ Phy auto-curation: recluster + cut + label)"),
+    ("a", "Auto-curate existing Phy exports (recluster + cut + label; skips curated ones)"),
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
     ("l", "Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
@@ -79,7 +79,7 @@ MENU = [
 
 # Sequential master-level steps, in execution order. Everything NOT in here is
 # a parallel worker step.
-SEQUENTIAL_STEPS = ["7", "c", "9", "l", "u", "v", "b", "m", "t"]
+SEQUENTIAL_STEPS = ["7", "a", "9", "l", "u", "v", "b", "m", "t"]
 
 # Tree mode (a root without ip* folders): these steps run per session, as parallel
 # jobs, in this order — l before v (the theta pages read the LFP), u before v/b/m
@@ -322,7 +322,7 @@ def session_pfx(folder):
 # ------------------------------------------------------------
 def run_worker(ip, op, steps, out):
     """Run the per-folder parallel steps for one ip/op pair, logging to `out`.
-    Sequential steps (7 c r 9 u ...) are handled at master level, not here."""
+    Sequential steps (7 a 9 u ...) are handled at master level, not here."""
     ip, op = Path(ip), Path(op)
     op.mkdir(parents=True, exist_ok=True)
     log(out, f"[INFO] Running steps [{steps}] for {ip}")
@@ -531,7 +531,7 @@ def clean_folder(target):
 #                 SEQUENTIAL (master) STEP RUNNERS
 # ------------------------------------------------------------
 def _run_per_op(label, tag, script, ops, config, extra_ip=None):
-    """Run a python step sequentially over every op folder (used by 7/c/l/u/v)."""
+    """Run a python step sequentially over every op folder (used by 7/a/l/u/v)."""
     print("\n" + "=" * 56)
     print(f"[MASTER] Running {label} sequentially...")
     print("=" * 56)
@@ -555,7 +555,7 @@ def _is_date_name(name):
 
 
 def sequential_targets(root, ops):
-    """Folder targets for the steps that don't need an ip folder (c/u/v). Besides
+    """Folder targets for the steps that don't need an ip folder (a/u/v). Besides
     the op* folders derived from ip*, include every op* folder in the root AND every
     session-date-named folder (YYYYMMDD) whose name ALSO appears in a file/subfolder
     inside it — i.e. the folder really belongs to that session (e.g. '20260629'
@@ -1158,6 +1158,14 @@ def main():
               "then write the units to the NWB). Running step u for 'r'.")
         selection = selection.replace("r", "" if "u" in selection else "u")
 
+    # Step [c] (continue after sorting) was removed. A sort that crashed before its
+    # Phy export has no phy_export/, so re-running step 7 sorts it again; the Phy
+    # auto-curation that now ends step 7 can be re-run on its own as step a.
+    if "c" in selection:
+        print("[STEPS] Step [c] (continue after sorting) was removed: re-run step 7 for a "
+              "recording whose sort crashed (it has no phy_export yet). Ignoring 'c'.")
+        selection = selection.replace("c", "")
+
     # Split the selection into sequential master steps and parallel worker steps.
     # Step 6 (compression) is special: it always runs LAST at master level over all
     # op folders, so pull it out of the parallel worker steps here.
@@ -1211,7 +1219,7 @@ def main():
             print(f"[TREE] Step(s) {' '.join(need_ip)} read the raw recordings (ip* folders) "
                   f"and are skipped here.")
     else:
-        # Targets for the ip-INDEPENDENT steps (c/u/v): op* folders + session-date
+        # Targets for the ip-INDEPENDENT steps (a/u/v): op* folders + session-date
         # folders whose name matches a file inside them. This lets those steps run on
         # session-named folders, not just op*.
         seq_ops = sequential_targets(root, ops)
@@ -1278,8 +1286,9 @@ def main():
     if has["7"]:
         _run_per_op("SORTING", "SORT", "./src/sorter/sorting.py", ops, config, extra_ip=True)
         clock_qc_after_sorting(ops)
-    if has["c"]:
-        _run_per_op("CONTINUE-AFTER-SORTING", "CONT", "./src/sorter/continue_sorting.py", seq_ops, config)
+    if has["a"]:
+        _run_per_op("AUTO-CURATION (recluster + cut + label the Phy exports)", "AUTO",
+                    "./src/sorter/phy_autocurate.py", seq_ops, config)
 
     if has["9"]:
         print("\n" + "=" * 56)

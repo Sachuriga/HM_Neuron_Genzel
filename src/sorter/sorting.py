@@ -370,10 +370,9 @@ from trodes_rec import find_rec_files, open_rec, SPLICED_GAPS  # noqa: E402  (.r
 LAST_SPLICED_GAPS = []   # set by open_raw_recording; see spliced_gaps.json
 
 
-# Post-sorting analysis (analyzer, metrics, quality-check labels, Phy export)
-# lives in sorter_common.py so it stays identical between the full pipeline and
-# continue_sorting.py. QUALITY_CHECK_THRESHOLDS / label_units_quality_check are
-# re-exported here for convenience/backwards-compatibility.
+# Post-sorting analysis (analyzer, metrics, quality-check labels, Phy export,
+# Phy auto-curation) lives in sorter_common.py. QUALITY_CHECK_THRESHOLDS /
+# label_units_quality_check are re-exported here for backwards-compatibility.
 from sorter_common import (  # noqa: E402
     QUALITY_CHECK_THRESHOLDS,
     label_units_quality_check,
@@ -815,8 +814,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     sorting.save(folder=final_output_folder)
     print(f"Sorting complete! Object saved to: {final_output_folder}")
 
-    # 7-10. Analyzer, metrics, quality-check labels, Phy export, cleanup — shared
-    #       with continue_sorting.py so both paths stay identical.
+    # 7-10. Analyzer, metrics, quality-check labels, Phy export, Phy auto-curation
+    #       (recluster + cut + label), cleanup — see sorter_common.analyze_and_export.
     analyze_and_export(
         sorting, rec_saved, output_dir,
         n_jobs=n_jobs, file_stem=file_stem, cleanup=True,

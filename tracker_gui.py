@@ -68,8 +68,9 @@ PRESETS = {
     "— Other —": "",
     "NWB packaging (nwb + units + visualise)": "wuv",
     "Analysis (decode / UMAP)": "nbm",
-    "Spike sorting (+ continue)": "7c",
-    "Full pipeline": "1234567c89wuvnbmt",
+    "Spike sorting (+ Phy auto-curation)": "7",
+    "Auto-curate existing Phy exports": "a",
+    "Full pipeline": "123456789wuvnbmt",
     # a root without ip* folders, e.g. the share's task folder: one job per session
     "— Session tree (e.g. the share) —": "",
     "Fix NWB LFP — check only (dry run)": "l",

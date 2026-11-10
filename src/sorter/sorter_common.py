@@ -1,14 +1,14 @@
 """
-Shared post-sorting helpers for sorting.py and continue_sorting.py.
+Shared post-sorting helpers for sorting.py (step 7) and step u.
 
-Keep the code that BOTH the full sorting pipeline and the continue-after-sorting
-script use in one place, so a change to the post-sorting analysis (metrics,
-quality-check labels, Phy export) only has to be made here.
+Keep the post-sorting analysis (metrics, quality-check labels, Phy export, Phy
+auto-curation) and the curated-metrics recompute in one place.
 
 Contents:
 - QUALITY_CHECK_THRESHOLDS   : the tetrode quality-check cutoffs.
 - label_units_quality_check  : good/mua/noise labeling from the quality metrics.
-- analyze_and_export         : analyzer -> metrics -> labels -> Phy -> cleanup.
+- analyze_and_export         : analyzer -> metrics -> labels -> Phy -> Phy
+                               auto-curation (phy_autocurate.py) -> cleanup.
 """
 
 import shutil
@@ -246,8 +246,8 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
                        cleanup=True, auto_curate=True):
     """Everything AFTER spike sorting: (optionally) auto-curate the clusters,
     build the SortingAnalyzer, compute metrics + quality-check labels, export to
-    Phy, and (optionally) clean up intermediates. Shared by the main pipeline
-    (process_single_file) and the continue-after-sorting script.
+    Phy, recluster + cut + label the Phy export (phy_autocurate.py; set
+    PHY_AUTOCURATE=0 to skip it) and (optionally) clean up intermediates.
 
     Set cleanup=False to keep the intermediate folders (e.g. when re-running
     only the post-sorting steps). Set auto_curate=False to skip the automatic
@@ -354,6 +354,11 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
         except Exception as e:
             print(f"[QC] Could not write label files ({e}).")
 
+    # 9c. PHY AUTO-CURATION — recluster + cut + label the exported units the way
+    #     they are curated by hand (models trained on our Phy curations, see
+    #     phy_autocurate.py). Best-effort: a failure leaves the plain export.
+    run_phy_autocuration(phy_output_folder, n_jobs=n_jobs)
+
     # 10. CLEANUP INTERMEDIATE FILES
     if cleanup:
         print("\nCleaning up intermediate files...")
@@ -376,6 +381,26 @@ def analyze_and_export(sorting, recording, output_dir, n_jobs=4, file_stem="",
 
     print(f"Done processing {file_stem}!")
     print(f"To open Phy, run:\nphy template-gui {phy_output_folder}/params.py\n")
+
+
+def run_phy_autocuration(phy_folder, n_jobs=4):
+    """Run phy_autocurate.py on a fresh Phy export, unless PHY_AUTOCURATE is
+    0/false/no/off in hm_tracker_paths.txt (the runner exports it). Never raises
+    into the sorting pipeline: on any failure the export stays as it is."""
+    import os
+    if os.environ.get("PHY_AUTOCURATE", "1").strip().lower() in ("0", "false", "no", "off"):
+        print("[autocurate] PHY_AUTOCURATE is off; the Phy export keeps the threshold labels.")
+        return None
+    try:
+        import phy_autocurate
+        return phy_autocurate.autocurate_phy_folder(
+            phy_folder, n_jobs=n_jobs, params=phy_autocurate.env_params(), reason="step 7")
+    except Exception as e:
+        import traceback
+        print(f"[autocurate] Phy auto-curation failed ({e}); the export keeps the "
+              f"threshold labels. Re-run it later with step a.")
+        traceback.print_exc()
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

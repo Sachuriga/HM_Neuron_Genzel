@@ -151,3 +151,25 @@ def test_old_step_r_runs_step_u(share, monkeypatch, typed, runs):
     runner.main()
     assert jobs["steps"] == runs
     assert "r" not in dict(runner.MENU) and "r" not in runner.SEQUENTIAL_STEPS
+
+
+def test_old_step_c_is_dropped_and_step_a_runs_the_autocuration(share, monkeypatch, capsys):
+    # step c (continue after sorting) is gone: an old "c" is ignored with a notice;
+    # step a runs the Phy auto-curation over the op/session targets
+    calls = []
+
+    def fake_run_per_op(label, tag, script, ops, config, extra_ip=None):
+        calls.append((tag, script, len(ops)))
+
+    monkeypatch.setattr(runner, "_run_per_op", fake_run_per_op)
+    monkeypatch.setattr(runner, "run_post_jobs", lambda *a, **k: [])
+    monkeypatch.setattr(runner, "load_config", lambda: "cfg.txt")
+    monkeypatch.setattr(sys, "argv", ["runner.py", str(share)])
+    monkeypatch.setenv("HM_STEPS", "ca")
+    monkeypatch.delenv("HM_SESSIONS_FILE", raising=False)
+    runner.main()
+    assert "Step [c]" in capsys.readouterr().out
+    assert [c[:2] for c in calls] == [("AUTO", "./src/sorter/phy_autocurate.py")]
+    assert calls[0][2] > 0                                # the session folders
+    assert "c" not in dict(runner.MENU) and "c" not in runner.SEQUENTIAL_STEPS
+    assert "a" in dict(runner.MENU) and "a" in runner.SEQUENTIAL_STEPS
