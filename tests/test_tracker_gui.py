@@ -98,3 +98,84 @@ def test_run_button_shows_running_then_idle(gui):
     assert not gui.spinner_timer.isActive() and gui.run_btn.icon().isNull()
     assert G.IDLE_GREEN in gui.run_btn.styleSheet()
     assert gui.windowTitle() == "Genzel Tracker"
+
+
+def test_every_runner_step_has_a_checkbox(gui):
+    menu_keys = [key for key, _ in G.MENU]
+    assert sorted(gui.checks) == sorted(menu_keys)
+    # each step is shown once, with the runner's full description as its tooltip
+    shown = [key for _, _, steps in G.grouped_steps() for key, _, _ in steps]
+    assert sorted(shown) == sorted(menu_keys)
+    assert dict(G.MENU)["7"] in gui.checks["7"].toolTip()
+
+
+def test_ticking_a_step_by_hand_shows_the_custom_preset(gui):
+    gui.preset.setCurrentText("Retrack")
+    assert gui._selection() == "3456d"
+    gui.checks["2"].setChecked(True)                      # the user's own choice now
+    assert gui.preset.currentText() == G.CUSTOM_PRESET
+    assert gui._selection() == "23456d"                   # ... and the ticks are kept
+
+    gui._untick_all()
+    assert gui._selection() == ""
+
+
+def test_dry_run_box_only_shows_with_step_l(gui):
+    gui.preset.setCurrentText("Retrack")
+    assert gui.lfp_dry_run.isHidden()
+    gui.preset.setCurrentText("Fix NWB LFP only (no figures)")
+    assert not gui.lfp_dry_run.isHidden()
+
+
+def test_data_root_is_recognised(gui, tmp_path):
+    classic = tmp_path / "classic"
+    (classic / "ip1").mkdir(parents=True)
+    tree = tmp_path / "tree"
+    (tree / "rat5" / "20260630").mkdir(parents=True)
+    assert G.describe_data_root("")[0] == "empty"
+    assert G.describe_data_root(str(tmp_path / "nowhere"))[0] == "missing"
+    assert G.describe_data_root(str(classic))[0] == "classic"
+    assert G.describe_data_root(str(tree))[0] == "tree"
+
+    # the Session tree card is only there for a tree root, and Run says what is missing
+    gui.preset.setCurrentText("Retrack")
+    gui.root_edit.setText(str(classic))
+    gui._check_root()
+    assert gui.tree_card.isHidden() and gui._problem() == ""
+    gui.root_edit.setText(str(tree))
+    gui._check_root()
+    assert not gui.tree_card.isHidden()
+    gui.root_edit.setText(str(tmp_path / "nowhere"))
+    gui._check_root()
+    assert "data-root" in gui._problem()
+
+
+def test_log_stays_put_when_scrolled_up(gui):
+    gui.show()
+    gui.log.clear()
+    gui._append("line\n" * 500)
+    bar = gui.log.verticalScrollBar()
+    assert bar.value() == bar.maximum()                   # at the bottom: it follows
+    bar.setValue(0)                                       # scrolled up to read something
+    gui._append("more\n" * 50)
+    assert bar.value() == 0
+
+
+def test_settings_are_remembered(tmp_path):
+    from PyQt6.QtCore import QSettings
+    app = QApplication.instance() or QApplication([])
+    store = str(tmp_path / "settings.ini")
+
+    first = G.TrackerGUI(QSettings(store, QSettings.Format.IniFormat))
+    first.root_edit.setText(str(tmp_path))
+    first._remember_root(str(tmp_path))
+    first.preset.setCurrentText("Retrack")
+    first.mem.setValue(50)
+    first.close()                                         # closing saves
+
+    second = G.TrackerGUI(QSettings(store, QSettings.Format.IniFormat))
+    assert second.root_edit.text() == str(tmp_path)
+    assert second.preset.currentText() == "Retrack" and second._selection() == "3456d"
+    assert second.mem.value() == 50
+    second.close()
+    del app

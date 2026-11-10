@@ -258,23 +258,36 @@ python runner.py "\\genzel.z.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\task"
 genzeltracker
 ```
 
-The Qt window imports the step menu straight from `runner.py` (GUI and CLI can never disagree), offers per-step checkboxes and one-click presets, then launches `runner.py` with `HM_STEPS` set:
+The Qt window imports the step menu straight from `runner.py` (GUI and CLI can never disagree) and launches `runner.py` with `HM_STEPS` set. Left half: what to run; right half: the session jobs and the log (drag the bar between them).
+
+- **Data** — the data root (type it, **Browse…**, drop a folder onto the window, or pick an earlier root from the drop-down) and the config file. The line below the root says what was found: `ip*` folders (ipN → opN pairs) or a session tree.
+- **Steps** — a preset, or tick the steps yourself (the preset then reads *Custom*). Steps are grouped and carry short names; hover a step for the runner's full description. Step l's *check only (dry run)* box appears while step l is ticked.
+- **Session tree** — only shown for a root without `ip*` folders (see below).
+- **Options** (folded) — the CPU / GPU / memory limits and *each worker in its own terminal window*.
+- **Run** (also Ctrl+Return; Cmd+Return on the Mac) / **Stop** (asks first). The line below says what Run will do, or what is still missing; when a run ends it shows the result and the taskbar / Dock icon flashes.
+- **Log** — follows the output only while you are at its bottom, so you can scroll up during a run; **Save log…** writes it to a file.
+
+The window remembers the folders, preset, options and its size between launches.
 
 | Preset | Steps |
 |---|---|
-| Tracker implanted | `12345678d` |
-| Tracker non-implanted | `23456d` |
-| After manual curation | `uvbm` |
-| Retrack | `346d` |
-| Full pipeline | `123456789uvnbmt` |
-| Trodes export (DIO + analog/IMU) | `1` |
-| Sync + stitch + track | `234` |
+| **Maze** | |
+| Tracker implanted (Video process + ephys) | `12345678d` |
+| Tracker non-implanted (Video process, no ephys) | `23456d` |
+| Retrack | `3456d` |
+| LED Sync + stitch + track | `234` |
+| After manual curation (Maze) | `wuvbm` |
+| **Sleep** | |
+| Prepare sleep scoring and spike sorting | `178` |
+| Prepare sleep scoring only | `18` |
+| Prepare spike sorting only | `17` |
+| After manual curation (Sleep) | `wu` |
+| **Other** | |
+| NWB packaging (nwb + units + visualise) | `wuv` |
+| Analysis (decode / UMAP) | `nbm` |
 | Spike sorting (+ Phy auto-curation) | `7` |
 | Auto-curate existing Phy exports | `a` |
-| LFP + motion + EMG (sleep) | `18` |
-| NWB units + visualise | `uv` |
-| Analysis (decode / UMAP) | `nbm` |
-| Drive scan (QC) | `t` |
+| Full pipeline | `123456789wuvnbmt` |
 | **Session tree (e.g. the share)** | |
 | Fix NWB LFP — check only (dry run) | `l` + step l dry run |
 | Fix NWB LFP only (no figures) | `l` |
@@ -282,7 +295,7 @@ The Qt window imports the step menu straight from `runner.py` (GUI and CLI can n
 | Remake figures (visualise / decode / plots / UMAP) | `vb5m` |
 | After manual curation (session tree) | `wuvb5m` |
 
-For a data root **without `ip*` folders** (e.g. the share's `task` folder) the runner works in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share). The window's **Session tree** row sets how many sessions run at once (`auto` or a number; it wins over `POST_JOBS` in the config) and whether step l only checks (dry run, nothing replaced); **Find sessions** lists the session folders it will process. **Only failed of a run…** takes a run's `summary.csv` (in `<tmp>/hm_post/<run time>/`) and limits the next Run to that run's sessions that are not `ok` (failed, interrupted, not started); **All sessions** goes back to every session below the data root. While it runs, the **Session jobs** panel shows the machine's load (CPU / RAM / GPU / network), a sessions-done bar (failed ones named) and each running job's step, time and memory; every session's full log is in the folder printed at the start. **Stop** also ends the processes the runner started (its current step, the session jobs); worker terminal windows keep running, as before.
+For a data root **without `ip*` folders** (e.g. the share's `task` folder) the runner works in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share). The **Session tree** card sets how many sessions run at once (`auto` or a number; it wins over `POST_JOBS` in the config); **Find sessions** lists the session folders it will process. **Only failed of a run…** takes a run's `summary.csv` (in `<tmp>/hm_post/<run time>/`) and limits the next Run to that run's sessions that are not `ok` (failed, interrupted, not started); **All sessions** goes back to every session below the data root. While it runs, the **Session jobs** panel shows the machine's load (CPU / RAM / GPU / network), a sessions-done bar (failed ones named) and each running job's step, time and memory; **Open logs folder** opens the folder with every session's full log. **Stop** also ends the processes the runner started (its current step, the session jobs); worker terminal windows keep running, as before.
 
 ### CLI
 
