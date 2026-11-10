@@ -393,12 +393,29 @@ def run_phy_autocuration(phy_folder, n_jobs=4):
         return None
     try:
         import phy_autocurate
+        n_jobs = int(os.environ.get("AUTO_CURATE_JOBS", "") or n_jobs)
         return phy_autocurate.autocurate_phy_folder(
             phy_folder, n_jobs=n_jobs, params=phy_autocurate.env_params(), reason="step 7")
     except Exception as e:
         import traceback
         print(f"[autocurate] Phy auto-curation failed ({e}); the export keeps the "
-              f"threshold labels. Re-run it later with step a.")
+              f"threshold labels. Re-running step 7 curates it (without sorting it again).")
+        traceback.print_exc()
+        return None
+
+
+def recurate_sorted_exports(output_folder, skip=()):
+    """Step 7 on the recordings it does not sort again (they have a phy_export):
+    curate each export under output_folder again from the sorter's units. Its
+    curation is replaced, with no backup (phy_autocurate.curate_sorted_exports;
+    AUTO_CURATE_REDO=0 leaves curated exports alone). `skip`: the exports step 7
+    has just made and curated. Never raises into the sorting pipeline."""
+    try:
+        import phy_autocurate
+        return phy_autocurate.curate_sorted_exports(output_folder, skip=skip)
+    except Exception as e:
+        import traceback
+        print(f"[autocurate] Could not curate the sorted Phy exports again ({e}).")
         traceback.print_exc()
         return None
 

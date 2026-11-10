@@ -87,7 +87,6 @@ PRESET_GROUPS = [
         "NWB packaging (nwb + units + visualise)": "wuv",
         "Analysis (decode / UMAP)": "nbm",
         "Spike sorting (+ Phy auto-curation)": "7",
-        "Auto-curate existing Phy exports": "a",
         "Full pipeline": "123456789wuvnbmt",
     }),
     # a root without ip* folders, e.g. the share's task folder: one job per session
@@ -130,7 +129,6 @@ STEP_GROUPS = [
     }),
     ("Ephys", 1, {
         "7": "Spike sorting (+ auto-curation)",
-        "a": "Auto-curate Phy exports",
         "8": "LFP + motion + EMG (sleep)",
         "l": "Rewrite NWB LFP",
     }),

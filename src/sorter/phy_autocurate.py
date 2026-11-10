@@ -25,15 +25,20 @@ candidate piece of the Phy curations listed in training_datasets.tsv, with the
 curator's decision derived from the final curation by spike overlap. Add a
 curation and re-train with `python phy_autocurate.py train --curated <phy_export> ...`.
 
-Runs as the last part of step 7's post-sorting (sorter_common.analyze_and_export,
-PHY_AUTOCURATE=0 turns it off) and as runner step 'a' on existing exports:
+Runs as part of step 7 (sorting.py): at the end of a new sort's post-sorting
+(sorter_common.analyze_and_export), and on the export of every recording step 7
+finds already sorted (curate_sorted_exports). PHY_AUTOCURATE=0 turns it off.
+On its own:
 
-    python phy_autocurate.py --output_folder <op|sorting_output|phy_export> [--redo] [--n_jobs 4]
+    python phy_autocurate.py --output_folder <op|sorting_output|phy_export> [--n_jobs 4]
 
-Step 'a' skips a phy_export that was already curated (by hand or by this
-script) unless --redo / AUTO_CURATE_REDO=1: the current curation is then backed
-up to _auto_curation/backup_<time>/ and the curation is redone from the sorter's
-units. Needs the recording (params.py dat_path / processed_binary/).
+A phy_export that was already curated (by hand or by this script) is curated
+again from the sorter's units and its curation is replaced; there is no backup.
+AUTO_CURATE_REDO=0 leaves curated exports alone instead (--redo overrides it).
+
+Needs only the export: the waveform features come from the sorter's templates
+(templates.npy) and the per-spike PC features, the noise level from the exported
+snr column; the recording (params.py dat_path) is read for its length only.
 
 numpy / scipy / pandas / scikit-learn only (no phy, no spikeinterface).
 """
@@ -65,9 +70,9 @@ GMM_MAX_DIMS = 10            # PCA dimensions before the mixture
 MIN_SPIKES_TO_SPLIT = 40     # smaller units are never reclustered
 L2_MIN_SPIKES = 1000         # smaller pieces are never reclustered again
 # ---- features ---------------------------------------------------------------
-N_WAVEFORM_SPIKES = 100      # raw spikes averaged per cluster (as the fork's cell type)
 N_ISOLATION_SPIKES = 500     # spikes per cluster in the isolation distance (as SI)
-N_NOISE_CHUNKS = 40          # 1-s chunks for the per-channel noise (MAD)
+N_NOISE_CHUNKS = 40          # 1-s chunks for the per-channel noise (MAD; only without an snr column)
+SHAPE_T_MS = np.arange(-0.6, 1.41, 0.1)   # where the template is sampled for the models (ms from the trough)
 ISI_THRESHOLD_MS = 1.5
 DUPLICATE_MS = 0.3
 N_TIME_BINS = 60
@@ -80,18 +85,29 @@ CLASSES_A = ("good", "mua", "noise", "split2", "split4")
 CLASSES_B = ("good", "mua", "noise", "split")
 LABELS = ("good", "mua", "noise")
 
+# The waveform: the unit's template (templates.npy, uV) on its best channel, around the
+# trough - shape metrics and the shape itself (template_features). A piece of a unit
+# shares its unit's template; how its own waveform differs is in the PC features.
+TEMPLATE_FEATS = [
+    "trough_to_peak", "wf_ptp_ratio2", "wf_pos_neg_ratio", "wf_flatness", "tpl_ptp",
+    "tpl_ptp_ratio4", "tpl_spread", "tpl_trough_hw", "tpl_after_hw", "tpl_before_ratio",
+    "tpl_after_ratio", "tpl_repol_slope", "tpl_recov_slope", "tpl_n_neg", "tpl_n_pos",
+    "tpl_energy_pre", "tpl_trough_pos",
+] + [f"tpl_s{i:02d}" for i, t in enumerate(SHAPE_T_MS) if abs(t) > 1e-9]   # the trough itself is -1
+# A piece in PC space (pc_features.npy), relative to the spike set it was cut from and
+# to its sibling pieces (pc_relative).
+PC_FEATS = ["pc_d_parent", "pc_d_sib", "pc_spread_rel", "pc_d_ch_max", "pc_d_ch_min"]
 UNIT_FEATS = [
     "snr_wf", "amp_iqr_rel", "amp_p90_rel", "log_n", "log_fr", "log_isr", "log_isf",
-    "log_iso", "log_lr", "trough_to_peak", "acg_tau_rise", "presence", "rate_cv",
+    "log_iso", "log_lr", "acg_tau_rise", "presence", "rate_cv",
     "top10_bins_frac", "isi_lt2", "isi_2_4", "isi_4_10", "isi_10_50", "refrac_contrast",
-    "wf_ptp_ratio2", "wf_pos_neg_ratio", "wf_flatness", "tet_max_snr", "tet_n_snr15",
-    "amp_rel_tetmax",
-]
+    "tet_max_snr", "tet_n_snr15", "amp_rel_tetmax",
+] + TEMPLATE_FEATS
 SUB_FEATS = UNIT_FEATS + [
     "n_frac", "amp_rel_unit", "amp_rank", "amp_rel_maxsib", "n_rank", "n_siblings",
     "u_snr", "u_log_isf", "u_log_fr", "u_log_n", "rel_isf", "rel_iso", "rel_snr",
     "rel_presence", "rel_lt2", "level",
-]
+] + PC_FEATS
 # Settings that can be changed per run (env / config file / CLI); defaults here.
 DEFAULT_PARAMS = {
     "good_min_conf": GOOD_MIN_CONF,
@@ -156,7 +172,7 @@ class PhyData:
 
     'unit' = an original sorter unit = a template id (spike_templates.npy)."""
 
-    def __init__(self, phy_dir, cache_dir=None, need_traces=True):
+    def __init__(self, phy_dir, cache_dir=None, need_traces=False):
         self.dir = Path(phy_dir)
         p = read_params(self.dir)
         self.fs = float(p["sample_rate"])
@@ -177,23 +193,39 @@ class PhyData:
         self.channel_groups = np.load(cg).reshape(-1) if cg.exists() else np.arange(n_ch) // 4
         self.n_spikes = len(self.spike_samples)
         self.traces = None
-        if need_traces:
+        self._dat = None
+        self.duration = float(self.spike_samples[-1]) / self.fs     # if the recording is gone
+        try:   # the recording: its length, and the noise if the export has no snr column
             dat = resolve_dat(self.dir, p["dat_path"])
             dtype = np.dtype(p.get("dtype", "int16"))
             offset = int(p.get("offset", 0))
             n_samples = (dat.stat().st_size - offset) // (n_ch * dtype.itemsize)
-            self.traces = np.memmap(dat, dtype=dtype, mode="r", offset=offset,
-                                    shape=(n_samples, n_ch))
+            self._dat = (dat, dtype, offset, n_samples)
             self.duration = n_samples / self.fs
-        else:
-            self.duration = float(self.spike_samples[-1]) / self.fs
+        except OSError:
+            pass
+        if need_traces:
+            self.open_traces()
         self._template_info()
         self._unit_spikes(cache_dir)
+        self.noise = noise_from_snr(self, cache_dir)
+
+    def open_traces(self):
+        """Memory-map the recording (needed only for the noise-level fallback)."""
+        if self.traces is None:
+            if self._dat is None:
+                raise FileNotFoundError(f"the recording of {self.dir} is not there")
+            dat, dtype, offset, n_samples = self._dat
+            self.traces = np.memmap(dat, dtype=dtype, mode="r", offset=offset,
+                                    shape=(n_samples, self.n_channels))
+        return self.traces
 
     def _template_info(self):
         """Per template: channels by decreasing amplitude (phylib's order), the
-        peak channel and its tetrode (channel group)."""
+        peak channel and its tetrode (channel group), the template on those
+        channels and its waveform features."""
         self.unit_channels, self.unit_peak = {}, {}
+        self.unit_template, self.unit_template_feats = {}, {}
         for t in range(self.templates.shape[0]):
             w = np.asarray(self.templates[t], dtype=np.float64)
             ch = np.asarray(self.template_ind[t]).astype(np.int64)
@@ -207,6 +239,8 @@ class PhyData:
             order = np.argsort(amp)[::-1]
             self.unit_channels[t] = ch[order]
             self.unit_peak[t] = int(ch[order][0]) if len(ch) else 0
+            self.unit_template[t] = w[:, order]
+            self.unit_template_feats[t] = template_features(w[:, order], self.fs)
         self.unit_tetrode = {t: int(self.channel_groups[c]) for t, c in self.unit_peak.items()}
 
     def _unit_spikes(self, cache_dir):
@@ -243,10 +277,101 @@ def get_data(phy_dir, cache_dir=None):
     return _DATA_CACHE[key]
 
 
+def _descendants(spike_templates, spike_clusters):
+    """{sorter unit: [(current cluster, n_spikes), ...]}."""
+    pairs, counts = np.unique(np.stack([spike_templates, spike_clusters], 1), axis=0,
+                              return_counts=True)
+    kids = {}
+    for (t, c), n in zip(pairs, counts):
+        kids.setdefault(int(t), []).append((int(c), int(n)))
+    return kids
+
+
+def unit_metric_values(phy_dir, metric, spike_templates):
+    """{sorter unit: value} of a step-7 cluster_<metric>.tsv column: from the
+    original file (_auto_curation/original/) when there is one, else from the
+    current one, where a unit split in Phy is read from its largest descendant
+    (a split inherits the value). Reads only."""
+    import pandas as pd
+    phy = Path(phy_dir)
+    f = phy / CURATION_DIR / "original" / f"cluster_{metric}.tsv"
+    current_file = not f.exists()
+    if current_file:
+        f = phy / f"cluster_{metric}.tsv"
+    if not f.exists():
+        return {}
+    try:
+        t = pd.read_csv(f, sep="\t")
+        vals = {int(c): float(v) for c, v in zip(t.iloc[:, 0], pd.to_numeric(t.iloc[:, 1], errors="coerce"))}
+    except Exception:
+        return {}
+    st = np.asarray(spike_templates, np.int64)
+    units = np.unique(st).tolist()
+    direct = {u: vals[u] for u in units if u in vals}
+    scp = phy / "spike_clusters.npy"
+    if not current_file or not scp.exists():
+        return direct
+    sc = np.load(scp, mmap_mode="r").reshape(-1)
+    if len(sc) != len(st) or np.array_equal(np.asarray(sc), st):
+        return direct
+    kids = _descendants(st, np.asarray(sc, np.int64))
+    current = set(np.unique(np.asarray(sc)).tolist())
+    out = {}
+    for u in units:
+        if u in vals and (u in current or not kids.get(u)):
+            out[u] = vals[u]
+            continue
+        for c, _n in sorted(kids.get(u, []), key=lambda x: -x[1]):
+            if c in vals:
+                out[u] = vals[c]
+                break
+    return out
+
+
+def noise_from_snr(data, cache_dir=None):
+    """Per-channel noise level (uV, as SpikeInterface's noise_levels) recovered
+    from the exported snr column: snr = |template extremum| / noise on the
+    extremum channel. A channel without a unit gets its tetrode's median, then
+    the recording's. Without an snr column the noise is measured on the
+    recording (MAD), if that is still there."""
+    n_ch = data.n_channels
+    snr = unit_metric_values(data.dir, "snr", data.spike_templates)
+    per = {}
+    for u, s in snr.items():
+        w = data.unit_template.get(u)
+        if w is None or w.size == 0 or not (np.isfinite(s) and s > 0):
+            continue
+        j = int(np.argmax(np.abs(w).max(0)))
+        amp = float(np.abs(w[:, j]).max())
+        if amp > 0:
+            per.setdefault(int(data.unit_channels[u][j]), []).append(amp / s)
+    if not per:
+        try:
+            return noise_levels(data, cache_dir)
+        except Exception as e:
+            log(f"{data.dir}: no snr column and no recording for the noise level ({e})")
+            return np.full(n_ch, np.nan)
+    noise = np.full(n_ch, np.nan)
+    for c, v in per.items():
+        if 0 <= c < n_ch:
+            noise[c] = float(np.median(v))
+    groups = np.asarray(data.channel_groups)
+    if len(groups) == n_ch:
+        for tet in np.unique(groups):
+            m = groups == tet
+            if np.isnan(noise[m]).any() and np.isfinite(noise[m]).any():
+                noise[m & np.isnan(noise)] = np.nanmedian(noise[m])
+    if np.isfinite(noise).any():
+        noise[np.isnan(noise)] = np.nanmedian(noise)
+    return noise
+
+
 def noise_levels(data, cache_dir=None):
-    """Per-channel noise, MAD / 0.6745 of the (filtered) recording, 40 x 1 s."""
+    """Per-channel noise, MAD / 0.6745 of the (filtered) recording, 40 x 1 s.
+    The fallback of noise_from_snr for an export without an snr column."""
     if cache_dir and (Path(cache_dir) / "noise.npy").exists():
         return np.load(Path(cache_dir) / "noise.npy")
+    data.open_traces()
     rng = np.random.default_rng(0)
     n = data.traces.shape[0]
     chunk = int(data.fs)
@@ -353,34 +478,147 @@ def gmm_split(data, spikes, unit, n_clusters):
     return remap[lab].astype(np.int8)
 
 
-def mean_waveform(data, spikes, channels, seed):
-    """Mean raw waveform (4 ms, the cluster's channels) of <= 100 spikes."""
-    if data.traces is None or len(spikes) == 0:
-        return None
-    half = int(round(ctm.WAVEFORM_WINDOW_S * data.fs / 2))
-    s = np.asarray(data.spike_samples[np.asarray(spikes)], dtype=np.int64)
-    s = s[(s >= half) & (s + half <= data.traces.shape[0])]
-    if len(s) == 0:
-        return None
-    s = np.sort(sample_spikes(s, N_WAVEFORM_SPIKES, seed))
-    acc = np.zeros((2 * half, len(channels)))
-    for t in s:
-        acc += np.asarray(data.traces[t - half:t + half], dtype=np.float64)[:, channels]
-    return acc / len(s)
+def template_features(w, fs):
+    """Waveform features of a mean waveform `w` (n_samples, n_channels; the
+    channels by decreasing amplitude; uV), on its best channel, around the
+    trough (a positive spike is flipped): CellExplorer's trough-to-peak, the
+    widths, the peaks before / after the trough, the slopes after it, the number
+    of peaks, baseline flatness, the energy before the spike, the trough's
+    position, the amplitude profile over the channels, and the shape itself
+    (SHAPE_T_MS samples, trough = -1)."""
+    from scipy.signal import find_peaks
+    f = dict.fromkeys(TEMPLATE_FEATS, np.nan)
+    w = np.asarray(w, np.float64)
+    if w.ndim != 2 or w.size == 0 or not np.all(np.isfinite(w)):
+        return f
+    ptp = w.max(0) - w.min(0)
+    b = int(np.argmax(ptp))
+    if ptp[b] <= 0:
+        return f
+    x = w[:, b]
+    n = len(x)
+    ms = 1000.0 / fs
+    t0 = int(np.argmax(np.abs(x)))
+    y = x if x[t0] < 0 else -x                   # the trough is negative
+    depth = float(-y[t0])
+    k05, k15 = int(round(0.5 / ms)), int(round(1.5 / ms))
+    f["trough_to_peak"] = ctm.trough_to_peak(y, fs, t0)
+    f["tpl_ptp"] = float(ptp[b])
+    f["wf_ptp_ratio2"] = float(np.sort(ptp)[-2] / ptp[b]) if len(ptp) > 1 else 0.0
+    f["tpl_ptp_ratio4"] = float(ptp.min() / ptp[b])
+    f["tpl_spread"] = float(np.sum(ptp >= 0.5 * ptp[b]))
+    f["wf_pos_neg_ratio"] = float(x.max() / max(-x.min(), 1e-9))
+    edge = np.r_[y[:max(t0 - k05, 0)], y[t0 + k15:]]
+    if len(edge) < 3:
+        edge = np.r_[y[:3], y[-3:]]
+    f["wf_flatness"] = float(np.std(edge) / ptp[b])
+    f["tpl_trough_pos"] = float((t0 - n / 2) * ms)
+    half = y[t0] / 2                             # the trough's width at half depth
+    lo = t0
+    while lo > 0 and y[lo] < half:
+        lo -= 1
+    hi = t0
+    while hi < n - 1 and y[hi] < half:
+        hi += 1
+    f["tpl_trough_hw"] = float((hi - lo) * ms)
+    before = y[max(t0 - k05, 0):t0]
+    f["tpl_before_ratio"] = float(before.max() / depth) if len(before) else 0.0
+    after = y[t0 + 1:t0 + k15 + 1]
+    if len(after):
+        ia = int(np.argmax(after))
+        pk = t0 + 1 + ia                         # the peak after the trough
+        f["tpl_after_ratio"] = float(after.max() / depth)
+        f["tpl_repol_slope"] = float((y[pk] - y[t0]) / (ia + 1) / ms / depth)
+        k = min(k05, n - 1 - pk)
+        if k >= 2:
+            f["tpl_recov_slope"] = float((y[pk + k] - y[pk]) / k / ms / depth)
+        if y[pk] > 0:
+            hl = y[pk] / 2
+            lo = pk
+            while lo > t0 and y[lo] > hl:
+                lo -= 1
+            hi = pk
+            while hi < n - 1 and y[hi] > hl:
+                hi += 1
+            f["tpl_after_hw"] = float((hi - lo) * ms)
+    prom = 0.1 * ptp[b]
+    f["tpl_n_neg"] = float(len(find_peaks(-y, prominence=prom)[0]))
+    f["tpl_n_pos"] = float(len(find_peaks(y, prominence=prom)[0]))
+    e = y ** 2
+    pre = e[max(t0 - int(round(0.75 / ms)), 0):max(t0 - int(round(0.25 / ms)), 0)]
+    f["tpl_energy_pre"] = float(pre.sum() / max(e.sum(), 1e-9))
+    idx = np.clip(np.round(t0 + SHAPE_T_MS / ms).astype(int), 0, n - 1)
+    for i, v in enumerate(y[idx] / depth):
+        f[f"tpl_s{i:02d}"] = float(v)
+    return f
+
+
+def pc_relative(x, parent, siblings, n_pcs):
+    """A piece's waveform in PC space, relative to the spike set it was cut from
+    (`parent`) and to its sibling pieces: pc_d_parent = Mahalanobis distance of
+    its mean from the parent's mean (parent covariance), pc_d_sib = the same to
+    the nearest sibling with the pooled covariance (a d'), pc_spread_rel = its
+    spread / the parent's, pc_d_ch_max / _min = the largest and smallest of the
+    per-channel distances from the parent (is the difference on one channel or
+    on all). Rows of `x`: (n_channels * n_pcs) PC features, channel-major."""
+    out = dict.fromkeys(PC_FEATS, np.nan)
+    x, parent = np.asarray(x, np.float64), np.asarray(parent, np.float64)
+    if len(x) < 5 or len(parent) < 10:
+        return out
+
+    def inv(c):
+        c = np.atleast_2d(c)
+        c = c + np.eye(len(c)) * (1e-6 * np.trace(c) / len(c) + 1e-12)
+        try:
+            return np.linalg.inv(c)
+        except np.linalg.LinAlgError:
+            return None
+
+    mu, pm = x.mean(0), parent.mean(0)
+    d = mu - pm
+    cov = np.cov(parent, rowvar=False)
+    vi = inv(cov)
+    if vi is None:
+        return out
+    out["pc_d_parent"] = float(np.sqrt(max(d @ vi @ d, 0.0)))
+    out["pc_spread_rel"] = float(np.sqrt(x.var(0).mean() / max(parent.var(0).mean(), 1e-12)))
+    per = []
+    for c in range(x.shape[1] // n_pcs):
+        sl = slice(c * n_pcs, (c + 1) * n_pcs)
+        vic = inv(cov[sl, sl])
+        if vic is not None:
+            per.append(float(np.sqrt(max(d[sl] @ vic @ d[sl], 0.0))))
+    if per:
+        out["pc_d_ch_max"], out["pc_d_ch_min"] = max(per), min(per)
+    cx = np.cov(x, rowvar=False) * (len(x) - 1)
+    best = np.nan
+    for s in siblings:
+        s = np.asarray(s, np.float64)
+        if len(s) < 5:
+            continue
+        vis = inv((cx + np.cov(s, rowvar=False) * (len(s) - 1)) / (len(x) + len(s) - 2))
+        if vis is None:
+            continue
+        dd = mu - s.mean(0)
+        v = float(np.sqrt(max(dd @ vis @ dd, 0.0)))
+        best = v if not np.isfinite(best) else min(best, v)
+    out["pc_d_sib"] = best
+    return out
 
 
 INTRINSIC_KEYS = (
     "n_spikes", "num_spikes", "fr", "isi_violations_ratio", "isi_violations_count",
     "isi_violations_fraction", "presence", "rate_cv", "top10_bins_frac", "isi_lt2", "isi_2_4",
     "isi_4_10", "isi_10_50", "isi_median_ms", "refrac_contrast", "amp_med", "amp_iqr_rel",
-    "amp_p90_rel", "trough_to_peak", "peak_channel", "wf_ptp", "wf_ptp_ratio2", "wf_trough",
-    "wf_peak_pos", "wf_pos_neg_ratio", "wf_flatness", "snr_wf", "acg_tau_rise",
-    "isolation_distance", "l_ratio")
+    "amp_p90_rel", "peak_channel", "wf_ptp", "snr_wf", "acg_tau_rise",
+    "isolation_distance", "l_ratio") + tuple(TEMPLATE_FEATS) + tuple(PC_FEATS)
 
 
-def intrinsic_features(data, spikes, unit, neighbors, key, noise):
+def intrinsic_features(data, spikes, unit, neighbors, key, noise, unit_amp_med=None):
     """Features of one spike set that do not depend on its siblings.
-    `neighbors`: spike arrays of the clusters it is compared with (isolation)."""
+    `neighbors`: spike arrays of the clusters it is compared with (isolation).
+    `unit_amp_med`: the median spike amplitude of the unit the set belongs to
+    (its template's amplitude is scaled by the set's own amplitude)."""
     spikes = np.asarray(spikes, dtype=np.int64)
     f = dict.fromkeys(INTRINSIC_KEYS, np.nan)
     f["n_spikes"] = len(spikes)
@@ -408,23 +646,14 @@ def intrinsic_features(data, spikes, unit, neighbors, key, noise):
         f.update(amp_med=med, amp_iqr_rel=(q75 - q25) / max(med, 1e-9),
                  amp_p90_rel=(q95 - q5) / max(med, 1e-9))
     channels = data.unit_channels[unit]
-    wf = mean_waveform(data, spikes, channels, seed_of(key, "wf"))
-    if wf is not None:
-        half = wf.shape[0] // 2
-        f["trough_to_peak"] = ctm.waveform_trough_to_peak(wf, data.fs, spike_index=half)
-        w = ctm.bandpass_filter(wf, data.fs, axis=0)
-        ptp = w.max(0) - w.min(0)
-        b = int(np.argmax(ptp))
-        f["peak_channel"] = int(channels[b])
-        f["wf_ptp"] = float(ptp[b])
-        f["wf_ptp_ratio2"] = float(np.sort(ptp)[-2] / max(ptp[b], 1e-9)) if len(ptp) > 1 else 0.0
-        f["wf_trough"] = float(w[half - 8:half + 8, b].min())
-        f["wf_peak_pos"] = float(w[:, b].max())
-        f["wf_pos_neg_ratio"] = float(w[:, b].max() / max(-w[:, b].min(), 1e-9))
-        edge = np.r_[w[:max(half - 25, 1), b], w[half + 30:, b]]
-        f["wf_flatness"] = float(np.std(edge) / max(ptp[b], 1e-9))
-        nz = noise[int(channels[b])] if noise is not None else np.nan
-        f["snr_wf"] = float(ptp[b] / nz) if np.isfinite(nz) and nz > 0 else np.nan
+    # the waveform: the unit's template, its amplitude scaled by this set's own
+    f.update(data.unit_template_feats.get(unit, {}))
+    scale = f["amp_med"] / unit_amp_med if unit_amp_med and np.isfinite(f["amp_med"]) else 1.0
+    f["peak_channel"] = int(channels[0]) if len(channels) else -1
+    f["wf_ptp"] = f["tpl_ptp"] * scale
+    nz = noise[int(channels[0])] if noise is not None and len(channels) else np.nan
+    f["snr_wf"] = float(f["wf_ptp"] / nz) if np.isfinite(nz) and nz > 0 and np.isfinite(f["wf_ptp"]) \
+        else np.nan
     f["acg_tau_rise"] = ctm.acg_tau_rise(t, data.fs) if len(t) > 1 else np.nan
     own = sample_spikes(spikes, N_ISOLATION_SPIKES, seed_of(key, "iso"))
     other = [sample_spikes(nb, N_ISOLATION_SPIKES, seed_of(key, "nb", i))
@@ -494,15 +723,18 @@ def _unit_task(phy_dir, cache_dir, unit, todo):
       'l2_all_min': int or None             recluster every piece >= this many spikes
     Returns dict(rows=[...], labels={n: int8 array}, l2_labels={(n, k): int8 array})."""
     data = get_data(phy_dir, cache_dir)
-    noise = noise_levels(data, cache_dir)
+    noise = data.noise
     spikes = data.spikes_of(unit)
     tet = data.unit_tetrode[unit]
     others = [data.spikes_of(v) for v in data.units_on_tetrode(tet) if v != unit]
+    uamp = float(np.median(np.abs(np.asarray(data.amplitudes[spikes], np.float64)))) if len(spikes) else 0.0
     out = {"rows": [], "labels": {}, "l2_labels": {}}
 
-    def row(key, sp, nbs, level, parent):
-        f = intrinsic_features(data, sp, unit, nbs, key, noise)
+    def row(key, sp, nbs, level, parent, extra=None):
+        f = intrinsic_features(data, sp, unit, nbs, key, noise, uamp)
         f.update(key=key, unit=unit, tetrode=tet, level=level, parent=parent)
+        if extra:
+            f.update(extra)
         out["rows"].append(f)
 
     if todo.get("whole"):
@@ -510,6 +742,8 @@ def _unit_task(phy_dir, cache_dir, unit, todo):
     if len(spikes) < MIN_SPIKES_TO_SPLIT:
         return out
     l2_min = todo.get("l2_all_min") or L2_MIN_SPIKES
+    X = pc_features(data, spikes, data.unit_channels[unit]) if todo.get("splits") else None
+    n_pcs = int(data.pc_features.shape[1])
     for n in todo.get("splits", []):
         if len(spikes) < 10 * n:
             continue
@@ -521,10 +755,12 @@ def _unit_task(phy_dir, cache_dir, unit, todo):
         if m < 2:
             continue
         pieces = [spikes[lab == k] for k in range(m)]
+        xs = [X[lab == k] for k in range(m)]
         if not todo.get("skip_piece_features"):
             for k in range(m):
                 sib = [pieces[j] for j in range(m) if j != k]
-                row(f"u{unit}/s{n}k{k}", pieces[k], sib + others, 1, f"u{unit}/s{n}")
+                row(f"u{unit}/s{n}k{k}", pieces[k], sib + others, 1, f"u{unit}/s{n}",
+                    pc_relative(xs[k], X, [xs[j] for j in range(m) if j != k], n_pcs))
         for k in range(m):
             asked = (n, k) in todo.get("l2", {})
             if not (asked or (todo.get("l2_all_min") and len(pieces[k]) >= l2_min)):
@@ -537,11 +773,13 @@ def _unit_task(phy_dir, cache_dir, unit, todo):
                 continue
             out["l2_labels"][(n, k)] = lab2
             kids = [pieces[k][lab2 == c] for c in range(m2)]
+            xk = [xs[k][lab2 == c] for c in range(m2)]
             sib1 = [pieces[j] for j in range(m) if j != k]
             for c in range(m2):
                 sib2 = [kids[j] for j in range(m2) if j != c]
                 row(f"u{unit}/s{n}k{k}/c{c}", kids[c], sib2 + sib1 + others, 2,
-                    f"u{unit}/s{n}k{k}")
+                    f"u{unit}/s{n}k{k}",
+                    pc_relative(xk[c], xs[k], [xk[j] for j in range(m2) if j != c], n_pcs))
     return out
 
 
@@ -567,7 +805,6 @@ def build_bank(phy_dir, cache_dir, n_jobs=1, l2_min=L2_MIN_SPIKES):
         return load_bank(cache)
     cache.mkdir(parents=True, exist_ok=True)
     data = get_data(phy_dir, cache)
-    noise_levels(data, cache)
     t0 = time.time()
     todos = {u: {"whole": True, "splits": [2, 4], "l2_all_min": l2_min} for u in data.units}
     res = run_tasks(phy_dir, cache, todos, n_jobs)
@@ -1021,20 +1258,6 @@ def folder_state(phy_dir):
     return "fresh"
 
 
-def _backup(phy, dest):
-    dest.mkdir(parents=True, exist_ok=True)
-    for f in ["spike_clusters.npy", "phy.log", "cluster_info.tsv"]:
-        if (phy / f).exists():
-            shutil.copy2(phy / f, dest / f)
-    for f in phy.glob("cluster_*.tsv"):
-        shutil.copy2(f, dest / f.name)
-    # .phy is a cache Phy rebuilds (it can be GBs): keep only the GUI state files
-    for f in ("state.json", "new_cluster_id.json"):
-        if (phy / ".phy" / f).exists():
-            (dest / "dot_phy").mkdir(exist_ok=True)
-            shutil.copy2(phy / ".phy" / f, dest / "dot_phy" / f)
-
-
 _NOT_METRIC_TSVS = {"cluster_group.tsv", "cluster_info.tsv", "cluster_auto_conf.tsv",
                     "cluster_auto_step.tsv"}
 
@@ -1285,7 +1508,7 @@ def _write_logs(cur, leaves, ids, labels, conf, step, parent, unit_rows, cuts, s
 # The step: one phy folder
 # =============================================================================
 def autocurate_phy_folder(phy_dir, n_jobs=4, redo=False, params=None, data_dir=DATA_DIR,
-                          reason="step a"):
+                          reason="phy_autocurate.py"):
     """Auto-curate one phy_export. Returns a short status string; never raises
     for a folder it skips."""
     import pandas as pd
@@ -1296,14 +1519,11 @@ def autocurate_phy_folder(phy_dir, n_jobs=4, redo=False, params=None, data_dir=D
     state = folder_state(phy)
     cur = phy / CURATION_DIR
     if state != "fresh" and not redo:
-        log(f"{phy}: already curated ({state}) - skipped (use --redo / AUTO_CURATE_REDO=1 "
-            f"to back it up and curate it again from the sorter's units)")
+        log(f"{phy}: already curated ({state}) - left alone (redo is off: AUTO_CURATE_REDO=0)")
         return f"skipped ({state})"
-    if state != "fresh":
-        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = cur / f"backup_{stamp}"
-        _backup(phy, dest)
-        log(f"{phy}: current curation ({state}) backed up to {dest}")
+    if state != "fresh":  # start again from the sorter's units; the old curation is replaced
+        log(f"{phy}: already curated ({state}) - curating it again from the sorter's units "
+            f"(its curation is replaced; no backup)")
         orig = cur / "original"
         if orig.exists():
             for f in phy.glob("cluster_*.tsv"):
@@ -1319,7 +1539,6 @@ def autocurate_phy_folder(phy_dir, n_jobs=4, redo=False, params=None, data_dir=D
     import tempfile
     tmp = Path(tempfile.mkdtemp(prefix="autocurate_"))  # per-unit spike lists for the workers
     data = get_data(phy, tmp)
-    noise_levels(data, tmp)
     # 1. whole units
     res = run_tasks(phy, tmp, {u: {"whole": True} for u in data.units}, n_jobs)
     rows = [r for u in data.units for r in res[u]["rows"]]
@@ -1402,6 +1621,35 @@ def find_phy_folders(output_folder):
     if not phys and (op / "phy_export" / "params.py").exists():
         phys = [op / "phy_export"]
     return phys
+
+
+def curate_sorted_exports(output_folder, skip=(), n_jobs=None):
+    """Step 7 on the recordings it does not sort again: curate the phy_export of
+    each one under output_folder again from the sorter's units (its curation is
+    replaced; no backup). `skip`: the exports step 7 has just made, which its
+    post-sorting has curated already. AUTO_CURATE_REDO=0 leaves curated exports
+    alone, PHY_AUTOCURATE=0 the whole step-7 auto-curation. Returns
+    {phy_export: status}; never raises for one export."""
+    if os.environ.get("PHY_AUTOCURATE", "1").strip().lower() in ("0", "false", "no", "off"):
+        log("PHY_AUTOCURATE is off; the sorted Phy exports are left as they are.")
+        return {}
+    done = {Path(p).resolve() for p in skip}
+    phys = [p for p in find_phy_folders(output_folder) if p.resolve() not in done]
+    if not phys:
+        return {}
+    redo = flag("AUTO_CURATE_REDO", default=True)
+    n_jobs = n_jobs or int(os.environ.get("AUTO_CURATE_JOBS", "4") or 4)
+    out = {}
+    for i, phy in enumerate(phys, 1):
+        log(f"[{i}/{len(phys)}] already sorted: {phy}")
+        try:
+            out[str(phy)] = autocurate_phy_folder(phy, n_jobs=n_jobs, redo=redo,
+                                                  params=env_params(), reason="step 7")
+        except Exception as e:
+            log(f"FAILED on {phy}: {e}")
+            traceback.print_exc()
+            out[str(phy)] = f"failed ({e})"
+    return out
 
 
 def env_params():
@@ -1518,7 +1766,8 @@ def main(argv=None):
     ap.add_argument("--output_folder", help="op folder (or *_sorting_output / phy_export)")
     ap.add_argument("--n_jobs", type=int, default=int(os.environ.get("AUTO_CURATE_JOBS", "4") or 4))
     ap.add_argument("--redo", action="store_true",
-                    help="back up an existing curation and curate again from the sorter's units")
+                    help="curate curated exports again even if AUTO_CURATE_REDO=0 (the default "
+                         "already does: the old curation is replaced)")
     ap.add_argument("--config", default=None, help=argparse.SUPPRESS)
     tr = sub.add_parser("train", help="build the training tables from curated phy folders")
     tr.add_argument("--curated", nargs="+", required=True)
@@ -1548,7 +1797,7 @@ def main(argv=None):
         return
     if not args.output_folder:
         ap.error("--output_folder is required")
-    redo = args.redo or flag("AUTO_CURATE_REDO")
+    redo = args.redo or flag("AUTO_CURATE_REDO", default=True)  # always redo (no backup)
     phys = find_phy_folders(args.output_folder)
     if not phys:
         log(f"no phy_export under {args.output_folder}")

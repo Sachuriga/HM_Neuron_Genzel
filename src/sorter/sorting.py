@@ -378,6 +378,7 @@ from sorter_common import (  # noqa: E402
     label_units_quality_check,
     analyze_and_export,
     attach_probe,
+    recurate_sorted_exports,
 )
 
 
@@ -461,6 +462,8 @@ def group_split_recordings(dat_files):
 #   delete the whole output folder before re-sorting, which silently threw that
 #   work away. The helpers below make step 7 skip sorted recordings by default,
 #   and keep a backup of phy_export when a re-sort is explicitly requested.
+#   Their Phy export is still auto-curated again at the end of step 7, which
+#   replaces its curation (recurate_sorted_exports; AUTO_CURATE_REDO=0 keeps it).
 # ---------------------------------------------------------------------------
 def sorting_output_dir(first_path, output_parent, sorter_name):
     """The output folder of one sort job: <recording>_<sorter>_sorting_output.
@@ -832,10 +835,13 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     `config` is the dict returned by load_sorting_config(); per-recording bad
     channels and reference channels are resolved from it by file stem.
 
-    Recordings that already have a phy_export are SKIPPED, so running step 7
-    again (e.g. after adding one new session to the folder) never touches
-    curated sorts. `resort=True` sorts them again; their old phy_export is
-    then moved to a dated backup folder first (see back_up_phy_export).
+    Recordings that already have a phy_export are not sorted again (e.g. after
+    adding one new session to the folder); instead, at the end, the Phy
+    auto-curation is run again on every export in output_data_folder that was
+    not just made, from the sorter's units, replacing its curation (no backup;
+    AUTO_CURATE_REDO=0 leaves them alone). `resort=True` sorts them again; their
+    old phy_export is then moved to a dated backup folder first (see
+    back_up_phy_export).
     """
     config = config or {}
     sorter_name = resolve_sorter(config)
@@ -854,6 +860,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
 
     if not dat_files:
         print(f"No .rec files (or *.raw/*_group0.dat exports) found under '{base_data_folder}'.")
+        recurate_sorted_exports(output_path)        # sorted earlier: curate their exports again
         return
 
     # Split parts of the same phase (..._post + ..._post2) are concatenated and
@@ -863,6 +870,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     print(f"Found {len(dat_files)} recording(s) -> {len(groups)} sort job(s)"
           + (f" ({n_concat} multi-part phase(s) will be concatenated)." if n_concat else "."))
 
+    just_sorted = []   # their exports were curated by the post-sorting already
     for i, group in enumerate(groups, 1):
         first = group[0]
         name = _recording_name(first)
@@ -872,17 +880,19 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
         print(f"Job {i}/{len(groups)}: {label}")
         print(f"{'='*60}")
 
-        # Already sorted? Then leave it alone unless a re-sort was asked for.
+        # Already sorted? Then don't sort it again unless a re-sort was asked for.
         output_dir = sorting_output_dir(first, output_path, sorter_name)
         if has_phy_export(output_dir) and not resort:
-            print(f"Already sorted: {output_dir.name}/phy_export exists — skipping, "
-                  f"so any Phy curation is kept.")
+            print(f"Already sorted: {output_dir.name}/phy_export exists — not sorted again. "
+                  f"Its Phy export is auto-curated again at the end of step 7, which replaces "
+                  f"its curation (AUTO_CURATE_REDO=0 keeps it).")
             print("To sort it again, set RESORT=1 in hm_tracker_paths.txt (or pass "
                   "--resort); the old phy_export is then backed up, not deleted.")
             continue
 
         bad_channel_ids, ref_channels, eeg_channel_ids = resolve_rat_settings(
             first.stem, config)
+        just_sorted.append(output_dir / "phy_export")
         try:
             process_single_file(
                 file_path=group,                      # single-item or multi-part list
@@ -898,6 +908,9 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
             print(f"Error processing {first.name}:\n{e}")
             traceback.print_exc()
             print("Skipping to next job...")
+
+    # The recordings that were sorted earlier: curate their Phy exports again.
+    recurate_sorted_exports(output_path, skip=just_sorted)
 
 
 # =========================================================

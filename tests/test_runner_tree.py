@@ -153,23 +153,26 @@ def test_old_step_r_runs_step_u(share, monkeypatch, typed, runs):
     assert "r" not in dict(runner.MENU) and "r" not in runner.SEQUENTIAL_STEPS
 
 
-def test_old_step_c_is_dropped_and_step_a_runs_the_autocuration(share, monkeypatch, capsys):
+def test_old_steps_c_and_a_are_retired(tmp_path, monkeypatch, capsys):
     # step c (continue after sorting) is gone: an old "c" is ignored with a notice;
-    # step a runs the Phy auto-curation over the op/session targets
+    # step a is part of step 7 now (sorting.py curates the exports of the recordings
+    # it does not sort again): an old "a" runs step 7
+    for d in ("ip1", "op1"):
+        (tmp_path / d).mkdir()
     calls = []
 
     def fake_run_per_op(label, tag, script, ops, config, extra_ip=None):
         calls.append((tag, script, len(ops)))
 
     monkeypatch.setattr(runner, "_run_per_op", fake_run_per_op)
-    monkeypatch.setattr(runner, "run_post_jobs", lambda *a, **k: [])
+    monkeypatch.setattr(runner, "clock_qc_after_sorting", lambda ops: None)
     monkeypatch.setattr(runner, "load_config", lambda: "cfg.txt")
-    monkeypatch.setattr(sys, "argv", ["runner.py", str(share)])
+    monkeypatch.setattr(sys, "argv", ["runner.py", str(tmp_path)])
     monkeypatch.setenv("HM_STEPS", "ca")
     monkeypatch.delenv("HM_SESSIONS_FILE", raising=False)
     runner.main()
-    assert "Step [c]" in capsys.readouterr().out
-    assert [c[:2] for c in calls] == [("AUTO", "./src/sorter/phy_autocurate.py")]
-    assert calls[0][2] > 0                                # the session folders
-    assert "c" not in dict(runner.MENU) and "c" not in runner.SEQUENTIAL_STEPS
-    assert "a" in dict(runner.MENU) and "a" in runner.SEQUENTIAL_STEPS
+    out = capsys.readouterr().out
+    assert "Step [c]" in out and "Step [a] is now part of step 7" in out
+    assert calls == [("SORT", "./src/sorter/sorting.py", 1)]
+    for key in "ca":
+        assert key not in dict(runner.MENU) and key not in runner.SEQUENTIAL_STEPS

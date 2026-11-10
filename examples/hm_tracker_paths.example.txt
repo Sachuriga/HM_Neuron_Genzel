@@ -78,13 +78,16 @@ NWB_RAT_NR=1
 #
 # RESORT           : 1 = sort recordings again even if they already have a
 #                    phy_export (the old phy_export is backed up first).
-#                    0 / omitted = skip them, so Phy curation is never lost.  [0]
+#                    0 / omitted = don't sort them again (their Phy export is
+#                    still auto-curated again; see AUTO_CURATE_REDO).        [0]
 #
-# Phy auto-curation (end of menu [7], and menu [a] on existing exports):
-# PHY_AUTOCURATE     : 0 = step 7 leaves the Phy export with the threshold
-#                      labels (no recluster / cut / label).                  [1]
-# AUTO_CURATE_REDO   : 1 = step a backs up a curated phy_export and curates it
-#                      again from the sorter's units (default: skip it).    [0]
+# Phy auto-curation (part of menu [7]):
+# PHY_AUTOCURATE     : 0 = no auto-curation in step 7: a new sort keeps the
+#                      threshold labels, sorted ones are left as they are.   [1]
+# AUTO_CURATE_REDO   : 1 = step 7 curates the phy_export of a recording it does
+#                      not sort again from the sorter's units, replacing its
+#                      curation (hand-curated or checked; no backup);
+#                      0 = leave curated exports alone.                      [1]
 # AUTO_GOOD_MIN_CONF : a 'good' call below this confidence is left unsorted. [0.4]
 # AUTO_GOOD_BOOST_NARROW : P(good) weight for narrow waveforms (interneurons,
 #                      which keep more short ISIs); 1 = same rule as pyramidal. [1.5]

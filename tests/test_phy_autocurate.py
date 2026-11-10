@@ -1,6 +1,8 @@
 """Phy auto-curation (src/sorter/phy_autocurate.py) on a small synthetic Phy export:
 the recluster replica is deterministic, the training targets follow the curated
-spikes, a curated folder is never overwritten without --redo, and a full run writes
+spikes, a curated folder is left alone without a redo and curated again from the
+sorter's units with one (the default of step 7 and the CLI; AUTO_CURATE_REDO=0 opts
+out; no backup), step 7 curates the exports it does not sort again, and a full run writes
 a consistent curation (every spike in one cluster, the pieces inherit their unit's
 metric values, the amplitude cut, Phy's cache cleared)."""
 import json
@@ -152,6 +154,37 @@ def test_a_curated_folder_is_not_overwritten_without_redo(tmp_path):
     assert pa.folder_state(phy) == "manual"                            # a label saved in Phy
 
 
+def test_the_cli_redoes_curated_folders_by_default(tmp_path, monkeypatch):
+    make_phy(tmp_path / "phy")
+    seen = []
+    monkeypatch.setattr(pa, "autocurate_phy_folder", lambda phy, **kw: seen.append(kw["redo"]))
+    monkeypatch.delenv("AUTO_CURATE_REDO", raising=False)
+    pa.main(["--output_folder", str(tmp_path / "phy")])                # the default: redo
+    monkeypatch.setenv("AUTO_CURATE_REDO", "0")                        # opt out: skip curated
+    pa.main(["--output_folder", str(tmp_path / "phy")])
+    pa.main(["--output_folder", str(tmp_path / "phy"), "--redo"])
+    assert seen == [True, False, True]
+
+
+def test_step_7_curates_the_exports_it_does_not_sort_again(tmp_path, monkeypatch):
+    op = tmp_path / "op"
+    for name in ("A", "B"):
+        make_phy(op / f"{name}_sorting_output" / "phy_export")
+    seen = []
+    monkeypatch.setattr(pa, "autocurate_phy_folder",
+                        lambda phy, **kw: seen.append((Path(phy).parent.name, kw["redo"])) or "curated")
+    for name in ("AUTO_CURATE_REDO", "PHY_AUTOCURATE"):
+        monkeypatch.delenv(name, raising=False)
+    just_sorted = [op / "A_sorting_output" / "phy_export"]             # curated by its post-sorting
+    assert len(pa.curate_sorted_exports(op, skip=just_sorted)) == 1
+    assert seen == [("B_sorting_output", True)]
+    monkeypatch.setenv("AUTO_CURATE_REDO", "0")                        # keep the curations
+    pa.curate_sorted_exports(op, skip=just_sorted)
+    assert seen[-1] == ("B_sorting_output", False)
+    monkeypatch.setenv("PHY_AUTOCURATE", "0")                          # no auto-curation at all
+    assert pa.curate_sorted_exports(op) == {} and len(seen) == 2
+
+
 def test_a_full_run_writes_a_consistent_curation(tmp_path):
     rng = np.random.default_rng(1)
     make_phy(tmp_path / "phy")
@@ -191,12 +224,17 @@ def test_a_full_run_writes_a_consistent_curation(tmp_path):
     for c in groups[groups.group == "good"].cluster_id:
         a = amp[sc == c]
         assert len(a) > 0
-    # a second run leaves the curated folder alone; --redo backs it up and redoes it
+    # without a redo, a second run leaves the curated folder alone. A redo starts
+    # again from the sorter's units: a change made in Phy since is replaced, with no
+    # backup, and the result is the same (deterministic)
+    edited = sc.copy()
+    edited[:5] = sc.max() + 1                                          # a split made in Phy
+    np.save(phy / "spike_clusters.npy", edited)
     assert pa.autocurate_phy_folder(phy, n_jobs=1, data_dir=tmp_path / "train").startswith("skipped")
     again = pa.autocurate_phy_folder(phy, n_jobs=1, redo=True, data_dir=tmp_path / "train")
     assert again.startswith("curated")
-    assert np.array_equal(np.load(phy / "spike_clusters.npy"), sc)     # deterministic
-    assert any(p.name.startswith("backup_") for p in cur.iterdir())
+    assert np.array_equal(np.load(phy / "spike_clusters.npy"), sc)
+    assert not any(p.name.startswith("backup") for p in cur.iterdir())
 
 
 def test_same_neuron_pairs_flags_pieces_of_one_refractory_train():
