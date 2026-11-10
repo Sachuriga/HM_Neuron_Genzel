@@ -774,8 +774,9 @@ def _X(rows, feats):
 def load_training_tables(data_dir=DATA_DIR, exclude=()):
     import pandas as pd
     data_dir = Path(data_dir)
-    u = pd.read_csv(data_dir / "training_units.tsv", sep="\t")
-    p = pd.read_csv(data_dir / "training_pieces.tsv", sep="\t")
+    # round_trip: exact floats, so `train` rewrites the rows it keeps unchanged
+    u = pd.read_csv(data_dir / "training_units.tsv", sep="\t", float_precision="round_trip")
+    p = pd.read_csv(data_dir / "training_pieces.tsv", sep="\t", float_precision="round_trip")
     if exclude:
         u, p = u[~u.dataset.isin(exclude)], p[~p.dataset.isin(exclude)]
     return u, p
