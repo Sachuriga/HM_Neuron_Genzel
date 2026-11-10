@@ -559,18 +559,20 @@ The decisions come from three random forests (unit decision, piece label, mua vs
 | `AUTO_AMP_CUT_SD` | 4 | amplitude cut at mean + this × SD (0 = no cut) |
 | `AUTO_CURATE_JOBS` | 4 | parallel worker processes |
 
-**How well it agrees with manual curation** — leave-one-recording-out over the three curations it is trained on (fit on two, curate the third from its sorter units, compare with its curation). Good-cluster F1 = matching good clusters (Jaccard ≥ 0.5) on both sides; spike accuracy = same good/mua/noise label:
+**How well it agrees with manual curation** — leave-one-recording-out over the four curations it is trained on (fit on three, curate the fourth from its sorter units, compare with its curation; Rat6 op1 is also compared with a hand curation of the same recording made from scratch the day before). Good-cluster F1 = matching good clusters (Jaccard ≥ 0.5) on both sides; spike accuracy = same good/mua/noise label:
 
 | Held-out recording | Good F1 | Good recall | Good precision | Spike accuracy | Interneurons recall / precision | Pyramidal recall / precision | Unsorted |
 |---|---|---|---|---|---|---|---|
-| Rat6 op2 (curated from scratch) | 0.61 → **0.65** | 0.59 → 0.67 | 0.64 → 0.62 | 0.87 → 0.92 | 0.35 / 0.59 → 0.51 / 0.63 | 0.72 / 0.66 → 0.76 / 0.62 | 19 → 7 |
-| Rat5 op2 (checked) | 0.82 → **0.84** | 0.71 → 0.80 | 0.95 → 0.87 | 0.92 → 0.94 | 0.53 / 0.90 → 0.69 / 0.71 | 0.79 / 0.97 → 0.85 / 0.94 | 25 → 11 |
-| Rat5 op1 (checked) | 0.84 → **0.88** | 0.73 → 0.85 | 0.99 → 0.91 | 0.92 → 0.95 | 0.48 / 1.00 → 0.79 / 0.77 | 0.85 / 0.98 → 0.88 / 0.98 | 19 → 7 |
-| **mean** | 0.76 → **0.79** | 0.68 → 0.78 | 0.86 → 0.80 | 0.91 → 0.94 | 0.46 / 0.83 → 0.67 / 0.70 | 0.78 / 0.87 → 0.83 / 0.85 | 21 → 8 |
+| Rat6 op2 (curated from scratch) | 0.63 → **0.66** | 0.62 → 0.68 | 0.65 → 0.65 | 0.89 → 0.91 | 0.43 / 0.70 → 0.54 / 0.71 | 0.72 / 0.64 → 0.76 / 0.62 | 18 → 7 |
+| Rat5 op2 (checked) | 0.79 → **0.81** | 0.70 → 0.77 | 0.92 → 0.85 | 0.94 → 0.94 | 0.56 / 0.90 → 0.66 / 0.72 | 0.75 / 0.92 → 0.81 / 0.90 | 23 → 10 |
+| Rat5 op1 (checked) | 0.85 → **0.83** | 0.77 → 0.83 | 0.95 → 0.84 | 0.93 → 0.92 | 0.55 / 0.89 → 0.72 / 0.66 | 0.86 / 0.97 → 0.88 / 0.93 | 14 → 4 |
+| Rat6 op1 (checked) | 0.90 → **0.97** | 0.81 → 0.95 | 1.00 → 1.00 | 0.96 → 0.98 | 0.79 / 1.00 → 0.97 / 1.00 | 0.82 / 1.00 → 0.94 / 1.00 | 15 → 2 |
+| Rat6 op1, vs the hand curation of 9 Nov (from scratch) | 0.62 → **0.62** | 0.69 → 0.75 | 0.57 → 0.53 | 0.88 → 0.89 | 0.65 / 0.63 → 0.69 / 0.55 | 0.71 / 0.54 → 0.79 / 0.52 | 15 → 2 |
+| **mean of the 4** | 0.79 → **0.82** | 0.72 → 0.81 | 0.88 → 0.83 | 0.93 → 0.94 | 0.58 / 0.87 → 0.72 / 0.77 | 0.79 / 0.88 → 0.85 / 0.86 | 18 → 6 |
 
-Left of the arrow: one rule for all cells and an unsorted threshold of 0.5; right: the defaults (threshold 0.4, interneuron P(good) ×1.5). Tried and not kept (mean good F1): separate models for narrow and wide waveforms 0.74 (too few interneurons to train two models), a separate unsorted threshold for interneurons only 0.78, gradient boosting 0.73, extra trees 0.74, no second-level recluster 0.73, recluster more / less readily (split bias 1.3 / 0.8) 0.76 / 0.75, threshold 0.6 0.72; never unsorted (threshold 0) ties at 0.79 but gives you nothing flagged to check.
+Left of the arrow: one rule for all cells and an unsorted threshold of 0.5; right: the defaults (threshold 0.4, interneuron P(good) ×1.5). With four recordings the alternatives tie with the defaults (mean good F1 0.817–0.824 against 0.820, and 0.64–0.65 against 0.64 on the two from-scratch curations): no interneuron weighting 0.82 (fewer interneurons found, fewer false ones — interneuron recall / precision 0.68 / 0.83 against 0.72 / 0.77; a false good is one key press in Phy, a missed cell has to be cut out again, so the weighting stays), never unsorted (threshold 0) 0.82 but nothing flagged to check, threshold 0.3 0.82, recluster more / less readily (split bias 1.3 / 0.8) 0.82 / 0.82, interneurons reclustered more readily 0.82. Worse: threshold 0.5 0.81, interneuron weight ×2 0.81, separate models for narrow and wide waveforms 0.79; with three recordings also gradient boosting 0.73, extra trees 0.74, no second-level recluster 0.73, threshold 0.6 0.72.
 
-Rat6 op2 was curated from scratch by hand; the two Rat5 curations are checked-and-corrected versions of an earlier automatic curation, so they are a little easier to agree with. Interneurons are the harder case: they hide in high-rate multi-unit clusters and are accepted with more short ISIs, which is what the narrow-waveform weighting is for.
+Rat6 op2 was curated from scratch by hand; the other three are automatic curations checked and corrected in Phy, and a checker keeps most of what is there (Rat6 op1: 400 of the 418 clusters kept as they were), so agreement with them is optimistic. The honest test is a curation made from scratch: on Rat6 op1 the hand curation of 9 Nov and the checked one of 10 Nov — same curator, same recording — agree with each other at good F1 0.61, about as well as the auto-curation agrees with the hand one (0.62); most of the difference is borderline clusters labelled differently and good cells cut into more or fewer pieces. Interneurons are the harder case: they hide in high-rate multi-unit clusters and are accepted with more short ISIs, which is what the narrow-waveform weighting is for.
 
 **Adding a curation (re-training)** — after checking a recording in Phy, add it to the training tables (an existing dataset of the same name is replaced; rows of the others are kept):
 
