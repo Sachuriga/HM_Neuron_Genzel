@@ -157,7 +157,9 @@ def _main(cli_args):
         # the winners finished and left sessions idle. --dry_run takes no slot.
         keeper = contextlib.nullcontext(True) if cli_args.dry_run else gpuslot.hold()
         with keeper:
-            command = make_command(path, crop_x=104, crop_y=91, dur=cli_args.duration, quiet=True,
+            # -cx / -cy were parsed but never used (the defaults were hard-coded here)
+            command = make_command(path, crop_x=cli_args.cx, crop_y=cli_args.cy,
+                                   dur=cli_args.duration, quiet=True,
                                    glob=cli_args.glob, n_videos=cli_args.n_videos, encoder=encoder)
 
             if not command:

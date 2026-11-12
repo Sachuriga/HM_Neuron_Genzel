@@ -558,3 +558,216 @@ def test_compare_curations_scores_good_clusters():
     assert (d["u_good"], d["u_found"], d["u_fragmented"]) == (2, 1, 1)
     assert (d["p_good"], d["p_right"], d["p_fragment_of_good"]) == (4, 1, 3)
     assert pa.spike_scores(pred, labels, user, user_labels)["sp_recall_good"] == 1.0
+
+
+def test_an_automatic_curation_checked_in_phy_is_learned_from(tmp_path):
+    rng = np.random.default_rng(0)
+    training_tables(tmp_path / "train", rng)
+    phy = tmp_path / "phy"
+    make_phy(phy)
+    assert pa.autocurate_phy_folder(phy, n_jobs=1, data_dir=tmp_path / "train").startswith("curated")
+    cur = phy / pa.CURATION_DIR
+    cut = pd.read_csv(cur / "cutting_log.tsv", sep="\t", keep_default_na=False)
+    pieces = cut[cut.unit == 0]
+    n = int(pieces.path.iloc[0][1:].split("k")[0])
+    # its cuts, as actions: the recluster of unit 0 (pieces in component order), the amplitude cuts
+    auto = pa.auto_lineage(phy)
+    recl = [a for a in auto["actions"] if a["kind"] == "recluster_n"]
+    assert [(a["parents"], a["children"], a["n"]) for a in recl] == [([0], list(pieces.cluster), n)]
+    amp = pd.read_csv(cur / "amplitude_cuts.tsv", sep="\t") if (cur / "amplitude_cuts.tsv").exists() else []
+    assert [a["children"] for a in auto["actions"] if a["kind"] == "amp_cut"] == \
+        [[r.noise_id, r.good_id] for r in (amp.itertuples() if len(amp) else [])]
+    groups = pd.read_csv(phy / "cluster_group.tsv", sep="\t")
+    assert {c: g for c, g in auto["groups"].items() if g in pa.LABELS} == dict(zip(groups.cluster_id, groups.group))
+    R = pa.replay_curation(phy)                              # not opened in Phy yet: it ends where it is
+    assert R["auto"] == pa.VERSION and not (R["missing"] or R["wrong"] or R["problems"][1:])
+    # the check in Phy: one label changed by hand, saved
+    target = int(pieces.final_cluster.iloc[0])
+    new = "noise" if auto["groups"][target] != "noise" else "mua"
+    log = PhyLog()
+    log.launch()
+    log.select([target])
+    log.label([target], new)
+    log.save()
+    log.write(phy / "phy.log")
+    groups.loc[groups.cluster_id == target, "group"] = new
+    groups.to_csv(phy / "cluster_group.tsv", sep="\t", index=False)
+    before = _files(phy)
+    bank_dir = pa.build_bank(phy, tmp_path / "banks" / "checked", n_jobs=1)
+    assert _files(phy) == before
+    bank = pa.load_bank(bank_dir)
+    C, S = bank["C"], bank["S"]
+    assert bank["R"]["auto"] == pa.VERSION
+    assert all(json.loads((bank_dir / "sets.json").read_text())["verified"].values())   # rebuilt exactly
+    final = C[C.final]
+    assert set(final.id) == set(groups.cluster_id) and (final.depth >= 0).all()       # with their history
+    assert final.set_index("id").label[target] == new and list(final[final.explicit].id) == [target]
+    made = S[S.source == "user"]                             # the recluster it made and the curator left: kept
+    assert list(made.auto) == [True] and list(made.kept.astype(bool)) == [True] and list(made.n) == [n]
+    assert list(made.parent) == ["c0"] and "amp_cut" not in set(S.kind)
+    assert not ((S.source == "cand") & (S.parent == "c0")).any()         # unit 0 is not a final cluster
+    pa.cmd_train([phy], ["checked"], tmp_path / "banks", n_jobs=1, data_dir=tmp_path / "train2")
+    clusters, splits = pa.load_training_tables(tmp_path / "train2")
+    assert len(clusters) == len(final) and int(splits.kept.sum()) == 1
+    # the curator merges the pieces of its recluster together again: that recluster was not kept
+    phy2 = tmp_path / "phy2"
+    make_phy(phy2)
+    pa.autocurate_phy_folder(phy2, n_jobs=1, data_dir=tmp_path / "train", params={"amp_cut_sd": None})
+    cut = pd.read_csv(phy2 / pa.CURATION_DIR / "cutting_log.tsv", sep="\t", keep_default_na=False)
+    ids = list(cut[cut.unit == 0].final_cluster)
+    sc = np.load(phy2 / "spike_clusters.npy")
+    merged = int(sc.max()) + 1
+    sc[np.isin(sc, ids)] = merged
+    np.save(phy2 / "spike_clusters.npy", sc)
+    groups = pd.read_csv(phy2 / "cluster_group.tsv", sep="\t")
+    groups = pd.concat([groups[~groups.cluster_id.isin(ids)],
+                        pd.DataFrame({"cluster_id": [merged], "group": ["mua"]})], ignore_index=True)
+    groups.to_csv(phy2 / "cluster_group.tsv", sep="\t", index=False)
+    log = PhyLog()
+    log.launch()
+    log.select(ids)
+    log.merge(ids, merged)
+    log.label([merged], "mua")
+    log.save()
+    log.write(phy2 / "phy.log")
+    bank = pa.load_bank(pa.build_bank(phy2, tmp_path / "banks" / "merged", n_jobs=1))
+    made = bank["S"][bank["S"].source == "user"]
+    assert list(made.auto) == [True] and list(made.kept.astype(bool)) == [False] and list(made.merged_back) == [True]
+    whole = bank["C"][bank["C"].key == "c0"].iloc[0]                     # the merged cluster is unit 0 again
+    assert whole.final and whole.label == "mua" and whole.id == merged and whole.depth == 0
+    # an automatic curation of v1 (no paths in its log) cannot be rebuilt: replayed as before
+    cut.drop(columns="path").to_csv(phy2 / pa.CURATION_DIR / "cutting_log.tsv", sep="\t", index=False)
+    assert pa.auto_lineage(phy2) is None and pa.replay_curation(phy2)["auto"] is None
+
+
+def _eap(cap=0.05, na_sd=4.0, k=0.3, k_delay=16, k_sd=9.0, n=90, n_before=30):
+    """A model extracellular action potential at 30 kHz, trough = -1 at sample n_before: a small
+    positive (capacitive) peak, the Na+ trough, a longer positive K+ phase (Gold et al. 2006)."""
+    t = np.arange(n) - n_before
+    return (cap * np.exp(-0.5 * ((t + 3.2 * na_sd) / (0.8 * na_sd)) ** 2) - np.exp(-0.5 * (t / na_sd) ** 2)
+            + k * np.exp(-0.5 * ((t - k_delay) / k_sd) ** 2))
+
+
+def test_a_waveform_is_measured_against_the_rules_of_an_action_potential():
+    profile = np.array([1.0, 0.6, 0.3, 0.1])
+    f = pa.ap_features(100 * np.outer(_eap(), profile), FS, 30)
+    assert set(f) == set(pa.AP_FEATS)
+    assert f["ap_viol"] == pytest.approx(0, abs=0.02)                    # follows every rule
+    assert 0.03 < f["ap_cap_ratio"] < 0.06 and 0.35 <= f["ap_na_w25"] <= 0.6
+    assert f["ap_k_ratio"] == pytest.approx(0.3, abs=0.03) and f["ap_k_t"] == pytest.approx(16 / 30, abs=0.07)
+    assert f["ap_k_na_dur"] > 1 and f["ap_n_neg"] == 1                   # the K+ phase is the longer one
+    assert f["ap_ch_rank1"] == pytest.approx(1) and f["ap_ch_lag"] == 0  # one shape on every channel
+    # the width at 25 % of the Na+ peak is the paper's measure: a Gaussian of SD s is 3.33 s wide there
+    for sd in (3.0, 6.0):
+        assert pa.ap_features(np.outer(_eap(cap=0, k=0, na_sd=sd), profile), FS, 30)["ap_na_w25"] == \
+            pytest.approx(2 * sd * np.sqrt(2 * np.log(4)) / 30, abs=0.02)
+    # what is not an action potential: each breaks a rule
+    t = np.arange(90) - 30
+    w_shape = _eap() - 0.8 * np.exp(-0.5 * ((t - 14) / 3.0) ** 2)        # a "W": two negative peaks
+    fw = pa.ap_features(np.outer(w_shape, profile), FS, 30)
+    assert fw["ap_n_neg"] == 2 and fw["ap_viol"] >= 1
+    assert pa.ap_features(np.outer(_eap(cap=0.9), profile), FS, 30)["ap_viol"] > 1       # capacitive peak
+    assert pa.ap_features(np.outer(_eap(na_sd=0.5, k=0), profile), FS, 30)["ap_viol"] >= 1    # too narrow
+    assert pa.ap_features(np.outer(_eap(na_sd=20, k=0), profile), FS, 30)["ap_viol"] >= 1     # too wide
+    assert pa.ap_features(np.outer(-_eap(), profile), FS, 30)["ap_viol"] >= 1                 # positive
+    two = np.stack([_eap(), np.roll(_eap(), 9), 0 * _eap(), 0 * _eap()], 1)  # another shape per channel
+    f2 = pa.ap_features(two, FS, 30)
+    assert f2["ap_ch_lag"] == pytest.approx(0.3) and f2["ap_ch_rank1"] < 0.8 and f2["ap_viol"] >= 1
+    assert all(np.isnan(v) for v in pa.ap_features(None, FS, 30).values())
+    # two pieces: one waveform at two amplitudes (one neuron) or two waveforms (two neurons)
+    a = 100 * np.outer(_eap(), profile)
+    same = pa.ap_pair_features(a, 0.6 * a, f, pa.ap_features(0.6 * a, FS, 30), FS, 30)
+    assert same["wf_sin"] == pytest.approx(0, abs=1e-6) and same["wf_amp_ratio"] == pytest.approx(0.6)
+    assert same["wf_d_w25"] == pytest.approx(0, abs=1e-9) and same["wf_prof_cos"] == pytest.approx(1)
+    b = 100 * np.outer(_eap(na_sd=6.5, k=0.1), profile)                  # other ion channels: wider, less K+
+    other = pa.ap_pair_features(a, b, f, pa.ap_features(b, FS, 30), FS, 30)
+    assert other["wf_shape_sin"] > 0.3 and other["wf_d_w25"] > 0.2 and other["wf_d_k"] > 0.1
+    assert other["wf_prof_cos"] == pytest.approx(1, abs=0.02)            # at the same place
+    c = 100 * np.outer(_eap(), profile[::-1])                            # the same cell type elsewhere
+    moved = pa.ap_pair_features(a, c, f, pa.ap_features(c, FS, 30), FS, 30)
+    assert moved["wf_shape_sin"] == pytest.approx(0, abs=1e-6) and moved["wf_sin"] > 0.5
+    assert all(np.isnan(v) for v in pa.ap_pair_features(a, None, f, f, FS, 30).values())
+
+
+def test_the_keep_model_sees_the_action_potential_of_every_piece(tmp_path, monkeypatch):
+    make_phy(tmp_path / "phy")
+    phy, cache = tmp_path / "phy", tmp_path / "cache"
+    before = _files(phy)
+    data = pa.PhyData(phy, cache)
+    c = data.waveforms()                                                 # one pass over the recording
+    assert _files(phy) == before and data.wf_window() == (30, 60)
+    assert c["W"].shape == (data.n_spikes, 90, N_CH) and c["W"].dtype == np.int16
+    raw = np.fromfile(phy / "recording.dat", np.int16).reshape(-1, N_CH)
+    for unit in data.units:                                              # a unit's snippets: its spikes, in order
+        sp, w = data.unit_waveforms(unit)
+        assert np.array_equal(sp, data.spikes_of(unit))
+        for i in (0, len(sp) // 2, len(sp) - 1):
+            t = int(data.spike_samples[sp[i]])
+            assert np.array_equal(w[i], raw[t - 30:t + 60])
+    wf = pa.Waveforms(data, [0])
+    half = data.spikes_of(0)[::2]
+    t = np.asarray(data.spike_samples[half])
+    assert np.allclose(wf.mean(half), np.mean([raw[s - 30:s + 60] for s in t], 0))
+    assert wf.mean(half[:5]) is None and wf.mean(data.spikes_of(1)) is None   # too few; another unit
+    pa._release(cache / "nothing")
+    with monkeypatch.context() as m:                                     # a cache that is there is used
+        m.setattr(pa, "build_waveforms", lambda *a, **k: pytest.fail("the recording is read again"))
+        assert pa.PhyData(phy, cache).waveforms() is not None
+    # the pieces of the two-neuron unit: two action potentials on other channels; of the one-neuron
+    # unit: one action potential at two amplitudes
+    monkeypatch.setattr(pa, "MIN_SPIKES_TO_SPLIT", 120)
+    sess = pa.Session(phy, cache, n_jobs=1)
+    assert sess.has_waveforms
+    sess.ensure([dict(unit=u, key=f"c{u}", depth=0, chain=[], ns=[2]) for u in (0, 1)], want_units=[0, 1, 2])
+    C, S, P = sess.tables()
+    rows = C.set_index("key")
+    assert rows.loc[["c0", "c0/n2k0", "c0/n2k1", "c1", "c1/n2k0", "c1/n2k1"], pa.AP_FEATS].notna().all().all()
+    assert rows.loc[["c0/n2k0", "c0/n2k1", "c1"], "ap_viol"].max() < 0.5 < rows.loc["c2", "ap_viol"]  # c2: noise
+    pair = P.set_index("split")
+    assert pair.loc["c0/n2", "wf_sin"] > 0.5 > pair.loc["c0/n2", "wf_prof_cos"]
+    assert pair.loc["c0/n2", "wf_shape_sin"] < 0.2                       # the same cell type
+    assert pair.loc["c1/n2", "wf_sin"] < 0.2 and pair.loc["c1/n2", "wf_prof_cos"] > 0.98
+    T = pa.split_table(pa.add_ctx(C, P), S, P).set_index("split")
+    assert set(pa.AP_SPLIT_FEATS) <= set(pa.SPLIT_FEATS) and set(pa.AP_SPLIT_FEATS) <= set(T.columns)
+    assert T[pa.AP_SPLIT_FEATS].notna().all().all()
+    assert np.allclose(T.ap_viol_gain, T.c_ap_viol - T.pmin_ap_viol)     # is a piece more of a spike
+    pa._release(cache)
+
+
+def test_without_the_recording_the_keep_model_decides_without_action_potentials(tmp_path):
+    rng = np.random.default_rng(0)
+    make_phy(tmp_path / "phy")
+    phy = tmp_path / "phy"
+    training_tables(tmp_path / "train", rng)
+    clusters, splits = pa.load_training_tables(tmp_path / "train")
+    sess = pa.Session(phy, tmp_path / "with", n_jobs=1)
+    sess.ensure([dict(unit=0, key="c0", depth=0, chain=[], ns=[2])], want_units=[0])
+    C, S, P = sess.tables()
+    Cx = pa.add_ctx(C, P)
+    models = pa.Models(clusters, splits)
+    models.keep_proba(pa.split_table(Cx, S, P), Cx)
+    assert list(models._keep) == [True] and models.keep_forest()[1] == pa.SPLIT_FEATS
+    off = pa.Models(clusters, splits, {"use_ap": False})                 # AUTO_USE_AP=0
+    off.keep_proba(pa.split_table(Cx, S, P), Cx)
+    assert list(off._keep) == [False] and off.keep_forest()[1] == pa.SPLIT_FEATS_NO_AP
+    old = pa.Models(clusters, splits.drop(columns=pa.AP_SPLIT_FEATS))    # training tables of before 2.1
+    assert not old.trained_ap and old.keep_forest()[1] == pa.SPLIT_FEATS_NO_AP
+    pa._release(tmp_path / "with")
+    quiet = pa.Session(phy, tmp_path / "off", n_jobs=1, waveforms=False)     # then the recording is not read
+    assert not quiet.has_waveforms and not (tmp_path / "off" / "waveforms.npy").exists()
+    pa._release(tmp_path / "off")
+    (phy / "recording.dat").unlink()                                     # the export alone
+    sess = pa.Session(phy, tmp_path / "without", n_jobs=1)
+    assert not sess.has_waveforms
+    sess.ensure([dict(unit=0, key="c0", depth=0, chain=[], ns=[2])], want_units=[0])
+    C, S, P = sess.tables()
+    assert C[pa.AP_FEATS].isna().all().all() and P[pa.AP_PAIR_FEATS].isna().all().all()
+    Cx = pa.add_ctx(C, P)
+    models = pa.Models(clusters, splits)
+    p = models.keep_proba(pa.split_table(Cx, S, P), Cx)
+    assert list(models._keep) == [False] and len(p) == 1                 # the forest fit without them
+    pa._release(tmp_path / "without")
+    assert pa.autocurate_phy_folder(phy, n_jobs=1, data_dir=tmp_path / "train").startswith("curated")
+    cur = phy / pa.CURATION_DIR
+    assert json.loads((cur / "curation.json").read_text())["action_potentials"] is False
+    assert "WITHOUT the action potentials" in (cur / "cutting_log.txt").read_text()

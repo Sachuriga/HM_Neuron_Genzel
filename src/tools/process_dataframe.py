@@ -84,7 +84,7 @@ if __name__ == "__main__":
     from pathnames import find_paths, find_session_folders
     root = r"C:\Users\Jacob\OneDrive\Documenten\University\Masters Internship\Scripts\Data_Structure/"
     input_folder= r"nwb_data/"
-    session_folders = find_session_folders(Path(root + input_folder))
+    session_folders, _notes = find_session_folders(Path(root + input_folder))   # (folders, notes)
     session_paths = []
     for session_dir in session_folders:
         paths = find_paths(session_dir)

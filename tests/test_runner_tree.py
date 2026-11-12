@@ -37,7 +37,7 @@ def share(tmp_path):
 
 
 def test_session_folders_are_found_below_a_renamed_tree(share):
-    found = [str(p.relative_to(share)) for p in runner.find_session_folders(share, max_depth=4)]
+    found = [p.relative_to(share).as_posix() for p in runner.find_session_folders(share, max_depth=4)]
     assert found == ["op1", "rat5_491390/20260630", "rat5_491390/20260701", "rat6_491391/20260630"]
 
 

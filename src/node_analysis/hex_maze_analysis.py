@@ -338,8 +338,10 @@ def _save(df, sheet, exc_path, out_path):
 # ── Run over every ip/op pair ─────────────────────────────────────────────────
 for ip_folder, op_folder in FOLDER_PAIRS:
     os.makedirs(op_folder, exist_ok=True)
-    excel_files = [f for f in glob.glob(os.path.join(ip_folder, '*.xlsx'))
-                   if not os.path.basename(f).startswith('~$')]
+    # not Excel's lock files (~$...) nor macOS sidecars (._...): neither is a
+    # workbook, and failing to open one stopped the run before the real files
+    excel_files = sorted(f for f in glob.glob(os.path.join(ip_folder, '*.xlsx'))
+                         if not os.path.basename(f).startswith(('~$', '._')))
 
     if not excel_files:
         print(f'No .xlsx files found in {ip_folder}')

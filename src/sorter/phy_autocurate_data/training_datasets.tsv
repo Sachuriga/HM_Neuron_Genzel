@@ -1,5 +1,14 @@
-dataset	phy_export	n_units	n_pieces	built
-Rat6_20260727_op2	C:/Users/gl_pc/Desktop/data/sleep/Rat6_20260727/op2/Rat6_HM_Neurons_20260727_135512_post.raw_group0_mountainsort4_sorting_output/phy_export	220	310	2026-11-09
-Rat5_20260720_op2	C:/Users/gl_pc/Desktop/data/sleep/op2/Rat5_HM_Neurons_20260720_121844_post.raw_group0_mountainsort4_sorting_output/phy_export	237	268	2026-11-09
-Rat5_20260720_op1	C:/Users/gl_pc/Desktop/data/sleep/op1/Rat5_HM_Neurons_20260720_091313_pre.raw_group0_mountainsort4_sorting_output/phy_export	221	146	2026-11-09
-Rat6_20260727_op1	C:/Users/gl_pc/Desktop/data/sleep/Rat6_20260727/op1/Rat6_HM_Neurons_20260727_092437_pre.raw_group0_mountainsort4_sorting_output/phy_export	197	212	2026-11-10
+dataset	phy_export	n_clusters	n_clusters_used	n_reclusters	n_kept	n_candidates	built
+Rat6_20260720_090627_pre	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\pre\Rat6\20260720\Rat6_HM_Neurons_20260720_090627_pre.raw_group0_mountainsort4_sorting_output\phy_export	342	313	242	58	859	2026-11-11
+Rat6_20260720_134207_post	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\post\Rat6\20260720\Rat6_HM_Neurons_20260720_134207_post.raw_group0_mountainsort4_sorting_output\phy_export	385	382	253	62	992	2026-11-11
+Rat6_20260722_091154_pre	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\pre\Rat6\20260722\Rat6_HM_Neurons_20260722_091154_pre.raw_group0_mountainsort4_sorting_output\phy_export	403	401	215	93	1018	2026-11-11
+Rat6_20260722_140602_post	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\post\Rat6\20260722\Rat6_HM_Neurons_20260722_140602_post.raw_group0_mountainsort4_sorting_output\phy_export	445	445	205	90	1172	2026-11-11
+Rat6_20260731_090604_pre	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\pre\Rat6\20260731\Rat6_HM_Neurons_20260731_090604_pre.raw_group0_mountainsort4_sorting_output\phy_export	411	411	292	77	1032	2026-11-11
+Rat6_20260731_140035_post	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\post\Rat6\20260731\Rat6_HM_Neurons_20260731_140035_post.raw_group0_mountainsort4_sorting_output\phy_export	399	392	255	69	978	2026-11-11
+Rat5_20260721_091858_pre	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\pre\Rat5\20260721\Rat5_HM_Neurons_20260721_091858_pre.raw_group0_mountainsort4_sorting_output\phy_export	276	276	96	28	676	2026-11-11
+Rat5_20260721_122411_post	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\post\Rat5\20260721\Rat5_HM_Neurons_20260721_122411_post.raw_group0_mountainsort4_sorting_output\phy_export	327	326	134	54	817	2026-11-11
+Rat6_20260727_135512_post	\\genzel-srv.science.ru.nl\genzel\Rat\HM\Rat_HM_Neuron\post\Rat6\20260727\Rat6_HM_Neurons_20260727_135512_post.raw_group0_mountainsort4_sorting_output\phy_export	419	419	136	105	1121	2026-11-11
+Rat5_20260721_111224_maze	C:\Users\gl_pc\Desktop\data\maze\op2\Rat5_HM_Neurons_20260721_111224_maze_merged.raw_group0_mountainsort4_sorting_output\phy_export	336	336	38	33	725	2026-11-11
+Rat5_20260723_110439_maze	C:\Users\gl_pc\Desktop\data\maze\op4\Rat5_HM_Neurons_20260723_110439_maze_merged.raw_group0_mountainsort4_sorting_output\phy_export	343	343	22	22	717	2026-11-11
+Rat5_20260724_110348_maze	C:\Users\gl_pc\Desktop\data\maze\op5\Rat5_HM_Neurons_20260724_110348_maze_merged.raw_group0_mountainsort4_sorting_output\phy_export	314	314	26	26	654	2026-11-11
+Rat5_20260727_110325_maze	C:\Users\gl_pc\Desktop\data\maze\op6\Rat5_HM_Neurons_20260727_110325_maze_merged.raw_group0_mountainsort4_sorting_output\phy_export	342	342	35	34	651	2026-11-11

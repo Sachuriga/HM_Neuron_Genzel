@@ -7,7 +7,10 @@ Created on Mon Mar  8 16:37:54 2021
 
 import networkx as nx
 from matplotlib import pyplot as plt
-from utils import mask
+try:                              # (there is no 'utils' package: mask.py is in src/tools)
+    from tools import mask        # src/ on the path
+except ImportError:
+    import mask                   # run from src/tools
 import csv
 
 from tkinter import Tk, filedialog, Label

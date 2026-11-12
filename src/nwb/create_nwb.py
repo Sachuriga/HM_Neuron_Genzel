@@ -154,12 +154,26 @@ def parse_ISO_8601(start, end=None, show_T = False):
     )
 
 # takes dataframe (with column 'Time (seconds)' indicating time in seconds) and returns the element closest to 0
+# Returns None when no row has a time. (The old lookup of the row before the first
+# non-negative time raised KeyError(-1) whenever the video started at or after
+# time 0, and IndexError when every time was negative.)
 def find_index_time_zero(df):
-    index_positive = np.where(df['Time (seconds)']>=0)[0][0] # first positive element
-    if np.abs(df['Time (seconds)'][index_positive]) < np.abs(df['Time (seconds)'][index_positive-1]):
-        return index_positive
-    else:
-        return index_positive-1
+    t = pd.to_numeric(df['Time (seconds)'], errors='coerce').to_numpy(dtype=float)
+    if not np.isfinite(t).any():
+        return None
+    return int(np.nanargmin(np.abs(t)))
+
+# values above this are unix times, smaller ones session seconds (as in clock_qc.py
+# and fix_txt_timestamps.py)
+UNIX_MIN = 1e6
+
+# `value` as a unix time (float), or None when it is missing or is not one
+def unix_time_or_none(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) and value > UNIX_MIN else None
 
 # creates a nwb file using pynwb
 # uses global variables nwb_*
@@ -765,9 +779,25 @@ if __name__ == "__main__":
         # source for rat id / date / repeat / day / session / goal node.
         rec_meta = read_recording_meta(session_folders[session_i])
 
-        if 'Time (seconds)' in df.columns and 'Timestamp' in df_coordinates_with_frames.columns:
-            index_time_zero = find_index_time_zero(df)
-            ts = df_coordinates_with_frames['Timestamp'][index_time_zero]
+        # unix time of the frame closest to session time 0 (None: not available)
+        ts = None
+        index_time_zero = find_index_time_zero(df) if 'Time (seconds)' in df.columns else None
+        if index_time_zero is not None:
+            if 'Timestamp' in df_coordinates_with_frames.columns:
+                ts = unix_time_or_none(df_coordinates_with_frames['Timestamp'].iloc[index_time_zero])
+            # The tracker reads the framewise SECONDS file when there is one, and then
+            # 'Timestamp' holds session seconds (~0 here), not unix time — which used
+            # to give a new NWB a session start in 1970. That frame's unix time is in
+            # the framewise_ts file.
+            frame_col = pdf._frame_column(df)
+            ts_frame_col = pdf._frame_column(df_framewise_ts) if df_framewise_ts is not None else None
+            if ts is None and frame_col is not None and ts_frame_col is not None:
+                frame = pd.to_numeric(df[frame_col], errors='coerce').iloc[index_time_zero]
+                same_frame = pd.to_numeric(df_framewise_ts[ts_frame_col], errors='coerce') == frame
+                if same_frame.any():
+                    ts = unix_time_or_none(df_framewise_ts.loc[same_frame].iloc[0, 1])
+
+        if ts is not None:
             # ts is a unix timestamp (seconds since 1970-01-01 UTC). Convert the
             # instant to a tz-aware Amsterdam datetime with fromtimestamp so that
             # session_start_time.timestamp() round-trips back to ts. (The old code
@@ -951,7 +981,11 @@ if __name__ == "__main__":
 
         # create metrics object
         df_filtered = df[[c for c in metrics_cols if c in df.columns]]
-        metric_timeseries_list = create_metric_timeseries(df, df_filtered, metrics_descriptions)
+        # descriptions of the columns that are present, in the same order (a
+        # missing first column must not hand its description to the second)
+        metric_timeseries_list = create_metric_timeseries(
+            df, df_filtered,
+            [d for c, d in zip(metrics_cols, metrics_descriptions) if c in df.columns])
         metrics_obj = create_metrics_object(metric_timeseries_list, "Metrics")
 
         # add metrics object to behavior module

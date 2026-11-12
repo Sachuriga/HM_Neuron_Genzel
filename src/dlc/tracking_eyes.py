@@ -35,17 +35,36 @@ def add_region_column(
         df.loc[valid_rows, out_col] = region_id
     return df
 
+# Folders that hold copies of the session's files, never the files to work on:
+# clock_qc.py / rewrite_nwb_lfp.py keep the originals they replaced in these.
+_BACKUP_DIRS = {"clock_repair_backup", "lfp_fix_backup", "clock_qc"}
+
+
+def _find_files(folder: Path, pattern: str) -> list:
+    """Files matching `pattern` below `folder`, the ones nearest the top first.
+
+    Leaves out macOS "._" sidecars (a Mac writes one next to every file on the
+    share; they match the pattern, sort first and are not CSVs / videos) and
+    everything inside a backup folder — a bare rglob()[0] could return either."""
+    hits = [p for p in folder.rglob(pattern)
+            if not p.name.startswith("._")
+            and not _BACKUP_DIRS.intersection(p.relative_to(folder).parts[:-1])]
+    return sorted(hits, key=lambda p: (len(p.relative_to(folder).parts), str(p).lower()))
+
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
 
 def find_video_for_region(region_idd: int | str, video_dir: Path) -> Optional[Path]:
     region_id = int(region_idd) + 1
     pattern = f"eye0{region_id}*.mp4" if region_id < 10 else f"eye{region_id}*.mp4"
-    matches = sorted(video_dir.rglob(pattern), key=lambda p: _natural_key(p.name))
+    matches = sorted((p for p in video_dir.rglob(pattern) if not p.name.startswith("._")),
+                     key=lambda p: _natural_key(p.name))
     return matches[0] if matches else None
 
 class FastVideoReader:
     """Caches VideoCapture objects to prevent reopening files continuously."""
+    MAX_SKIP = 60       # frames skipped by reading on instead of seeking
+
     def __init__(self):
         self.caps: Dict[Path, cv2.VideoCapture] = {}
         self.current_frame_idx: Dict[Path, int] = {}
@@ -61,9 +80,18 @@ class FastVideoReader:
         cap = self.caps[video_path]
         current_idx = self.current_frame_idx[video_path]
 
-        # Only use cap.set() if we are jumping around. 
+        # Only use cap.set() if we are jumping around.
         # If we just need the very next frame, reading sequentially is much faster.
-        if frame_idx != current_idx:
+        # A short step forward (the frames where the rat was not tracked) is also
+        # read through: a seek makes the decoder start again from the last key
+        # frame, which costs more than skipping a few frames — and it lands on the
+        # exact frame, which a seek in an h264 file does not always do.
+        gap = frame_idx - current_idx
+        if 0 < gap <= self.MAX_SKIP:
+            for _ in range(gap):
+                if not cap.grab():
+                    break
+        elif gap != 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
         ok, frame = cap.read()
@@ -92,7 +120,7 @@ def process_tracking_data(
     if csv_path:
         csv_file = Path(csv_path)
     else:
-        csv_files = list(op_path.rglob("*_Full.csv")) + list(ip_path.rglob("*_Full.csv"))
+        csv_files = _find_files(op_path, "*_Full.csv") + _find_files(ip_path, "*_Full.csv")
         if not csv_files:
             raise FileNotFoundError(f"No CSV file found in {ip_path} or {op_path}.")
         csv_file = csv_files[0]
@@ -121,6 +149,7 @@ def process_tracking_data(
     errors = []
 
     total_rows = len(df)
+    has_frame_index = "Frame_Index" in df.columns
     for i, (row_idx, row) in enumerate(df.iterrows(), start=1):
         region_id = row.get("region_id")
         if pd.isna(region_id):
@@ -132,14 +161,22 @@ def process_tracking_data(
             errors.append(f"Row {row_idx}: No video for region {region_id}")
             continue
 
+        # The video frame of this row. The row NUMBER is that frame only when the
+        # file has one row per frame from frame 0; a tracker run that started later
+        # (Start_Min / Start_Sec) without a sync file does not, and the row number
+        # then picked frames from the wrong moment.
+        frame_no = int(row_idx)
+        if has_frame_index and pd.notna(row["Frame_Index"]):
+            frame_no = int(row["Frame_Index"])
+
         # Fetch frame using our cached reader
-        ok, frame, err = video_reader.get_frame(video_path, int(row_idx))
+        ok, frame, err = video_reader.get_frame(video_path, frame_no)
         if not ok:
             errors.append(f"Row {row_idx}: {err}")
             continue
-            
+
         # --- NEW: Record the frame index successfully extracted for this row ---
-        df.at[row_idx, 'extracted_frame_idx'] = int(row_idx)
+        df.at[row_idx, 'extracted_frame_idx'] = frame_no
 
         if int(region_id) > 5:
             frame = cv2.flip(frame, -1)  # -1 = flip both vertically and horizontally

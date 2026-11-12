@@ -269,7 +269,17 @@ def _local_speed(v, half=15):
     either side of it, used as the reference a jump has to stand out from."""
     n = v.size
     out = np.empty(n)
-    for i in range(n):
+    width = 2 * half + 1
+    if n >= width:
+        # every sample with a full window: all medians in one call. (One np.median
+        # per sample took seconds per long trial, and the seam repair asks for this
+        # up to 20 times a trial.) Same values as the loop below.
+        out[half:n - half] = np.median(
+            np.lib.stride_tricks.sliding_window_view(v, width), axis=1)
+        edges = list(range(half)) + list(range(n - half, n))
+    else:
+        edges = range(n)
+    for i in edges:                    # the window is cut short at the ends
         out[i] = np.median(v[max(0, i - half):min(n, i + half + 1)])
     return out
 
@@ -647,6 +657,13 @@ if __name__ == "__main__":
                     trial_data = {}
                     if 'Goal_Node' in row and pd.notna(row['Goal_Node']):
                         trial_data['Goal_Node'] = str(int(row['Goal_Node']))
+                    # NOTE: the workbook's column is 'Start_Nodes', so this never
+                    # matches and the scores below start from the FIRST NODE OF THE
+                    # RECORDED SEQUENCE. Leave it that way: the rat is often first
+                    # seen one node away from the workbook's start node, and the
+                    # actual hops are counted from that first recorded node — an
+                    # optimal path from the workbook's node would not be comparable
+                    # (it gave "better than optimal" scores on real sessions).
                     if 'Start_Node' in row and pd.notna(row['Start_Node']):
                         trial_data['Start_Node'] = str(int(row['Start_Node']))
                     if 'Trial_Type' in row and pd.notna(row['Trial_Type']):
@@ -823,7 +840,9 @@ if __name__ == "__main__":
     SMOOTH_SAMPLES_50 = max(1, int(round(5.0 * FS))) 
 
     # --- Load Node List and Build Graph ---
-    node_file_path = Path("src/tools/node_list_new.csv")
+    # next to this file's folder (src/tools), so it is found whatever the working
+    # directory is — not only when the runner starts this from the repo root
+    node_file_path = Path(__file__).resolve().parent.parent / "tools" / "node_list_new.csv"
     nodes_data = None
     maze_graph = None
 
@@ -1302,7 +1321,9 @@ if __name__ == "__main__":
             cols = 4
             rows = math.ceil(n_trials / cols)
             fig_hist, axes_hist = plt.subplots(rows, cols, figsize=(15, 3 * rows), constrained_layout=True)
-            axes_flat = axes_hist.flatten() if n_trials > 1 else [axes_hist]
+            # always the flat list of axes: with ONE trial this used to be
+            # [the array of 4 axes], and its .hist() call crashed the whole report
+            axes_flat = np.atleast_1d(axes_hist).ravel()
             common_bins = np.linspace(0, 1.5, 31) 
             for idx, (tid, spd) in enumerate(all_trials_speed_raw_list):
                 ax = axes_flat[idx]

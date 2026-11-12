@@ -214,19 +214,22 @@ def get_gpu_load():
 def wait_for_resources():
     if os.environ.get("DISABLE_RESOURCE_CHECK", "0") == "1":
         return
+    # Read now, not at import: load_config() runs after import, so the limits set
+    # in hm_tracker_paths.txt count here too (as they do in resources_free()).
+    max_cpu, max_gpu, max_mem = (_int_env("MAX_CPU", MAX_CPU), _int_env("MAX_GPU", MAX_GPU),
+                                 _int_env("MAX_MEM", MAX_MEM))
+    wait = _int_env("WAIT_SECONDS", WAIT_SECONDS)
     while True:
         cpu, gpu, mem = get_cpu_load(), get_gpu_load(), get_mem_usage()
-        if cpu > MAX_CPU:
-            print(f"    [WAIT] High CPU: {cpu}%. Pausing {WAIT_SECONDS}s...")
-            time.sleep(WAIT_SECONDS); continue
-        if gpu > MAX_GPU:
-            print(f"    [WAIT] High GPU: {gpu}%. Pausing {WAIT_SECONDS}s...")
-            time.sleep(WAIT_SECONDS); continue
-        if mem > MAX_MEM:
-            print(f"    [WAIT] High MEM: {mem}%. Pausing {WAIT_SECONDS}s...")
-            time.sleep(WAIT_SECONDS); continue
-        print(f"    [CHECK] CPU: {cpu}% | GPU: {gpu}% | MEM: {mem}% - OK.")
-        return
+        for name, val, lim in (("CPU", cpu, max_cpu), ("GPU", gpu, max_gpu),
+                               ("MEM", mem, max_mem)):
+            if val > lim:
+                print(f"    [WAIT] High {name}: {val}%. Pausing {wait}s...")
+                time.sleep(wait)
+                break
+        else:
+            print(f"    [CHECK] CPU: {cpu}% | GPU: {gpu}% | MEM: {mem}% - OK.")
+            return
 
 
 # ------------------------------------------------------------
@@ -647,7 +650,11 @@ def compress_all_op_videos(op_dirs):
                       "-stats", *enc.global_args, "-i", video, *vf_args,
                       "-c:v", enc.codec, *enc.args, "-c:a", "copy", temp_file])
             if rc == 0:
-                shutil.move(str(temp_file), str(video))
+                # os.replace swaps the file in one step. shutil.move cannot rename
+                # onto an existing file on Windows, so it copied the whole video
+                # back and deleted the temp one — slow, and a crash in between left
+                # a half-written video.
+                os.replace(temp_file, video)
                 print(f"[SUCCESS] Compressed: {video}")
                 n_ok += 1
             else:
@@ -1113,7 +1120,6 @@ def main():
     print("=" * 56)
     print("          SMART PARALLEL MODE (Multi-Step)")
     print("=" * 56)
-    print(f"[CONFIG] Max CPU: {MAX_CPU}% | Max GPU: {MAX_GPU}% | Max MEM: {MAX_MEM}%\n")
 
     if len(sys.argv) < 2 or not sys.argv[1]:
         print(f"Usage: {Path(sys.argv[0]).name} /path/to/data_root")
@@ -1125,6 +1131,10 @@ def main():
     root = root.resolve()
 
     config = load_config()
+    # after load_config(), so limits set in hm_tracker_paths.txt are the ones shown
+    print(f"[CONFIG] Max CPU: {_int_env('MAX_CPU', MAX_CPU)}% | "
+          f"Max GPU: {_int_env('MAX_GPU', MAX_GPU)}% | "
+          f"Max MEM: {_int_env('MAX_MEM', MAX_MEM)}%")
     print(f"[DEBUG] Target Root Directory: [{root}]\n")
 
     # Steps may come non-interactively via HM_STEPS (used by the genzeltracker GUI);
@@ -1243,6 +1253,7 @@ def main():
     tmp = Path(tempfile.gettempdir())
     use_windows = os.environ.get("WORKER_WINDOWS", "1") != "0"
     threads, markers, count = [], [], 0
+    launch_gap = _int_env("LAUNCH_GAP", LAUNCH_GAP)          # the config file's, if set
     if parallel_trim:
         for ip_path, op_path in ops:
             print(f"\n[QUEUE] Preparing: {ip_path.name}")
@@ -1273,8 +1284,8 @@ def main():
                 t = threading.Thread(target=_job, daemon=True)
                 t.start()
                 threads.append((t, name))
-            print(f"[MASTER] Job launched. Waiting {LAUNCH_GAP}s for stability...")
-            time.sleep(LAUNCH_GAP)
+            print(f"[MASTER] Job launched. Waiting {launch_gap}s for stability...")
+            time.sleep(launch_gap)
 
     if count > 0:
         print("\n" + "=" * 56)

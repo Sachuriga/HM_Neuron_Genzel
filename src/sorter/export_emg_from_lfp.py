@@ -31,9 +31,9 @@ import spikeinterface.preprocessing as spre
 import spikeinterface.extractors as se
 
 try:
-    from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile
+    from readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
 except ImportError:  # pragma: no cover - fallback when run as a module
-    from .readTrodesExtractedDataFile3 import readTrodesExtractedDataFile
+    from .readTrodesExtractedDataFile3 import readTrodesExtractedDataFile, trodesBinaryLayout
 
 from emg_from_lfp import (emg_from_lfp, emg_correlation, _highfreq_passband,
                           _moving_average)
@@ -410,9 +410,17 @@ def emg_from_recording(rec, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK, skip=
 def emg_for_recording(dat_file, work_fs=WORK_FS, emg_fs=EMG_FS, n_pick=N_PICK,
                       skip=()):
     """EMG-from-LFP for one extracted raw ``*.raw/*_group0.dat`` (30 kHz, 128 ch)."""
-    raw = readTrodesExtractedDataFile(str(dat_file))
-    voltage = raw["data"]["voltage"]                       # (n_samples, n_channels)
-    rec = si.NumpyRecording(traces_list=[voltage], sampling_frequency=RAW_FS)
+    # Read from the file, never into RAM: an hour of 128 channels is ~27 GiB, and
+    # np.fromfile (the old way) loaded all of it. Same reader as sorting.py.
+    lay = trodesBinaryLayout(str(dat_file))
+    if lay is not None:
+        rec = si.read_binary(str(dat_file), sampling_frequency=RAW_FS, dtype=lay["dtype"],
+                             num_channels=lay["n_channels"], file_offset=lay["offset"],
+                             time_axis=0)
+    else:                                                   # not a plain interleaved block
+        raw = readTrodesExtractedDataFile(str(dat_file), memmap=True)
+        voltage = raw["data"]["voltage"]                   # (n_samples, n_channels)
+        rec = si.NumpyRecording(traces_list=[voltage], sampling_frequency=RAW_FS)
     rec.set_channel_gains(GAIN)
     rec.set_channel_offsets(0.0)
     return emg_from_recording(rec, work_fs=work_fs, emg_fs=emg_fs, n_pick=n_pick,

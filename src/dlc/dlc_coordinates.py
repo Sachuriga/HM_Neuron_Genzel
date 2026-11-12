@@ -7,15 +7,32 @@ from pathlib import Path
 from typing import Optional
 
 
+# Folders that hold copies of the session's files, never the files to work on:
+# clock_qc.py / rewrite_nwb_lfp.py keep the originals they replaced in these.
+_BACKUP_DIRS = {"clock_repair_backup", "lfp_fix_backup", "clock_qc"}
+
+
+def _find_files(folder: Path, pattern: str) -> list:
+    """Files matching `pattern` below `folder`, the ones nearest the top first.
+
+    Leaves out macOS "._" sidecars (a Mac writes one next to every file on the
+    share; they match the pattern, sort first and are not CSVs / videos) and
+    everything inside a backup folder — a bare rglob()[0] could return either."""
+    hits = [p for p in folder.rglob(pattern)
+            if not p.name.startswith("._")
+            and not _BACKUP_DIRS.intersection(p.relative_to(folder).parts[:-1])]
+    return sorted(hits, key=lambda p: (len(p.relative_to(folder).parts), str(p).lower()))
+
+
 def find_collected_video(op_path: Path) -> Optional[Path]:
     # find collected_frames.mp4
-    matches = list(op_path.rglob("collected_frames.mp4"))
+    matches = _find_files(op_path, "collected_frames.mp4")
     return matches[0] if matches else None
 
 
 def find_with_frames_csv(op_path: Path) -> Optional[Path]:
     # find *_with_frames.csv
-    matches = list(op_path.rglob("*_with_frames.csv"))
+    matches = _find_files(op_path, "*_with_frames.csv")
     return matches[0] if matches else None
 
 

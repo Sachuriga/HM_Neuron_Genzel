@@ -49,6 +49,7 @@ from session_prefix import file_prefix
 
 import numpy as np
 import pandas as pd
+from functools import lru_cache
 
 import matplotlib
 matplotlib.use("Agg")
@@ -604,7 +605,8 @@ def _plot_speed_tuning(ax, speed, fr, title, color="tab:cyan"):
         s = fr[(speed >= c - win) & (speed <= c + win)]
         q = np.quantile(s, [0.25, 0.5, 0.75]) if s.size else (np.nan, np.nan, np.nan)
         p25.append(q[0]); p50.append(q[1]); p75.append(q[2])
-    idx = np.random.randint(0, len(speed), size=int(np.ceil(len(speed) * 0.1)))
+    # seeded: the same 10 % of the points each run, so a re-run gives the same page
+    idx = np.random.default_rng(0).integers(0, len(speed), size=int(np.ceil(len(speed) * 0.1)))
     ax.scatter(speed[idx], fr[idx], s=2, edgecolors="white", facecolors=color,
                linewidths=0.1, alpha=0.15)
     ax.plot(bins_c, p50, "k.", markersize=2)
@@ -633,6 +635,21 @@ def _speed_page(pdf, x, y, t, spike_times, dt, windows, cid, color):
     pdf.savefig(fig); plt.close(fig)
 
 
+@lru_cache(maxsize=4)
+def _phy_spike_arrays(phy):
+    """(cluster of each spike, its time in s, its amplitude) of a phy folder.
+
+    Read once per folder and kept: load_amplitudes is called for every unit, and
+    reading these three whole-recording files again each time (from the share,
+    for a hundred units) was most of step v's waiting."""
+    phy = Path(phy)
+    fs = float(_read_phy_params(phy)["sample_rate"])
+    clusters = np.load(phy / "spike_clusters.npy").astype("int64").flatten()
+    amps = np.load(phy / "amplitudes.npy").astype(float).flatten()
+    times = np.load(phy / "spike_times.npy").astype("int64").flatten() / fs
+    return clusters, times, amps
+
+
 def load_amplitudes(phy, cluster_id):
     """Per-spike (time_sec, amplitude) for one curated cluster, from the phy
     amplitudes.npy. Returns (None, None) if unavailable."""
@@ -643,13 +660,12 @@ def load_amplitudes(phy, cluster_id):
     if not (amp_f.exists() and st_f.exists() and sc_f.exists()):
         return None, None
     try:
-        fs = float(_read_phy_params(phy)["sample_rate"])
-        clusters = np.load(sc_f).astype("int64").flatten()
+        clusters, all_times, all_amps = _phy_spike_arrays(phy)
         mask = clusters == int(cluster_id)
         if not mask.any():
             return None, None
-        amps = np.load(amp_f).astype(float).flatten()[mask]
-        times = np.load(st_f).astype("int64").flatten()[mask] / fs
+        amps = all_amps[mask]
+        times = all_times[mask]
         order = np.argsort(times)
         return times[order], amps[order]
     except Exception:
@@ -847,6 +863,10 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
         return
     phys = find_phy_folders(output_folder)
     phy = phys[0] if phys else None
+    # A unit's amplitudes come from ITS OWN phy folder: with several recordings
+    # sorted in one op folder the cluster ids start again in each, so reading
+    # them all from the first folder showed another unit's amplitudes.
+    phy_of_group = {p.parent.name: p for p in phys}
 
     out_dir = Path(output_folder) / "visualization"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -988,7 +1008,8 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
                 continue
             spike_times = np.asarray(row["spike_times"], dtype=float)
             wf = np.asarray(row["waveform_mean"]) if has_wf else None
-            amp_t, amp_v = load_amplitudes(phy, cid) if phy is not None else (None, None)
+            unit_phy = phy_of_group.get(str(row.get("sorting_group", "")), phy)
+            amp_t, amp_v = load_amplitudes(unit_phy, cid) if unit_phy is not None else (None, None)
             _write_unit_pdf(out_dir / f"{pfx}Unit_{cid}.pdf", row, cid, spike_times, wf,
                             amp_t, amp_v, pos, extent, bins, dt, sigma, speed, trials, nodes,
                             res_pos=res_pos, gaps=gaps, te_bundle=te_bundle)

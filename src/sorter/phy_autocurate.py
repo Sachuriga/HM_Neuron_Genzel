@@ -11,7 +11,13 @@ What it does to a phy_export (starting from the sorter's original units):
      of the three splits the probability that the curator would have kept it;
      the best one is kept if that is >= 0.30 (divided by AUTO_SPLIT_BIAS) and
      its pieces are tried in the same way, up to 4 reclusters deep. Otherwise
-     the cluster stays as it is;
+     the cluster stays as it is. The keep model looks at the action potentials:
+     the mean waveform of the cluster and of each piece in the recording,
+     measured against what an extracellular action potential looks like (Gold
+     et al. 2006, J Neurophysiol 95:3113: a small capacitive peak, one negative
+     Na+ peak 0.35-0.95 ms wide at 25 %, a longer K+ phase, the same shape on
+     every channel - ap_features), and whether two pieces are one waveform at
+     two amplitudes or two waveforms (ap_pair_features);
   2. every cluster that is left is labelled good / mua / noise by the "label"
      model. Interneurons (narrow waveforms, trough-to-peak <= 0.425 ms) get
      their P(good) weighted x1.5: fast-spiking cells are kept with more short
@@ -36,7 +42,10 @@ phy_autocurate_data/, which are made from hand curations and their phy.log:
                             on a final cluster (= not kept)    -> the keep model
 The log is replayed into the curator's actions (replay_log), the spikes of
 every cluster the curator saw are rebuilt from them (the recluster replica is
-exact) and checked against the saved curation (build_bank). Add a curation and
+exact) and checked against the saved curation (build_bank). An automatic
+curation (v2.0+) that was checked and saved in Phy is learned from as well: its
+cuts are rebuilt from _auto_curation/cutting_log.tsv and put in front of the
+log (auto_lineage). Add a curation and
 re-train with `python phy_autocurate.py train --curated <phy_export> ...`.
 
 Runs as part of step 7 (sorting.py): at the end of a new sort's post-sorting
@@ -50,9 +59,14 @@ A phy_export that was already curated (by hand or by this script) is curated
 again from the sorter's units and its curation is replaced; there is no backup.
 AUTO_CURATE_REDO=0 leaves curated exports alone instead (--redo overrides it).
 
-Needs only the export: the waveform features come from the sorter's templates
-(templates.npy) and the per-spike PC features, the noise level from the exported
-snr column; the recording (params.py dat_path) is read for its length only.
+The label model needs only the export: its waveform features come from the
+sorter's templates (templates.npy) and the per-spike PC features, the noise
+level from the exported snr column. For the action potentials the recording
+(params.py dat_path) is read through once, in order: the snippets of up to
+50000 spikes per unit go into the scratch folder (build_waveforms; 0.7 kB a
+spike), and a cluster's waveform is the mean of up to 500 of them. Without the
+recording the keep model decides without the action potentials (a second forest,
+fit without them), as it does with AUTO_USE_AP=0.
 
 numpy / scipy / pandas / scikit-learn / joblib only (no phy, no spikeinterface).
 """
@@ -80,7 +94,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cell_type_metrics as ctm  # noqa: E402
 
-VERSION = "2.0"
+VERSION = "2.1"
 DATA_DIR = Path(__file__).resolve().parent / "phy_autocurate_data"
 CURATION_DIR = "_auto_curation"
 
@@ -98,13 +112,57 @@ SHAPE_T_MS = np.arange(-0.6, 1.41, 0.1)   # where the template is sampled for th
 ISI_THRESHOLD_MS = 1.5
 DUPLICATE_MS = 0.3
 N_TIME_BINS = 60
+# ---- the action potential of a cluster: its mean waveform in the recording ------
+AP_MS_BEFORE, AP_MS_AFTER = 1.0, 2.0   # the snippet around a spike (as the sorter's templates)
+AP_UNIT_SPIKES = 50000       # spikes per sorter unit whose snippet is read (spread over the recording)
+AP_N_SPIKES = 500            # at most this many spikes in the mean waveform of a cluster
+AP_MIN_SPIKES = 10           # fewer of a cluster's spikes in the cache: no waveform
+WF_BLOCK = 1 << 18           # samples read at a time in the pass over the recording
+WF_VERSION = 1               # of the waveform cache files
+NO_WAVEFORMS = "off"         # as wf_dir: do not read the recording (no action potentials)
+FEATURE_VERSION = 2          # of the feature rows (kept candidates / banks of another version are redone)
+# What an extracellular action potential (EAP) looks like - Gold, Henze, Koch & Buzsaki
+# 2006, J Neurophysiol 95:3113 (CA1 pyramidal cells, simultaneous intra- / extracellular
+# recordings and their compartmental models). Each rule: (no violation up to, full
+# violation from); ap_viol of a waveform is the sum over the rules (ap_features).
+# The paper's numbers are of wide-band recordings (1 Hz - 3 / 5 kHz). The sorter's
+# recording is band-passed (300 or 600 Hz - 6 or 8 kHz, zero-phase): that puts a
+# positive lobe on either side of the trough and narrows it, so the limits of rules 1,
+# 2 and 6 are set where the curator's good clusters are (Rat6 20260720 pre, 83 good
+# clusters: capacitive peak median 0.19, 95 % < 0.56; Na+ width 0.18-0.43 ms; baseline
+# median 0.10, 95 % < 0.15), not at the paper's values.
+#   1. three phases: a brief positive (capacitive) peak, a much larger negative (Na+)
+#      peak, a longer, slowly decaying positive (K+) phase. The capacitive peak is
+#      <= 5 % of the Na+ peak in 73 % and <= 10 % in 95 % of 307 EAPs (mean 6 %);
+AP_RULE_CAP = (0.30, 0.80)                # (wide-band: 0.10)
+#   2. the Na+ phase, measured at 25 % of its peak, lasts 0.35 ms (narrow) to 0.95 ms (the
+#      widest kind, 9 % of the EAPs); it widens a little with the distance to the soma;
+AP_RULE_NA_NARROW = (0.15, 0.08)          # ms: narrower than this is not a Na+ phase (wide-band: 0.35)
+AP_RULE_NA_WIDE = (1.00, 1.50)            # ms: nor is wider
+#   3. the negative peak is the largest deflection (the K+ phase can be negligible);
+AP_RULE_POS = (0.70, 1.20)                # largest positive deflection / Na+ peak
+#   4. one negative peak: a 'W' (two) is seen far from the soma at ~10 uV, rarely at a
+#      detectable amplitude (1 recording of 38);
+AP_W_PROMINENCE = 0.20                    # a second negative peak: this share of the Na+ peak
+#   5. where a spike is large enough to be detected the electrode's position changes its
+#      amplitude, hardly its shape: the channels of a tetrode show one waveform, scaled,
+#      at one time (rank-1 share of the waveform's energy; trough times);
+AP_RULE_RANK1 = (0.10, 0.40)              # 1 - the rank-1 share
+AP_RULE_LAG = (0.10, 0.30)                # ms between the troughs of the large channels
+#   6. flat before the spike (the average carries a few uV of LFP at most).
+AP_RULE_BASE = (0.15, 0.40)               # RMS 1.0-0.6 ms before the trough / Na+ peak
+# And between two clusters: the shape of a neuron's EAP is set by its ion channel
+# densities and is stable for hours, while its amplitude changes - two pieces of one
+# neuron are scaled copies of one waveform, two neurons differ in the width of the Na+
+# phase and in the K+ phase (ap_pair_features).
 # ---- decisions ----------------------------------------------------------------
 KEEP_THR = 0.30              # a recluster is kept if P(keep) >= this / split_bias
 AMP_CUT_SD = 4.0             # amplitude cut: |amp| > mean + 4 SD -> noise
 GOOD_MIN_CONF = 0.4          # a 'good' call below this confidence -> unsorted
 GOOD_BOOST_NARROW = 1.5      # P(good) weight of narrow-waveform (interneuron) clusters
 N_TREES = 300
-CAND_FRAC = 0.3              # share of the never-made candidate reclusters kept in the training table
+CAND_FRAC = 1.0              # share of the never-made candidate reclusters kept in the training table
+#                              (all: with fewer, P(keep) rises and the keep threshold no longer fits)
 TABLE_DIGITS = 5             # significant digits of the floats in the training tables
 LABELS = ("good", "mua", "noise")
 
@@ -153,11 +211,23 @@ AGG_PIECE = ["log_isf", "log_isr", "isi_lt2", "refrac_contrast", "snr_wf", "log_
 SPLIT_BASE_FEATS = SPLIT_STATS + [f"c_{f}" for f in LABEL_FEATS] + \
     [f"{a}_{f}" for f in AGG_PIECE for a in ("pmin", "pmax", "pavg")] + \
     [f"{a}_{f}" for f in PAIR_FEATS for a in ("qmin", "qmax", "qmed")]
+# The action potential (keep model only): the mean waveform of the cluster's own spikes
+# in the recording, measured against the rules of Gold et al. 2006 (ap_features) ...
+AP_FEATS = ["ap_cap_ratio", "ap_na_w25", "ap_k_ratio", "ap_k_t", "ap_k_w25", "ap_k_na_dur", "ap_n_neg",
+            "ap_pos_ratio", "ap_base", "ap_ch_rank1", "ap_ch_lag", "ap_viol"]
+# ... and two pieces of one recluster: one waveform at two amplitudes, or two waveforms
+# (ap_pair_features).
+AP_PAIR_FEATS = ["wf_sin", "wf_shape_sin", "wf_prof_cos", "wf_amp_ratio", "wf_d_w25", "wf_d_k", "wf_d_kt",
+                 "wf_d_cap"]
+AP_SPLIT_FEATS = [f"c_{f}" for f in AP_FEATS] + \
+    [f"{a}_{f}" for f in AP_FEATS for a in ("pmin", "pmax", "pavg")] + \
+    [f"{a}_{f}" for f in AP_PAIR_FEATS for a in ("qmin", "qmax", "qmed")] + ["ap_viol_gain"]
 # ... and what the label model says of the cluster and of its pieces (stack_features).
 STACK_FEATS = ["c_pgood", "c_pmua", "c_pnoise", "pmax_pgood", "pmin_pgood", "pavg_pgood", "pmax_pnoise",
                "pmin_pnoise", "pavg_pnoise", "pmax_pmua", "n_arg_good", "n_arg_mua", "n_arg_noise",
                "n_arg_labels", "gain_pgood", "gain_pnoise", "frac_arg_good", "frac_arg_noise"]
-SPLIT_FEATS = SPLIT_BASE_FEATS + STACK_FEATS         # the keep model's features
+SPLIT_FEATS_NO_AP = SPLIT_BASE_FEATS + STACK_FEATS   # ... of a recording that is not there any more
+SPLIT_FEATS = SPLIT_BASE_FEATS + AP_SPLIT_FEATS + STACK_FEATS   # the keep model's features
 # The columns of the training tables (phy_autocurate_data/).
 CLUSTER_TABLE_COLS = list(dict.fromkeys(["dataset", "key", "label", "explicit", "depth", "n_spikes"] + LABEL_FEATS))
 SPLIT_TABLE_COLS = list(dict.fromkeys(["dataset", "split", "parent", "source", "kept", "n"] + SPLIT_FEATS))
@@ -169,6 +239,7 @@ DEFAULT_PARAMS = {
     "split_bias": 1.0,          # > 1 reclusters more readily, < 1 less (keep_thr / split_bias)
     "keep_thr": KEEP_THR,
     "max_depth": MAX_DEPTH,
+    "use_ap": True,             # the keep model looks at the action potentials (False: as without a recording)
 }
 
 
@@ -220,8 +291,13 @@ class PhyData:
 
     'unit' = an original sorter unit = a template id (spike_templates.npy)."""
 
-    def __init__(self, phy_dir, cache_dir=None, need_traces=False):
+    def __init__(self, phy_dir, cache_dir=None, need_traces=False, wf_dir=None):
         self.dir = Path(phy_dir)
+        # where the spike snippets read from the recording are kept (waveforms())
+        self.wf_dir = Path(wf_dir) if wf_dir else (Path(cache_dir) if cache_dir else None)
+        self._wf = None
+        if wf_dir == NO_WAVEFORMS:               # the recording is not to be read
+            self.wf_dir, self._wf = None, False
         p = read_params(self.dir)
         self.fs = float(p["sample_rate"])
         n_ch = int(p["n_channels_dat"])
@@ -314,14 +390,192 @@ class PhyData:
     def units_on_tetrode(self, tet):
         return [u for u in self.units if self.unit_tetrode.get(u) == tet]
 
+    # ---- the spikes' waveforms in the recording --------------------------------
+    def wf_window(self):
+        """(samples before, samples after) the spike time in a snippet."""
+        return int(round(AP_MS_BEFORE * 1e-3 * self.fs)), int(round(AP_MS_AFTER * 1e-3 * self.fs))
+
+    def waveforms(self, build=True):
+        """The snippet cache: dict(spikes = the spike indices that have a snippet,
+        grouped by sorter unit, bounds = unit u's are [bounds[u]:bounds[u + 1]],
+        W = (n, samples, channels) memory-mapped, n_before), or None when there
+        is no recording (or nowhere to keep the snippets). Made on first use
+        (build_waveforms), in wf_dir."""
+        if self._wf is None:
+            self._wf = self._open_waveforms(build) or False
+        return self._wf or None
+
+    def _wf_signature(self):
+        nb, na = self.wf_window()
+        return dict(version=WF_VERSION, n_spikes=int(self.n_spikes), n_before=nb, n_after=na,
+                    unit_spikes=AP_UNIT_SPIKES, n_samples=int(self._dat[3]) if self._dat else -1)
+
+    def _open_waveforms(self, build):
+        d = self.wf_dir
+        if d is None:
+            return None
+        want = self._wf_signature()
+        meta = d / "wf_meta.json"
+        ok = False
+        if meta.exists():
+            try:
+                have = json.loads(meta.read_text())
+                # a cache that is there is used also when the recording has gone since
+                ok = all(have.get(k) == v for k, v in want.items() if k != "n_samples" or self._dat)
+            except (OSError, ValueError):
+                ok = False
+        if not ok:
+            if not build or self._dat is None:
+                return None
+            build_waveforms(self, d, want)
+        spikes = np.load(d / "wf_spikes.npy")
+        return dict(spikes=spikes, bounds=np.load(d / "wf_bounds.npy"), n_before=want["n_before"],
+                    W=np.load(d / "waveforms.npy", mmap_mode="r" if len(spikes) else None))
+
+    def unit_waveforms(self, unit):
+        """(spike indices, ascending; their snippets (n, samples, channels) on
+        np.unique(unit_channels[unit]), in memory) of a sorter unit, or None."""
+        c = self.waveforms()
+        if c is None or unit + 1 >= len(c["bounds"]):
+            return None
+        a, b = int(c["bounds"][unit]), int(c["bounds"][unit + 1])
+        return c["spikes"][a:b], np.array(c["W"][a:b])
+
+    def close_waveforms(self):
+        """Let go of the memory-mapped snippets (Windows cannot delete a mapped file)."""
+        if self._wf:
+            self._wf.clear()
+        self._wf = None
+
+
+def build_waveforms(data, folder, signature):
+    """Read the snippet (AP_MS_BEFORE / AP_MS_AFTER around the spike time, on the
+    channels of its unit's template) of up to AP_UNIT_SPIKES spikes of every
+    sorter unit from the recording, in ONE sequential pass (a recording on a
+    network share gives ~100 MB/s read in order, and 25 ms per snippet read out of
+    order), into `folder`: waveforms.npy (n, samples, channels; the recording's
+    dtype), wf_spikes.npy, wf_bounds.npy, wf_meta.json (written last: its
+    presence marks a finished cache). The recording is only read."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    dat, dtype, offset, n_samples = data._dat
+    nb, na = signature["n_before"], signature["n_after"]
+    nt = nb + na
+    n_ch = data.n_channels
+    n_units = len(data.bounds) - 1
+    n_loc = max([len(np.unique(data.unit_channels[u])) for u in data.units if u in data.unit_channels] or [1])
+    chan = np.full((n_units, n_loc), -1, np.int64)
+    ts = np.asarray(data.spike_samples, dtype=np.int64)
+    kept, bounds = [], [0]
+    for u in range(n_units):
+        sp = data.spikes_of(u)
+        if len(sp) and u in data.unit_channels:
+            ch = np.unique(data.unit_channels[u])[:n_loc]
+            chan[u, :len(ch)] = ch
+            sp = sample_spikes(sp, AP_UNIT_SPIKES, seed_of("wf", u))
+            t = ts[sp]
+            sp = sp[(t >= nb) & (t + na <= n_samples)]
+        else:
+            sp = sp[:0]
+        kept.append(sp)
+        bounds.append(bounds[-1] + len(sp))
+    spikes = np.concatenate(kept) if kept else np.zeros(0, np.int64)
+    unit_of = np.repeat(np.arange(n_units), np.diff(bounds))
+    order = np.argsort(ts[spikes], kind="stable")          # the rows in the order of the recording
+    t_sorted, ch_sorted = ts[spikes][order], chan[unit_of[order]]
+    t0 = time.time()
+    log(f"{data.dir}: reading the waveform of {len(spikes)} spikes from {dat} "
+        f"({n_samples * n_ch * dtype.itemsize / 2 ** 30:.1f} GB, once)")
+    (folder / "wf_meta.json").unlink(missing_ok=True)
+    if not len(spikes):                                    # (an empty file cannot be memory-mapped)
+        np.save(folder / "waveforms.npy", np.zeros((0, nt, n_loc), dtype))
+        np.save(folder / "wf_spikes.npy", spikes)
+        np.save(folder / "wf_bounds.npy", np.asarray(bounds, np.int64))
+        (folder / "wf_meta.json").write_text(json.dumps(signature))
+        return
+    W = np.lib.format.open_memmap(folder / "waveforms.npy", mode="w+", dtype=dtype,
+                                  shape=(len(spikes), nt, n_loc))
+    row = n_ch * dtype.itemsize
+    buf = bytearray((WF_BLOCK + nt) * row)
+    steps = np.arange(nt)
+    i, next_log = 0, 0.25
+    with open(dat, "rb", buffering=0) as fh:
+        for s in range(0, n_samples, WF_BLOCK):
+            j = int(np.searchsorted(t_sorted, s + WF_BLOCK + nb, side="left"))   # those that start in this block
+            if j == i:
+                continue
+            n_read = min(WF_BLOCK + nt, n_samples - s)
+            view = memoryview(buf)[:n_read * row]
+            fh.seek(offset + s * row)
+            got = 0
+            while got < len(view):
+                k = fh.readinto(view[got:])
+                if not k:
+                    raise OSError(f"{dat}: short read at sample {s}")
+                got += k
+            block = np.frombuffer(view, dtype=dtype).reshape(n_read, n_ch)
+            rows = (t_sorted[i:j] - s - nb)[:, None] + steps
+            ch = ch_sorted[i:j]
+            snip = block[rows[:, :, None], np.maximum(ch, 0)[:, None, :]]
+            snip[np.broadcast_to((ch < 0)[:, None, :], snip.shape)] = 0
+            W[order[i:j]] = snip
+            i = j
+            if n_samples and (s + WF_BLOCK) / n_samples >= next_log:
+                log(f"  waveforms: {min(100, round(100 * (s + WF_BLOCK) / n_samples))} % "
+                    f"({time.time() - t0:.0f} s)")
+                next_log += 0.25
+    W.flush()
+    del W
+    np.save(folder / "wf_spikes.npy", spikes)
+    np.save(folder / "wf_bounds.npy", np.asarray(bounds, np.int64))
+    (folder / "wf_meta.json").write_text(json.dumps(signature))
+
+
+class Waveforms:
+    """The mean action potential of spike sets of some sorter units (one unit, or
+    the units a curator's merges connect): their cached snippets, in memory."""
+
+    def __init__(self, data, units):
+        self.n_before = data.wf_window()[0]
+        self.fs = data.fs
+        self.spikes, self.W = np.zeros(0, np.int64), None
+        got, ch0 = [], None
+        for u in units:
+            ch = tuple(np.unique(data.unit_channels[u]))
+            if ch0 is not None and ch != ch0:
+                continue                        # another set of channels: not averaged with these
+            r = data.unit_waveforms(u)
+            if r is not None and len(r[0]):
+                got.append(r)
+                ch0 = ch
+        if got:
+            sp = np.concatenate([g[0] for g in got])
+            o = np.argsort(sp, kind="stable")
+            self.spikes, self.W = sp[o], np.concatenate([g[1] for g in got])[o]
+
+    def mean(self, spikes):
+        """(samples, channels) mean waveform of the spikes (those of them that
+        have a snippet, at most AP_N_SPIKES spread over the set), or None."""
+        if self.W is None:
+            return None
+        spikes = np.asarray(spikes, np.int64)
+        pos = np.searchsorted(self.spikes, spikes)
+        pos[pos >= len(self.spikes)] = 0
+        rows = pos[self.spikes[pos] == spikes]
+        if len(rows) < AP_MIN_SPIKES:
+            return None
+        if len(rows) > AP_N_SPIKES:
+            rows = rows[np.linspace(0, len(rows) - 1, AP_N_SPIKES).astype(np.int64)]
+        return self.W[np.sort(rows)].mean(0, dtype=np.float64)
+
 
 _DATA_CACHE = {}
 
 
-def get_data(phy_dir, cache_dir=None):
-    key = (str(phy_dir), str(cache_dir))
+def get_data(phy_dir, cache_dir=None, wf_dir=None):
+    key = (str(phy_dir), str(cache_dir), str(wf_dir))
     if key not in _DATA_CACHE:
-        _DATA_CACHE[key] = PhyData(phy_dir, cache_dir)
+        _DATA_CACHE[key] = PhyData(phy_dir, cache_dir, wf_dir=wf_dir)
     return _DATA_CACHE[key]
 
 
@@ -612,6 +866,142 @@ def template_features(w, fs):
     idx = np.clip(np.round(t0 + SHAPE_T_MS / ms).astype(int), 0, n - 1)
     for i, v in enumerate(y[idx] / depth):
         f[f"tpl_s{i:02d}"] = float(v)
+    return f
+
+
+def _ramp(x, lo, hi):
+    """0 up to lo, 1 from hi on (lo > hi: the other way round); 0 for NaN."""
+    if not np.isfinite(x):
+        return 0.0
+    return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+
+def _level_crossing(y, i0, step, level):
+    """The (fractional) index where y, followed from i0 in direction `step`,
+    first reaches `level` from below (y[i0] < level); the last index if it never
+    does."""
+    i, n = i0, len(y)
+    while 0 <= i + step < n and y[i + step] < level:
+        i += step
+    j = i + step
+    if not 0 <= j < n:
+        return float(i)
+    d = y[j] - y[i]
+    return float(i + step * (level - y[i]) / d) if d > 0 else float(i)
+
+
+def ap_features(w, fs, n_before):
+    """A mean waveform `w` (samples, channels; the spike time at sample n_before)
+    measured as an extracellular action potential, after Gold et al. 2006 (the
+    rules and their limits: AP_RULE_* above). On the channel with the deepest
+    trough at the spike time:
+      ap_cap_ratio  the positive (capacitive) peak in the 0.5 ms before the trough
+                    / the trough (the Na+ peak);
+      ap_na_w25     the width of the Na+ phase at 25 % of its peak (ms);
+      ap_k_ratio    the positive (K+) peak in the 1.5 ms after the trough / the trough,
+      ap_k_t        its time after the trough (ms), ap_k_w25 its width at 25 % (ms),
+      ap_k_na_dur   = ap_k_w25 / ap_na_w25 (the K+ phase is the longer one);
+      ap_n_neg      negative peaks within 1 ms of the trough (2 = a 'W');
+      ap_pos_ratio  the largest positive deflection / the trough;
+      ap_base       RMS from 1.0 to 0.6 ms before the trough / the trough;
+    over the channels (0.5 ms before to 1.5 ms after the trough):
+      ap_ch_rank1   the share of the waveform's energy that is ONE shape scaled per
+                    channel (1 = the same waveform on every channel),
+      ap_ch_lag     the largest distance in time between the trough and the troughs
+                    of the channels with at least half its depth (ms);
+      ap_viol       how far the waveform is from an action potential: the sum of the
+                    violations of the rules (each 0 ... 1; 0 = follows all of them).
+    All NaN without a waveform."""
+    from scipy.signal import find_peaks
+    f = dict.fromkeys(AP_FEATS, np.nan)
+    if w is None:
+        return f
+    w = np.asarray(w, np.float64)
+    if w.ndim != 2 or w.shape[0] < 8 or not np.all(np.isfinite(w)):
+        return f
+    ms = 1000.0 / fs
+    n = w.shape[0]
+    k05, k06, k10, k15 = (int(round(v / ms)) for v in (0.5, 0.6, 1.0, 1.5))
+    lo, hi = max(n_before - k05, 0), min(n_before + k05 + 1, n)
+    b = int(np.argmin(w[lo:hi].min(0)))
+    y = w[:, b]
+    t0 = lo + int(np.argmin(y[lo:hi]))
+    A = float(-y[t0])
+    if A <= 0:                                   # nothing negative at the spike time: not one
+        f.update(ap_pos_ratio=5.0, ap_n_neg=0.0, ap_viol=3.0)
+        return f
+    pre = y[max(t0 - k05, 0):t0]
+    f["ap_cap_ratio"] = min(max(float(pre.max()), 0.0) / A, 5.0) if len(pre) else 0.0
+    w25 = (_level_crossing(y, t0, 1, -0.25 * A) - _level_crossing(y, t0, -1, -0.25 * A)) * ms
+    f["ap_na_w25"] = float(w25)
+    f["ap_k_ratio"], f["ap_k_t"], f["ap_k_w25"] = 0.0, 0.0, 0.0
+    post = y[t0 + 1:t0 + k15 + 1]
+    if len(post):
+        ik = int(np.argmax(post))
+        pk, K = t0 + 1 + ik, max(float(post[ik]), 0.0)
+        f["ap_k_ratio"], f["ap_k_t"] = min(K / A, 5.0), (ik + 1) * ms
+        if K > 0.05 * A:
+            f["ap_k_w25"] = float((_level_crossing(-y, pk, 1, -0.25 * K) -
+                                   _level_crossing(-y, pk, -1, -0.25 * K)) * ms)
+    f["ap_k_na_dur"] = float(f["ap_k_w25"] / w25) if w25 > 0 else np.nan
+    seg = y[max(t0 - k10, 0):t0 + k10 + 1]
+    f["ap_n_neg"] = float(len(find_peaks(-seg, prominence=AP_W_PROMINENCE * A)[0]))
+    f["ap_pos_ratio"] = min(max(float(y.max()), 0.0) / A, 5.0)
+    base = y[:max(t0 - k06, 0)]
+    f["ap_base"] = min(float(np.sqrt(np.mean(base ** 2))) / A, 5.0) if len(base) >= 3 else np.nan
+    m = w[max(t0 - k05, 0):t0 + k15 + 1]
+    s2 = np.linalg.svd(m, compute_uv=False) ** 2
+    f["ap_ch_rank1"] = float(s2[0] / s2.sum()) if s2.sum() > 0 else np.nan
+    near = w[max(t0 - k05, 0):t0 + k05 + 1]
+    big = -near.min(0) >= 0.5 * A
+    f["ap_ch_lag"] = float(np.max(np.abs(np.argmin(near[:, big], 0) + max(t0 - k05, 0) - t0)) * ms)
+    f["ap_viol"] = (_ramp(f["ap_cap_ratio"], *AP_RULE_CAP) + _ramp(w25, *AP_RULE_NA_NARROW) +
+                    _ramp(w25, *AP_RULE_NA_WIDE) + _ramp(f["ap_pos_ratio"], *AP_RULE_POS) +
+                    float(f["ap_n_neg"] >= 2) + _ramp(1.0 - f["ap_ch_rank1"], *AP_RULE_RANK1) +
+                    _ramp(f["ap_ch_lag"], *AP_RULE_LAG) + _ramp(f["ap_base"], *AP_RULE_BASE))
+    return f
+
+
+def ap_pair_features(wa, wb, fa, fb, fs, n_before):
+    """Two mean waveforms (wa, wb: samples x channels, of two pieces of one
+    recluster; fa, fb: their ap_features): one action potential at two amplitudes,
+    or two? From 0.5 ms before to 1.5 ms after the spike time:
+      wf_sin        sine of the angle between the two waveforms over all channels
+                    (0 = one is the other scaled, as for one neuron whose amplitude
+                    changes; 1 = unrelated),
+      wf_shape_sin  the same for the shape alone: each on its own largest channel,
+      wf_prof_cos   cosine of their amplitude profiles over the channels,
+      wf_amp_ratio  the smaller / the larger trough,
+      wf_d_w25, wf_d_k, wf_d_kt, wf_d_cap  the differences in the width of the Na+
+                    phase (ms), the K+ peak (ratio and time, ms) and the capacitive
+                    peak - what the ion channels of a neuron set."""
+    f = dict.fromkeys(AP_PAIR_FEATS, np.nan)
+    if wa is None or wb is None or np.shape(wa) != np.shape(wb):
+        return f
+    ms = 1000.0 / fs
+    lo = max(n_before - int(round(0.5 / ms)), 0)
+    a = np.asarray(wa, np.float64)[lo:n_before + int(round(1.5 / ms)) + 1]
+    b = np.asarray(wb, np.float64)[lo:n_before + int(round(1.5 / ms)) + 1]
+
+    def sine(u, v):
+        nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+        if nu <= 0 or nv <= 0:
+            return np.nan
+        c = float(np.sum(u * v) / (nu * nv))
+        return float(np.sqrt(max(1.0 - c * c, 0.0))) if c > 0 else 1.0
+
+    f["wf_sin"] = sine(a, b)
+    ca, cb = int(np.argmin(a.min(0))), int(np.argmin(b.min(0)))
+    f["wf_shape_sin"] = sine(a[:, ca], b[:, cb])
+    pa, pb = -a[int(np.argmin(a[:, ca]))], -b[int(np.argmin(b[:, cb]))]
+    na, nb = np.linalg.norm(pa), np.linalg.norm(pb)
+    if na > 0 and nb > 0:
+        f["wf_prof_cos"] = float(pa @ pb / (na * nb))
+    if pa[ca] > 0 and pb[cb] > 0:
+        f["wf_amp_ratio"] = float(min(pa[ca], pb[cb]) / max(pa[ca], pb[cb]))
+    for dst, src in (("wf_d_w25", "ap_na_w25"), ("wf_d_k", "ap_k_ratio"), ("wf_d_kt", "ap_k_t"),
+                     ("wf_d_cap", "ap_cap_ratio")):
+        f[dst] = float(abs(fa[src] - fb[src]))
     return f
 
 
@@ -916,21 +1306,25 @@ def split_table(C, S, P):
     out = S.reset_index(drop=True)
     par = K.reindex(out.parent.values)
     new = {}
-    for f in LABEL_FEATS:
+    for f in LABEL_FEATS + AP_FEATS:
         new[f"c_{f}"] = par[f].values if f in par else np.full(len(out), np.nan)
     g = pieces.groupby("split")
     w = pieces.n_spikes / g.n_spikes.transform("sum")
-    for f in AGG_PIECE:
+    for f in AGG_PIECE + AP_FEATS:
         if f not in pieces:
             continue
         new[f"pmin_{f}"] = out.split.map(g[f].min()).values
         new[f"pmax_{f}"] = out.split.map(g[f].max()).values
         new[f"pavg_{f}"] = out.split.map((pieces[f] * w).groupby(pieces.split).sum(min_count=1)).values
     q = P.groupby("split")
-    for f in PAIR_FEATS:
+    for f in PAIR_FEATS + AP_PAIR_FEATS:
+        if f not in P:
+            continue
         new[f"qmin_{f}"] = out.split.map(q[f].min()).values
         new[f"qmax_{f}"] = out.split.map(q[f].max()).values
         new[f"qmed_{f}"] = out.split.map(q[f].median()).values
+    if "pmin_ap_viol" in new:    # does the cut leave a piece that is more of an action potential
+        new["ap_viol_gain"] = new["c_ap_viol"] - new["pmin_ap_viol"]
     return pd.concat([out, pd.DataFrame(new, index=out.index)], axis=1)
 
 
@@ -973,7 +1367,7 @@ def _X(rows, feats):
 # =============================================================================
 # Candidate reclusters of a recording (worker processes, kept in memory)
 # =============================================================================
-def _unit_task(phy_dir, cache_dir, unit, want_unit, clusters):
+def _unit_task(phy_dir, cache_dir, unit, want_unit, clusters, wf_dir=None):
     """Worker: the candidate reclusters of some clusters of ONE sorter unit.
 
     clusters: [dict(key, depth, chain=[(labels, k), ...], ns=[...])]; the spikes of
@@ -981,7 +1375,9 @@ def _unit_task(phy_dir, cache_dir, unit, want_unit, clusters):
     previous set, piece k). want_unit: also the feature row of the unit itself.
     Returns dict(rows, splits, pairs, labels={(key, n): int8 piece of every spike
     of the cluster})."""
-    data = get_data(phy_dir, cache_dir)
+    data = get_data(phy_dir, cache_dir, wf_dir)
+    wf = Waveforms(data, [unit])
+    waves = {}                                   # key -> (mean waveform, its ap_features)
     noise = data.noise
     n_pcs = int(data.pc_features.shape[1])
     tet = data.unit_tetrode[unit]
@@ -997,6 +1393,9 @@ def _unit_task(phy_dir, cache_dir, unit, want_unit, clusters):
         f.update(extra_cluster_features(data, spikes, x))
         if parent_x is not None:
             f.update(pc_relative(x, parent_x, list(sib_x), n_pcs))
+        w = wf.mean(spikes)
+        waves[key] = (w, ap_features(w, data.fs, wf.n_before))
+        f.update(waves[key][1])
         f.update(key=key, id=-1, unit=unit, tetrode=tet, depth=d, parent=parent_key, split=split_key)
         out["rows"].append(f)
 
@@ -1039,6 +1438,8 @@ def _unit_task(phy_dir, cache_dir, unit, want_unit, clusters):
                     sj = sample_spikes(pieces[j], N_PAIR_SPIKES, seed_of(pkeys[j], "pair"))
                     f = pair_features(data, pieces[i], pieces[j], x[np.searchsorted(sp, si)],
                                       x[np.searchsorted(sp, sj)])
+                    (wi, fi), (wj, fj) = waves[pkeys[i]], waves[pkeys[j]]
+                    f.update(ap_pair_features(wi, wj, fi, fj, data.fs, wf.n_before))
                     f.update(split=skey, a=pkeys[i], b=pkeys[j])
                     out["pairs"].append(f)
             s = dict(split=skey, parent=key, unit=unit, depth=d, n_out=m, n_parent=len(sp), source="rt",
@@ -1055,22 +1456,32 @@ class Session:
     unit, so that an evaluation can curate the recording again with other models
     or settings without computing them again)."""
 
-    def __init__(self, phy_dir, tmp, n_jobs=1, cache_dir=None):
+    def __init__(self, phy_dir, tmp, n_jobs=1, cache_dir=None, wf_dir=None, waveforms=True):
         self.phy, self.tmp, self.n_jobs = Path(phy_dir), Path(tmp), n_jobs
         self.dir = Path(cache_dir) if cache_dir else None
         if self.dir is not None:
             self.dir.mkdir(parents=True, exist_ok=True)
-        self.data = get_data(self.phy, self.tmp)
+        # waveforms=False: the keep model will not look at them, so the recording is not read
+        self.wf_dir = (str(wf_dir) if wf_dir else None) if waveforms else NO_WAVEFORMS
+        self.data = get_data(self.phy, self.tmp, self.wf_dir)
+        # the spikes' waveforms: read from the recording here, once, before the workers start
+        self.has_waveforms = self.data.waveforms() is not None
+        if waveforms and not self.has_waveforms:
+            log(f"{self.phy}: the recording is not there - no action potentials, the keep model "
+                f"decides without them")
         self.mem = {}                    # unit -> dict(rows, splits, pairs, labels, done={(key, n)}, unit_row)
 
     def _load(self, unit):
         if unit not in self.mem:
             f = self.dir / f"u{unit}.pkl" if self.dir is not None else None
+            c = None
             if f is not None and f.exists():
                 with open(f, "rb") as fh:
-                    self.mem[unit] = pickle.load(fh)
-            else:
-                self.mem[unit] = dict(rows=[], splits=[], pairs=[], labels={}, done=set(), unit_row=False)
+                    c = pickle.load(fh)
+                if c.get("fv") != FEATURE_VERSION:        # rows of another version of the features
+                    c = None
+            self.mem[unit] = c or dict(rows=[], splits=[], pairs=[], labels={}, done=set(), unit_row=False,
+                                       fv=FEATURE_VERSION)
         return self.mem[unit]
 
     def ensure(self, requests, want_units=()):
@@ -1088,7 +1499,8 @@ class Session:
         if not todo:
             return
         units = sorted(todo, key=lambda u: -len(self.data.spikes_of(u)))      # largest first
-        args = [(str(self.phy), str(self.tmp), u, todo[u]["want"], todo[u]["clusters"]) for u in units]
+        args = [(str(self.phy), str(self.tmp), u, todo[u]["want"], todo[u]["clusters"], self.wf_dir)
+                for u in units]
         if self.n_jobs and self.n_jobs > 1 and len(units) > 1:
             from joblib import Parallel, delayed
             res = Parallel(n_jobs=self.n_jobs, backend="loky", verbose=0)(
@@ -1166,16 +1578,33 @@ class Models:
     or undone, and the candidate reclusters the curator did not make). The keep
     model also sees the label model's opinion of the cluster and of its pieces
     (STACK_FEATS; in the training table they are cross-fitted: computed with a
-    label forest that did not see that recording)."""
+    label forest that did not see that recording) and the action potentials of
+    the cluster and of its pieces (AP_SPLIT_FEATS). For a recording that is not
+    there any more (no waveforms) a second keep forest, fit without the action
+    potentials, decides (also with use_ap = False)."""
 
     def __init__(self, clusters, splits, params=None, n_jobs=1):
         self.params = dict(DEFAULT_PARAMS, **(params or {}))
         self.n_jobs = n_jobs
         self.label = _fit_label(clusters, n_jobs)
         self.n_label_rows = len(_label_rows_for_fit(clusters))
-        self.keep = _forest(n_jobs).fit(_X(splits, SPLIT_FEATS), splits.kept.astype(int).values,
-                                        sample_weight=np.ones(len(splits)))
+        self._splits = splits
+        self._keep = {}                  # with / without the action potentials: fit on first use
         self.n_split_rows = len(splits)
+        # do the training tables know the action potentials at all (tables of before 2.1 do not)
+        self.trained_ap = bool("c_ap_viol" in splits and np.isfinite(splits["c_ap_viol"].astype(float)).any())
+
+    def keep_forest(self, ap=True):
+        ap = bool(ap and self.trained_ap and self.params.get("use_ap", True))
+        if ap not in self._keep:
+            feats = SPLIT_FEATS if ap else SPLIT_FEATS_NO_AP
+            self._keep[ap] = (_forest(self.n_jobs).fit(_X(self._splits, feats),
+                                                       self._splits.kept.astype(int).values), feats)
+        return self._keep[ap]
+
+    @property
+    def keep(self):
+        return self.keep_forest()[0]
 
     def label_proba(self, rows):
         """(len(rows), 3) P(good / mua / noise) of cluster rows (with context)."""
@@ -1187,10 +1616,12 @@ class Models:
         import pandas as pd
         T = T.reset_index(drop=True)
         T = pd.concat([T, stack_features(C, T, self.label_proba(C))], axis=1)
-        classes = list(self.keep.classes_)
+        has_ap = bool("c_ap_viol" in T and np.isfinite(T["c_ap_viol"].astype(float)).any())
+        clf, feats = self.keep_forest(has_ap)
+        classes = list(clf.classes_)
         if 1 not in classes:
             return np.zeros(len(T))
-        return self.keep.predict_proba(_X(T, SPLIT_FEATS))[:, classes.index(1)]
+        return clf.predict_proba(_X(T, feats))[:, classes.index(1)]
 
 
 def load_training_tables(data_dir=DATA_DIR, exclude=()):
@@ -1736,7 +2167,10 @@ def _write_logs(cur, leaves, ids, labels, conf, step, parent, unit_rows, cuts, s
     accepted, reverted = tree.get("accepted", {}), tree.get("reverted", {})
     lines = [f"Phy auto-curation v{VERSION} - {info['time']}",
              f"Models trained on: {', '.join(info['datasets'])}",
-             f"Settings: {info['params']}", "",
+             f"Settings: {info['params']}",
+             "Keep model: " + ("with the action potentials (mean waveforms read from the recording)"
+                               if info.get("action_potentials", True) else
+                               "WITHOUT the action potentials (the recording is not there, or AUTO_USE_AP=0)"), "",
              "Each unit, in id order: what the label model says of the whole unit and P(keep) of its",
              f"recluster_n {' / '.join(str(n) for n in RECLUSTER_NS)} (- = too few spikes to recluster), the reclusters "
              "that were kept, then the clusters.",
@@ -1839,7 +2273,8 @@ def autocurate_phy_folder(phy_dir, n_jobs=4, redo=False, params=None, data_dir=D
     _original_tsvs(phy, cur)
     tmp = Path(tempfile.mkdtemp(prefix="autocurate_"))  # per-unit spike lists for the workers
     try:
-        sess = Session(phy, tmp, n_jobs)
+        sess = Session(phy, tmp, n_jobs, waveforms=bool(getattr(models, "trained_ap", True) and
+                                                        params.get("use_ap", True)))
         data = sess.data
         leaves, tree = curate(sess, models, params)
         n_rev = len(tree["reverted"])
@@ -1848,6 +2283,7 @@ def autocurate_phy_folder(phy_dir, n_jobs=4, redo=False, params=None, data_dir=D
         spikes = [leaf_spikes(data, lf) for lf in leaves]
         info = dict(version=VERSION, time=_dt.datetime.now().isoformat(timespec="seconds"),
                     reason=reason, params=params, datasets=datasets,
+                    action_potentials=bool(sess.has_waveforms and getattr(models, "trained_ap", True)),
                     n_units=tree["n_units"], n_reclusters=len(tree["accepted"]) - len(tree["reverted"]),
                     runtime_s=round(time.time() - t0))
         counts, n_clusters = write_curation(phy, data, leaves, tree["units"], spikes, params, info, tree)
@@ -1866,6 +2302,8 @@ def _release(tmp):
         get_reusable_executor().shutdown(wait=True)
     except Exception:
         pass
+    for d in _DATA_CACHE.values():
+        d.close_waveforms()
     _DATA_CACHE.clear()
     _FINAL_CLUSTERS.clear()
     import gc
@@ -1930,6 +2368,8 @@ def env_params():
             p["amp_cut_sd"] = float(v) if float(v) > 0 else None
         except ValueError:
             log(f"ignoring AUTO_AMP_CUT_SD={v!r} (not a number)")
+    if not flag("AUTO_USE_AP", default=True):
+        p["use_ap"] = False
     return p
 
 
@@ -2230,13 +2670,80 @@ def replay_log(path, initial_ids=None, initial_groups=None):
                 sessions=session, problems=problems, n_events=n, unknown=sorted(unknown))
 
 
+AUTO_ID0 = 10 ** 7           # ids of the clusters an automatic curation cut again (they never had one)
+
+
+def auto_lineage(phy_dir):
+    """What an automatic curation (v2: _auto_curation/cutting_log.tsv names every
+    cluster by its unit and path) did before the curator checked it in Phy, as
+    actions like those of phy.log: one recluster_n per split it kept (n, parent,
+    the pieces in the order of the mixture components; a piece that was cut again
+    gets an id from AUTO_ID0 on), then its amplitude cuts ('amp_cut': [the noise
+    id, the good id]). Returns dict(actions, groups = {cluster id: label} as the
+    curator found them, version), or None (no automatic curation, or one of v1,
+    whose cuts cannot be rebuilt from its log)."""
+    import pandas as pd
+    cur = Path(phy_dir) / CURATION_DIR
+    try:
+        t = pd.read_csv(cur / "cutting_log.tsv", sep="\t", keep_default_na=False)
+        info = json.loads((cur / "curation.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not {"unit", "path", "cluster", "final_cluster", "label"} <= set(t.columns):
+        return None
+    ids, kids, n_of = {}, defaultdict(dict), {}
+    groups = {}
+    for r in t.itertuples():
+        unit, path = int(r.unit), str(r.path)
+        ids[(unit, path)] = int(r.cluster)
+        groups[int(r.final_cluster)] = str(r.label)
+        tok = [s for s in path.split("/") if s]
+        for i, s in enumerate(tok):
+            n, k = (int(v) for v in s[1:].split("k"))
+            parent, child = "/".join(tok[:i]), "/".join(tok[:i + 1])
+            kids[(unit, parent)][k] = child
+            n_of[(unit, parent)] = n
+    nxt = AUTO_ID0
+    for unit, parent in sorted(kids, key=lambda q: (q[1].count("/") + bool(q[1]), q[0], _path_order(q[1]))):
+        if (unit, parent) not in ids:
+            if parent == "":
+                ids[(unit, parent)] = unit
+            else:
+                ids[(unit, parent)] = nxt
+                nxt += 1
+    actions = []
+    for unit, parent in sorted(kids, key=lambda q: (q[1].count("/") + bool(q[1]), q[0], _path_order(q[1]))):
+        ch = kids[(unit, parent)]
+        if sorted(ch) != list(range(len(ch))):
+            return None                                     # a piece is missing: not a log of v2
+        actions.append(dict(kind="recluster_n", n=n_of[(unit, parent)], parents=[ids[(unit, parent)]],
+                            children=[ids[(unit, ch[k])] for k in range(len(ch))]))
+    cuts = cur / "amplitude_cuts.tsv"
+    if cuts.exists():
+        k_sd = (info.get("params") or {}).get("amp_cut_sd") or AMP_CUT_SD
+        for r in pd.read_csv(cuts, sep="\t").itertuples():
+            actions.append(dict(kind="amp_cut", k_sd=float(k_sd), parents=[int(r.cluster)],
+                                children=[int(r.noise_id), int(r.good_id)]))
+            groups[int(r.noise_id)] = "noise"
+    for i, a in enumerate(actions):
+        a.update(idx=i, session=0, t=0.0, n_spikes=None, undone=False, saved=True, scripted=False, auto=True,
+                 parent_groups=["unsorted"] * len(a["parents"]))
+    return dict(actions=actions, groups=groups, version=str(info.get("version", "")))
+
+
 def replay_curation(phy_dir):
     """The replay of a curated phy folder's phy.log, checked against the saved
     curation: dict(n_units, actions, labels, live = the labels the replay ends
     with, final = cluster_group.tsv, missing / extra / wrong = the labelled
     clusters the replay does not give / gives but the curation has not / gives
     another label, problems). As it is stored in a bank folder (replay.json).
-    Reads only."""
+
+    An automatic curation that was checked in Phy afterwards: the log starts
+    from its clusters, not from the sorter's units. Its cuts (auto_lineage) then
+    come first, as actions marked auto, and the log is replayed from the clusters
+    it left - if that ends in the saved curation (auto = its version; else the
+    log has sessions of before the automatic curation and is replayed from the
+    sorter's units as before, which explains less). Reads only."""
     import pandas as pd
     phy = Path(phy_dir)
     st = np.load(phy / "spike_templates.npy", mmap_mode="r").reshape(-1)
@@ -2245,24 +2752,49 @@ def replay_curation(phy_dir):
     if (phy / "cluster_group.tsv").exists():
         g = pd.read_csv(phy / "cluster_group.tsv", sep="\t")
         final = dict(zip(g.cluster_id.astype(int), g.iloc[:, 1].astype(str)))
-    init_groups = {}
-    qc = phy / "quality_check_labels.csv"
-    if qc.exists():
-        q = pd.read_csv(qc, index_col=0)
-        init_groups = dict(zip(range(len(q)), q["quality_label"].astype(str)))
-    if (phy / "phy.log").exists():
-        r = replay_log(phy / "phy.log", initial_ids=units, initial_groups=init_groups)
-    else:
-        r = dict(actions=[], labels=[], live=dict.fromkeys(units, "unsorted"), problems=["no phy.log"])
-        r["live"].update({c: g for c, g in init_groups.items() if c in r["live"]})
-    live = r["live"]
     labelled = {c: v for c, v in final.items() if v in LABELS}
-    missing = sorted(set(labelled) - set(live))             # in the curation, not in the replay
-    extra = sorted(c for c in live if c not in final and live[c] in LABELS)
-    wrong = sorted(c for c in labelled if c in live and live[c] != labelled[c])
+
+    def check(live):
+        missing = sorted(set(labelled) - set(live))         # in the curation, not in the replay
+        extra = sorted(c for c in live if c not in final and live[c] in LABELS)
+        wrong = sorted(c for c in labelled if c in live and live[c] != labelled[c])
+        return missing, extra, wrong
+
+    r, auto_version = None, None
+    auto = auto_lineage(phy)
+    if auto is not None:
+        if (phy / "phy.log").exists():
+            ra = replay_log(phy / "phy.log", initial_ids=list(auto["groups"]), initial_groups=auto["groups"])
+        else:
+            ra = dict(actions=[], labels=[], live=dict(auto["groups"]), problems=["no phy.log"], unknown=[])
+        missing, extra, wrong = check(ra["live"])
+        if not (missing or wrong or ra.get("unknown")):
+            m = len(auto["actions"])
+            for a in ra["actions"]:
+                a["idx"] += m
+            for lb in ra["labels"]:
+                lb["after_action"] += m
+            ra["actions"] = auto["actions"] + ra["actions"]
+            r, auto_version = ra, auto["version"]
+    if r is None:
+        init_groups = {}
+        qc = phy / "quality_check_labels.csv"
+        if qc.exists():
+            q = pd.read_csv(qc, index_col=0)
+            init_groups = dict(zip(range(len(q)), q["quality_label"].astype(str)))
+        if (phy / "phy.log").exists():
+            r = replay_log(phy / "phy.log", initial_ids=units, initial_groups=init_groups)
+        else:
+            r = dict(actions=[], labels=[], live=dict.fromkeys(units, "unsorted"), problems=["no phy.log"])
+            r["live"].update({c: g for c, g in init_groups.items() if c in r["live"]})
+        if auto is not None:
+            r["problems"].append("the log does not start from the automatic curation in _auto_curation "
+                                 "(sessions of before it): replayed from the sorter's units")
+    live = r["live"]
+    missing, extra, wrong = check(live)
     R = dict(phy=str(phy), n_units=len(units), actions=r["actions"], labels=r["labels"],
              live={int(k): v for k, v in live.items()}, final={int(k): v for k, v in final.items()},
-             missing=missing, extra=extra, wrong=wrong, problems=r["problems"])
+             missing=missing, extra=extra, wrong=wrong, problems=r["problems"], auto=auto_version)
     return json.loads(json.dumps(R))                        # as it is read back from replay.json
 
 
@@ -2301,10 +2833,12 @@ def _scratch_originals(phy, cache):
         _original_tsvs(Path(phy), Path(cache))
 
 
-def _group_task(phy_dir, cache_dir, grp):
+def _group_task(phy_dir, cache_dir, grp, wf_dir=None):
     """Worker: one connected group of sorter units (usually one): simulate the
     curator's actions on it and compute every feature row. grp: units, actions."""
-    data = get_data(phy_dir, cache_dir)
+    data = get_data(phy_dir, cache_dir, wf_dir)
+    wf = Waveforms(data, grp["units"])
+    waves = {}                                   # key -> (mean waveform, its ap_features)
     sc = _final_clusters(phy_dir)
     noise = data.noise
     n_pcs = int(data.pc_features.shape[1])
@@ -2364,6 +2898,9 @@ def _group_task(phy_dir, cache_dir, grp):
         f.update(extra_cluster_features(data, spikes, x))
         if parent_x is not None:
             f.update(pc_relative(x, parent_x, list(sib_x), n_pcs))
+        w = wf.mean(spikes)
+        waves[key] = (w, ap_features(w, data.fs, wf.n_before))
+        f.update(waves[key][1])
         f.update(key=key, id=cid, unit=unit, tetrode=tet, depth=d, parent=parent_key, split=split_key)
         rows.append(f)
 
@@ -2383,6 +2920,8 @@ def _group_task(phy_dir, cache_dir, grp):
                 sj = sample_spikes(pieces[j], N_PAIR_SPIKES, seed_of(piece_keys[j], "pair"))
                 f = pair_features(data, pieces[i], pieces[j],
                                   px[np.searchsorted(parent_spikes, si)], px[np.searchsorted(parent_spikes, sj)])
+                (wi, fi), (wj, fj) = waves[piece_keys[i]], waves[piece_keys[j]]
+                f.update(ap_pair_features(wi, wj, fi, fj, data.fs, wf.n_before))
                 f.update(split=split_key, a=piece_keys[i], b=piece_keys[j])
                 pairs.append(f)
         s = dict(split=split_key, parent=parent_key, unit=unit, depth=d, n_out=len(pieces),
@@ -2458,13 +2997,17 @@ def _group_task(phy_dir, cache_dir, grp):
         tk = {k: get_truth(k) for k in kids}
         cand, info, px = None, {}, None
         if kind == "recluster_n":
+            n_req = int(a.get("n") or len(kids))     # (an automatic curation names its n)
             for p in parents:
-                tried[p].add(len(kids))
-            lab, px, info = recluster(data, P, channels, len(kids))
+                tried[p].add(n_req)
+            lab, px, info = recluster(data, P, channels, n_req)
             if lab is not None:
                 uniq = np.unique(lab)
                 if len(uniq) == len(kids):
                     cand = {k: P[lab == uu] for k, uu in zip(kids, uniq)}
+        elif kind == "amp_cut" and len(kids) == 2:   # of an automatic curation: [noise, good]
+            cut = amplitude_cut(data.amplitudes, P, a.get("k_sd") or AMP_CUT_SD)
+            cand = {kids[0]: P[cut], kids[1]: P[~cut]}
         known = [k for k in kids if tk[k] is not None]
         pieces = None
         if cand is not None:
@@ -2512,7 +3055,9 @@ def _group_task(phy_dir, cache_dir, grp):
         if len(new) == len(kids):
             split_rows(skey, pkey, P, unit, d, [pieces[k] for k in kids], [f"c{k}" for k in kids], kids,
                        nb_parent, dict(source="user", kind=kind, action=a["idx"], kept=is_kept,
-                                       undone=bool(a["undone"]), saved=bool(a["saved"]), n=len(kids),
+                                       auto=bool(a.get("auto")),
+                                       undone=bool(a["undone"]), saved=bool(a["saved"]),
+                                       n=int(a.get("n") or len(kids)),
                                        n_parents=len(parents), session=a["session"], t=a["t"]),
                        info, px if px is not None else None)
             done_rows.update(f"c{k}" for k in kids)
@@ -2560,27 +3105,46 @@ def _group_task(phy_dir, cache_dir, grp):
                 depths={int(c): int(v) for c, v in depth.items()})
 
 
-def build_bank(phy_dir, cache_dir, n_jobs=1, name=None):
+def _bank_is_current(out):
+    """Does the bank folder hold feature rows of this version (the action
+    potential columns are there)?"""
+    try:
+        with open(Path(out) / "clusters.tsv") as fh:
+            return "ap_viol" in fh.readline().rstrip("\n").split("\t")
+    except OSError:
+        return False
+
+
+def build_bank(phy_dir, cache_dir, n_jobs=1, name=None, wf_dir=None):
     """The curator bank of one hand-curated phy_export, in `cache_dir` (see
     above; `name` = the dataset name written into the tables, default: the
     folder's name). A folder that already has clusters.tsv is reused, not
-    computed again. The phy folder is only read: scratch files (per-unit spike
-    lists, the sorter units' metric files) go into cache_dir/cache, which is
-    deleted at the end. Returns cache_dir."""
+    computed again (unless its rows are of before the action potentials). The phy
+    folder and the recording are only read: scratch files (per-unit spike lists,
+    the sorter units' metric files, the spikes' waveforms read from the
+    recording) go into cache_dir/cache, which is deleted at the end; `wf_dir`
+    keeps the waveforms (several GB) there instead, for a Session to use them
+    again. Returns cache_dir."""
     import pandas as pd
     out = Path(cache_dir)
     phy = Path(phy_dir)
     name = name or out.name
     if (out / "clusters.tsv").exists():
-        if not (out / "replay.json").exists():       # a bank of before the replay was kept with it
-            (out / "replay.json").write_text(json.dumps(replay_curation(phy)))
-        return out
+        if _bank_is_current(out):
+            if not (out / "replay.json").exists():       # a bank of before the replay was kept with it
+                (out / "replay.json").write_text(json.dumps(replay_curation(phy)))
+            return out
+        log(f"bank of {name}: made before the action potentials were measured - computed again")
+        (out / "clusters.tsv").unlink()
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     R = replay_curation(phy)
     cache = out / "cache"
     _scratch_originals(phy, cache)
-    data = get_data(phy, cache)
+    wf_dir = str(wf_dir) if wf_dir else None
+    data = get_data(phy, cache, wf_dir)
+    if data.waveforms() is None:         # read from the recording here, once, before the workers start
+        log(f"bank of {name}: the recording is not there - its rows have no action potentials")
     # group the sorter units that the curator's actions connect (merges across units)
     par = {u: u for u in data.units}
 
@@ -2611,9 +3175,9 @@ def build_bank(phy_dir, cache_dir, n_jobs=1, name=None):
     if n_jobs and n_jobs > 1:
         from joblib import Parallel, delayed
         res = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
-            delayed(_group_task)(str(phy), str(cache), g) for g in glist)
+            delayed(_group_task)(str(phy), str(cache), g, wf_dir) for g in glist)
     else:
-        res = [_group_task(str(phy), str(cache), g) for g in glist]
+        res = [_group_task(str(phy), str(cache), g, wf_dir) for g in glist]
     rows = [r for x in res for r in x["rows"]]
     splits = [r for x in res for r in x["splits"]]
     pairs = [r for x in res for r in x["pairs"]]
@@ -2640,8 +3204,8 @@ def build_bank(phy_dir, cache_dir, n_jobs=1, name=None):
     (out / "replay.json").write_text(json.dumps(R))
     C.to_csv(out / "clusters.tsv", sep="\t", index=False)      # last: its presence marks a finished bank
     n_ok = sum(verified.values())
-    sim = A.sim.value_counts().to_dict() if len(A) else {}
-    n_user = int((S.source == "user").sum()) if len(S) else 0
+    sim = A.sim.value_counts().to_dict() if "sim" in A else {}
+    n_user = int(((S.source == "user") & (S.kind != "amp_cut")).sum()) if len(S) else 0
     log(f"bank of {name}: {len(C)} cluster rows, {len(S)} reclusters ({n_user} by the curator), "
         f"{len(Pq)} pairs; final clusters reproduced exactly: {n_ok}/{len(verified)}; "
         f"actions: {sim}; {time.time() - t0:.0f} s")
@@ -2680,7 +3244,11 @@ def load_bank(cache_dir):
     C, S = undo_merge_backs(C, S)
     # a recluster that was neither undone nor saved (the GUI closed on it) says nothing
     lost = (S.source == "user") & (~S.saved.astype(bool)) & (~S.undone.astype(bool))
-    S = S[~lost].reset_index(drop=True)
+    # the amplitude cut of an automatic curation is a rule, not a recluster to learn from
+    S = S[~lost & (S.kind != "amp_cut")].reset_index(drop=True)
+    if "auto" not in S:
+        S["auto"] = False
+    S["auto"] = S.auto.eq(True)
     C = add_ctx(C, P)
     return dict(C=C, S=S, P=P, R=R, T=split_table(C, S, P))
 
@@ -2868,6 +3436,14 @@ def cmd_train(curated, names, cache_root, n_jobs, data_dir=DATA_DIR, replace=Fal
         log(f"{name}: {n_lab} labelled final clusters {L[name].label.value_counts().to_dict()}, "
             f"{len(user)} recluster(s) by the curator ({int(user.kept.astype(bool).sum())} kept), "
             f"{len(T) - len(user)} of {n_cand} candidate reclusters never made")
+        if R.get("auto"):
+            Sb, Cb = banks[name]["S"], banks[name]["C"]
+            n_hand = int(Cb.explicit.sum()) + sum(1 for a in R["actions"] if not a.get("auto"))
+            log(f"{name}: an automatic curation (v{R['auto']}) checked in Phy - {int(Sb.auto.sum())} of the "
+                f"reclusters are its own ({int((Sb.auto & Sb.kept.astype(bool)).sum())} left standing by the "
+                f"curator: kept), {int(Cb.explicit.sum())} labels set by hand" +
+                ("" if n_hand else ". NOTHING was changed by hand: is it checked? Training on an unchecked "
+                                   "automatic curation teaches the models their own output"))
         if n_fit < n_lab:
             log(f"{name}: phy.log does not give the history of {n_lab - n_fit} of these {n_lab} final clusters "
                 f"(the log cannot be replayed into them: cut or merged outside the logged actions, or a log "
@@ -2893,27 +3469,34 @@ def cmd_train(curated, names, cache_root, n_jobs, data_dir=DATA_DIR, replace=Fal
         f"{clusters.dataset.nunique()} curation(s)")
 
 
-def evaluate_lodo(curated, names, cache_root, n_jobs=1, params=None, cand_frac=CAND_FRAC, out=None):
+def evaluate_lodo(curated, names, cache_root, n_jobs=1, params=None, cand_frac=CAND_FRAC, out=None,
+                  train_only=(), train_only_names=()):
     """Leave-one-recording-out: fit the models on the banks of the other
     recordings (the label model's opinion in the recluster rows cross-fitted
     inside the fold), curate the held-out recording from its sorter units,
     compare with its hand curation. The curated folders are only read; the
-    candidate reclusters of each recording are kept in cache_root/<name>/candidates."""
+    candidate reclusters of each recording are kept in cache_root/<name>/candidates.
+    train_only (+ names): curations that are in every training set and never
+    held out - an automatic curation checked in Phy cannot be the yardstick."""
     import pandas as pd
     params = dict(DEFAULT_PARAMS, **(params or {}))
     banks = {}
-    for phy, name in zip(curated, names):
-        banks[name] = load_bank(build_bank(phy, Path(cache_root) / name, n_jobs, name=name))
+    every = list(names) + list(train_only_names)
+    wf_dirs = {name: Path(cache_root) / name / "waveforms" for name in every}   # read once, used twice
+    for phy, name in zip(list(curated) + list(train_only), every):
+        banks[name] = load_bank(build_bank(phy, Path(cache_root) / name, n_jobs, name=name,
+                                           wf_dir=wf_dirs[name]))
     rows = []
     for phy, test in zip(curated, names):
         t0 = time.time()
-        train = [n for n in names if n != test]
+        train = [n for n in every if n != test]
         clusters, splits = tables_from_banks(banks, train, n_jobs, cand_frac)
         models = Models(clusters, splits, params, n_jobs=n_jobs)
         tmp = Path(tempfile.mkdtemp(prefix="autocurate_"))
         try:
             _scratch_originals(phy, tmp)
-            sess = Session(phy, tmp, n_jobs, cache_dir=Path(cache_root) / test / "candidates")
+            sess = Session(phy, tmp, n_jobs, cache_dir=Path(cache_root) / test / "candidates",
+                           wf_dir=wf_dirs[test])
             sc, grp = curated_labels(phy)
             leaves, tree = curate(sess, models, params)
             pred, plab = leaves_to_pred(sess.data, leaves, params.get("amp_cut_sd"))
@@ -2959,16 +3542,22 @@ def main(argv=None):
     ev.add_argument("--n_jobs", type=int, default=4)
     ev.add_argument("--out", default=None)
     ev.add_argument("--cand_frac", type=float, default=CAND_FRAC)
+    ev.add_argument("--train_only", nargs="*", default=[],
+                    help="curations that are trained on in every fold and never held out "
+                         "(automatic curations checked in Phy)")
+    ev.add_argument("--train_only_names", nargs="*", default=[])
     args = ap.parse_args(argv)
     if args.cmd in ("train", "evaluate") and len(args.curated) != len(args.names):
         ap.error("give one --names entry per --curated folder")
+    if args.cmd == "evaluate" and len(args.train_only) != len(args.train_only_names):
+        ap.error("give one --train_only_names entry per --train_only folder")
     if args.cmd == "train":
         cmd_train(args.curated, args.names, args.cache, args.n_jobs, args.data_dir, args.replace,
                   args.cand_frac)
         return
     if args.cmd == "evaluate":
         res = evaluate_lodo(args.curated, args.names, args.cache, args.n_jobs, env_params(),
-                            args.cand_frac, args.out)
+                            args.cand_frac, args.out, args.train_only, args.train_only_names)
         cols = ["test", "good_f1", "good_recall", "good_precision", "spike_acc", "n_good_pred", "n_good_user",
                 "n_unsorted", "n_clusters", "n_splits"]
         print(res[cols].to_string(index=False))

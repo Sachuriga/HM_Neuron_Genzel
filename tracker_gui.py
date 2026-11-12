@@ -26,9 +26,9 @@ launches, and a folder can be dropped onto it to make it the data root.
 
 from __future__ import annotations
 
+import codecs
 import csv
 import math
-import os
 import re
 import sys
 import tempfile
@@ -921,6 +921,10 @@ class TrackerGUI(QMainWindow):
         self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self._read_output)
         self.proc.finished.connect(self._on_finished)
+        self.proc.errorOccurred.connect(self._on_error)
+        # the output arrives in arbitrary pieces: a character cut in two by a piece
+        # boundary ("—", "→", "…") is kept back until its other half arrives
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.proc.start(sys.executable, ["-u", str(RUNNER), root])
 
         dry = " (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
@@ -992,9 +996,21 @@ class TrackerGUI(QMainWindow):
         self.proc.kill()
 
     def _read_output(self):
-        data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
-        self._append(data)
-        self._follow(data)
+        if self.proc is None:
+            return
+        data = self._decoder.decode(bytes(self.proc.readAllStandardOutput()))
+        if data:
+            self._append(data)
+            self._follow(data)
+
+    def _on_error(self, error):
+        """The runner could not be started: `finished` never comes in that case,
+        so without this the window would stay on "Running…" for good."""
+        if error != QProcess.ProcessError.FailedToStart or self.proc is None:
+            return                               # a crash / kill still ends in _on_finished
+        self._append(f"\n[genzeltracker] could not start the runner: "
+                     f"{self.proc.errorString()}\n")
+        self._on_finished(-1, None)
 
     # ------------------------------------------------------------- session jobs
     def _reset_jobs(self):
@@ -1074,6 +1090,7 @@ class TrackerGUI(QMainWindow):
         self.statusBar().showMessage(f"Finished (exit {code}) after {elapsed}.")
         self._show_idle()
         self.stop_btn.setEnabled(False)
+        self.proc.deleteLater()                  # or every run leaves a QProcess behind
         self.proc = None
         if code == 0:
             self._set_hint(f"✓ Finished after {elapsed}.", "ok")

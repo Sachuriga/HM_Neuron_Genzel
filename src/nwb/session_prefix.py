@@ -9,6 +9,7 @@ the session identity already present in the output folder (the ``.nwb`` file, th
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 
 _SESSION_RE = re.compile(r"(?P<rat>[A-Za-z]+\d+).*?(?P<dt>\d{8}_\d{6})")
@@ -22,12 +23,24 @@ def _from_name(name: str) -> str:
 def file_prefix(output_folder) -> str:
     """Derive ``'Rat6_20260707_091045_'`` from the session identity in
     ``output_folder`` (``.nwb`` name > ``*_sorting_output`` folder > folder name).
-    Returns ``''`` if nothing parseable is found (callers fall back to no prefix)."""
+    Returns ``''`` if nothing parseable is found (callers fall back to no prefix).
+
+    The answer is remembered per folder for the life of the process: finding it
+    can mean listing the whole folder tree (slow on the share), and the video
+    steps ask once per output file."""
+    return _file_prefix(str(Path(output_folder)))
+
+
+@lru_cache(maxsize=None)
+def _file_prefix(output_folder: str) -> str:
     op = Path(output_folder)
-    for nwb in sorted(op.glob("*.nwb")) + sorted(op.glob("**/*.nwb")):
-        p = _from_name(nwb.stem)
-        if p:
-            return p
+    # the files directly in the folder first; the whole tree is only listed when
+    # none of them names the session
+    for nwbs in (op.glob("*.nwb"), op.glob("**/*.nwb")):
+        for nwb in sorted(nwbs):
+            p = _from_name(nwb.stem)
+            if p:
+                return p
     for d in sorted(op.glob("*_sorting_output")):
         p = _from_name(d.name)
         if p:

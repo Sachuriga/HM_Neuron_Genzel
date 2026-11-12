@@ -436,6 +436,13 @@ class Tracker:
         pbar_total = (min(total_frames, stop_frame) if stop_frame is not None else total_frames) - frame_index
         pbar = tqdm(total=max(pbar_total, 0), unit='frames', desc='Processing', ncols=100)
 
+        # The synchronised time written into each log line. The loader prefers the
+        # seconds file, which has no 'Corrected Time Stamp' column, so looking only
+        # that column up wrote "N/A" into every line: fall back to the column the
+        # summaries use (as export_tracking_data does).
+        log_ts = (self.sync_ts_dict.get("Corrected Time Stamp")
+                  or self.sync_ts_dict.get(self.ts_column_name, {}))
+
         while True:
             success, self.frame = self.cap.read()
             if not success:
@@ -507,7 +514,7 @@ class Tracker:
             })
 
             if self.record_detections:
-                ts_val = self.sync_ts_dict.get("Corrected Time Stamp", {}).get(frame_itr, "N/A")
+                ts_val = log_ts.get(frame_itr, "N/A")
                 if self.saved_nodes:
                     self.logger.info(
                         f'{self.converted_time} {ts_val} : The rat position is: {self.pos_centroid} @ {self.saved_nodes[-1]}')
@@ -1087,66 +1094,6 @@ class Tracker:
                 if self.covering_start_node:
                     self.covering_start_node = False
                     self.cover_start_timer = 0.0
-
-    def object_detection(self, rat):
-        self.pos_centroid = rat
-        self.centroid_list.append(self.pos_centroid)
-
-        is_immune = self.check_immunity()
-        is_did_not_reach = (self.counter < len(self.did_not_reach_list) and
-                            self.did_not_reach_list[self.counter] == 1)
-
-        if self.NGL:
-            minutes = self.timer(start=self.start_time)
-            if not self.reached:
-                if points_dist(self.pos_centroid, self.goal_location) <= 20:
-                    self.reached = True
-            if minutes >= 10:
-                print('\n\n >>> Ten minute passed... Goal location reached:', self.reached)
-                if self.reached:
-                    if not is_immune:
-                        print('\n\n >>> End New Goal Location Trial - timeout', self.trial_num, ' out of ',
-                            self.num_trials)
-                        self.NGL = False
-                        self.reached = False
-                        self.end_trial(reason="NGL 10min timeout")
-
-        if self.probe:
-            minutes = self.timer(start=self.start_time)
-            if minutes > 2:
-                if not self.probe_researcher_signalled:
-                    closest_to_goal = self.closest_researcher_to(self.goal_location)
-                    if (closest_to_goal is not None and
-                            points_dist(closest_to_goal, self.goal_location) <= 80):
-                        self.probe_researcher_signalled = True
-                else:
-                    if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
-                        if not is_immune:
-                            self.probe = False
-                            self.probe_researcher_signalled = False
-                            self.end_trial(reason="probe complete")
-
-        if self.normal_trial:
-            if not is_did_not_reach:
-                if points_dist(self.pos_centroid, self.goal_location) <= self.goal_node_radius:
-                    if not is_immune:
-                        self.normal_trial = False
-                        self.end_trial(reason="normal reached goal")
-            else:
-                # "Did Not Reach" end logic: trial ends when rat is picked up by researcher
-                # Use closest researcher to the RAT for pickup detection
-                closest_to_rat = self.closest_researcher_to(self.pos_centroid)
-                if closest_to_rat is not None:
-                    dist_to_researcher = points_dist(self.pos_centroid, closest_to_rat)
-                    if dist_to_researcher <= 60:
-                        self.pickup_timer += (1.0 / self.vid_fps)
-                        if self.pickup_timer >= 1.0:
-                            print(f'\n\n >>> Did Not Reach: Trial {self.trial_num} ended - rat picked up by researcher')
-                            self.normal_trial = False
-                            self.end_trial(reason="DNR rat picked up")
-                            self.pickup_timer = 0.0
-                    else:
-                        self.pickup_timer = 0.0
 
     def object_detection(self, rat):
         self.pos_centroid = rat
@@ -1737,9 +1684,12 @@ class Tracker:
                         fontFace=FONT, fontScale=0.65, color=(255, 255, 255), thickness=1)
 
             if len(self.centroid_list) >= 2:
-                for i in range(1, len(self.centroid_list)):
-                    cv2.line(frame, self.centroid_list[i], self.centroid_list[i - 1],
-                             color=(255, 0, 60), thickness=1)
+                # One polyline, not one cv2.line per point: the track is drawn again
+                # on every frame and has tens of thousands of points in a long trial
+                # (a 10-min trial: 18 000 calls per frame), which slowed the tracker
+                # down more and more as a trial went on. The picture is the same.
+                track = np.asarray(self.centroid_list, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(frame, [track], isClosed=False, color=(255, 0, 60), thickness=1)
             cv2.line(frame, (self.pos_centroid[0] - 5, self.pos_centroid[1]),
                      (self.pos_centroid[0] + 5, self.pos_centroid[1]),
                      color=(0, 255, 0), thickness=2)
@@ -2074,7 +2024,8 @@ def parse_metadata_xlsx(xlsx_path):
 # --- MAIN ---
 if __name__ == "__main__":
     try:
-        node_list = Path('src/tools/node_list_new.csv').resolve()
+        # in src/tools next to this file's folder, whatever the working directory is
+        node_list = Path(_SRC_DIR) / 'tools' / 'node_list_new.csv'
         print('\n\nTracker version: v2.11-YOLO11 (Headless / Mass Analysis)\n\n')
 
         # Argument Parsing
@@ -2098,7 +2049,10 @@ if __name__ == "__main__":
             sys.exit(1)
 
         # 2. Find the meta file
-        meta_files = glob.glob(os.path.join(in_p, '*RecordingMeta.xlsx'))
+        # not Excel's lock file (~$...) or a macOS sidecar (._...): neither is a
+        # workbook, and either can come first in the listing
+        meta_files = sorted(f for f in glob.glob(os.path.join(in_p, '*RecordingMeta.xlsx'))
+                            if not os.path.basename(f).startswith(('~$', '._')))
         if not meta_files:
             print(f"ERROR: No file found matching pattern '*RecordingMeta.xlsx' in folder: {in_p}")
             sys.exit(1)

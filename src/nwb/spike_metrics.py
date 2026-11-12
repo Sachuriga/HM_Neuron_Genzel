@@ -63,7 +63,10 @@ def autocorrelogram(spike_times, window_s, bin_s, max_spikes=50000):
     (zero lag excluded). Returns (counts, bin-centres in ms)."""
     st = np.sort(np.asarray(spike_times, dtype=float))
     if st.size > max_spikes:                     # cap for runtime on fast cells
-        st = np.sort(np.random.choice(st, max_spikes, replace=False))
+        # Seeded: the same spikes every time. An unseeded sample gave a fast cell a
+        # slightly different ACG (so tau_rise, so possibly cell_type) on every run,
+        # and step v could show another value than the one step u stored.
+        st = np.sort(np.random.default_rng(0).choice(st, max_spikes, replace=False))
     n = st.size
     if n < 2:
         return None, None

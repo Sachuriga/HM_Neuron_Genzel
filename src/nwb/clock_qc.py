@@ -650,10 +650,18 @@ def run(op, out_dir=None, repair=False, with_offset=False, in_place=False, auto=
     # Two independent ephys-clock signals; a spurious window in one does not move the fit.
     signals, sources = {}, []
     if signal in ("auto", "theta") and inp["lfp"] is not None:
-        te, sig, ch, fs = theta_amplitude(inp["lfp"], inp["lfp_ts"], channel=channel,
-                                          expected_duration=float(tv[-1] - max(tv[0], 0.0)))
-        signals["theta"] = (te, sig)
-        sources.append(f"theta amplitude (LFP ch {ch}, {fs:.0f} Hz)")
+        try:
+            te, sig, ch, fs = theta_amplitude(inp["lfp"], inp["lfp_ts"], channel=channel,
+                                              expected_duration=float(tv[-1] - max(tv[0], 0.0)))
+            signals["theta"] = (te, sig)
+            sources.append(f"theta amplitude (LFP ch {ch}, {fs:.0f} Hz)")
+        except (FileNotFoundError, ValueError, OSError) as e:
+            # an LFP export without usable timestamps must not stop the check when
+            # the spikes can still do it (explicitly asked for theta: report it)
+            if signal == "theta":
+                raise
+            print(f"[clock-qc] {op.name}: LFP not usable for the check ({e}); "
+                  f"using the spikes only")
     if signal in ("auto", "spikes") and inp["phy"] is not None:
         signals["spikes"] = spike_rate(inp["phy"])
         sources.append("population spike rate (phy)")

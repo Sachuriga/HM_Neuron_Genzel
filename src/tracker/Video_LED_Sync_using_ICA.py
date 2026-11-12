@@ -232,7 +232,7 @@ def get_dio_files(path: Path):
             candidates = sorted(path.rglob(pattern))
             if candidates:
                 files = candidates
-                if pattern.endswith('_MCU_'):
+                if '_MCU_' in pattern:      # (endswith was never true: they end in .dat)
                     print(f"{key.capitalize()} → using MCU naming (Plan B)")
                 break
         dio[key] = files
@@ -821,7 +821,9 @@ def extract_dio_com(dio_file_path_dict, sampling_freq, fallback_start_time=None)
 
     print("----------------------------------------------------------")
     print(sys_time)
-    timestamp_at_creation = int(sys_time_dict['timestamp_at_creation'])
+    # timestamp_at_creation is set above, by the normal path or by the fallback.
+    # (It was read from the header a second time here, which undid the fallback
+    # and raised KeyError for exactly the files the fallback is for.)
     first_timestamp = int(sys_time_dict['first_timestamp'])
     sys_time_dt = pd.to_datetime(sys_time, unit='s', utc=False)
     

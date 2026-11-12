@@ -104,10 +104,13 @@ def find_phy_folders(output_folder):
 def find_nwb_file(output_folder):
     """The session NWB (step 4 / step 8) lives directly in the op folder as Rat*_*.nwb."""
     op = Path(output_folder)
-    cands = [p for p in sorted(op.glob("*.nwb")) if not p.name.endswith(".tmp.nwb")]
+    # skip *.tmp.nwb and macOS AppleDouble sidecars ("._*.nwb": a Mac writes them next
+    # to files on the share; they sort first and are not HDF5) — as step v does
+    _ok = lambda p: not p.name.endswith(".tmp.nwb") and not p.name.startswith("._")
+    cands = [p for p in sorted(op.glob("*.nwb")) if _ok(p)]
     if cands:
         return cands[0]
-    cands = [p for p in sorted(op.glob("**/*.nwb")) if not p.name.endswith(".tmp.nwb")]
+    cands = [p for p in sorted(op.glob("**/*.nwb")) if _ok(p)]
     return cands[0] if cands else None
 
 
@@ -443,9 +446,10 @@ def add_units_to_nwb(output_folder, n_jobs=4):
         gaps_file = phy.parent / "spliced_gaps.json"
         if gaps_file.exists():
             import json
-            gaps = json.loads(gaps_file.read_text()).get("gaps", [])
+            gaps_info = json.loads(gaps_file.read_text())
+            gaps = gaps_info.get("gaps", [])
             if gaps:
-                fs_g = json.loads(gaps_file.read_text()).get("sampling_frequency", 30000.0)
+                fs_g = gaps_info.get("sampling_frequency", 30000.0)
                 lost = sum(g["missing_samples"] for g in gaps) / fs_g
                 print("*" * 70)
                 print(f"WARNING: {len(gaps)} spliced Trodes gap(s) in this recording; spike "
