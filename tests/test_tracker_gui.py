@@ -179,3 +179,51 @@ def test_settings_are_remembered(tmp_path):
     assert second.mem.value() == 50
     second.close()
     del app
+
+
+def _fake_sorted_session(folder):
+    """A session folder holding one finished sort whose units are in the NWB."""
+    h5py = pytest.importorskip("h5py")
+    import numpy as np
+    out = folder / "Rat5_HM_20260623_105525_maze_merged.raw_group0_mountainsort4_sorting_output"
+    (out / "processed_binary").mkdir(parents=True)
+    (out / "processed_binary" / "traces_cached_seg0.raw").write_bytes(b"\0" * 4096)
+    (out / "phy_export").mkdir()
+    (out / "phy_export" / "params.py").write_text("dat_path = 'traces_cached_seg0.raw'\n")
+    with h5py.File(folder / "Rat5_20260623.nwb", "w") as f:
+        f.create_dataset("units/sorting_group", data=np.array([out.name.encode()], dtype="S"))
+    return out / "processed_binary"
+
+
+def _wait_for_the_process(gui):
+    from PyQt6.QtCore import QCoreApplication
+    import time
+    deadline = time.monotonic() + 60
+    while gui.proc is not None and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.05)
+    assert gui.proc is None, "the clean-up tool did not finish"
+
+
+def test_disk_card_checks_then_deletes_processed_binary(gui, tmp_path, monkeypatch):
+    processed = _fake_sorted_session(tmp_path / "task" / "rat5_491390" / "20260623")
+    gui.root_edit.setText(str(tmp_path))
+    gui._check_root()
+    gui.log.clear()
+
+    gui._clean_processed_binary(delete=False)               # dry run
+    assert not gui.pb_delete_btn.isEnabled()                # one process at a time
+    _wait_for_the_process(gui)
+    assert processed.is_dir()
+    assert "DRY RUN" in gui.log.toPlainText()
+    assert gui.pb_delete_btn.isEnabled()
+
+    monkeypatch.setattr(gui, "_confirm", lambda question: False)   # "No": nothing runs
+    gui._clean_processed_binary(delete=True)
+    assert gui.proc is None and processed.is_dir()
+
+    monkeypatch.setattr(gui, "_confirm", lambda question: True)
+    gui._clean_processed_binary(delete=True)
+    _wait_for_the_process(gui)
+    assert not processed.exists()
+    assert "Deleted 1 processed_binary folder" in gui.log.toPlainText()

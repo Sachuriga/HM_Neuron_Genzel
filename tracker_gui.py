@@ -56,6 +56,7 @@ except Exception:                              # pragma: no cover
 
 REPO = Path(__file__).resolve().parent
 RUNNER = REPO / "runner.py"
+PB_TOOL = REPO / "src" / "sorter" / "processed_binary_tool.py"   # the Disk space card
 
 # Single source of truth for the step list: import it from the runner.
 try:
@@ -404,6 +405,7 @@ class TrackerGUI(QMainWindow):
         card_rows.addWidget(self._build_data_card())
         card_rows.addWidget(self._build_steps_card())
         card_rows.addWidget(self._build_tree_card())
+        card_rows.addWidget(self._build_disk_card())
         card_rows.addWidget(self._build_options_card())
         card_rows.addStretch(1)
         scroll = QScrollArea()
@@ -583,6 +585,34 @@ class TrackerGUI(QMainWindow):
         buttons.addStretch(1)
         rows.addLayout(buttons)
         return self.tree_card
+
+    def _build_disk_card(self):
+        """Free disk space: delete the processed_binary/ folders of the sorting
+        outputs below the data root (processed_binary_tool.py --clean --root)."""
+        card, rows = self._card("Disk space")
+        rows.addWidget(self._hint_label(
+            "processed_binary/ in each *_sorting_output is a filtered copy of the raw "
+            "data (~27 GB per recording hour), needed only for curating in Phy and for "
+            "step u. Deleted where the units are already in the session NWB; it can "
+            "be rebuilt from the .rec."))
+        self.pb_force = QCheckBox("Also where the units are not in the NWB yet (--force)")
+        self.pb_force.setToolTip("Step u then needs processed_binary_tool.py --restore first.")
+        rows.addWidget(self.pb_force)
+        buttons = QHBoxLayout()
+        self.pb_check_btn = QPushButton("Check processed_binary (dry run)")
+        self.pb_check_btn.setToolTip("List every processed_binary below the data root and "
+                                     "the space deleting them would free. Deletes nothing.")
+        self.pb_check_btn.clicked.connect(lambda: self._clean_processed_binary(delete=False))
+        buttons.addWidget(self.pb_check_btn)
+        self.pb_delete_btn = QPushButton("Delete processed_binary…")
+        self.pb_delete_btn.setObjectName("stop")             # the red text of Stop
+        self.pb_delete_btn.setToolTip("Asks first. Saves a fingerprint next to each, so "
+                                      "--restore can check a rebuild.")
+        self.pb_delete_btn.clicked.connect(lambda: self._clean_processed_binary(delete=True))
+        buttons.addWidget(self.pb_delete_btn)
+        buttons.addStretch(1)
+        rows.addLayout(buttons)
+        return card
 
     def _build_options_card(self):
         """Rarely changed settings, folded away until "Options" is clicked."""
@@ -914,7 +944,24 @@ class TrackerGUI(QMainWindow):
             sessions_file = str(list_file)
         env.insert("HM_SESSIONS_FILE", sessions_file)
         self._reset_jobs()
+        self._start_process(env, ["-u", str(RUNNER), root])
 
+        dry =" (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
+        only = f" (only the {len(self.only_sessions)} listed sessions)" if self.only_sessions else ""
+        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}{only}\n")
+        self._show_running(steps)
+        self.stop_btn.setEnabled(True)
+        self._set_hint(f"Running steps:  {' '.join(steps)}{dry}{only}")
+        self.statusBar().showMessage(f"Running steps: {steps}")
+
+    def _start_process(self, env, args):
+        """Start `python <args>` from the repo, its output going into the log.
+        One process at a time: the runner, or a tool such as the disk clean-up."""
+        # the children print "—", "→", "…": without this, Windows writes them to
+        # the pipe as cp1252 and a character it cannot encode crashes the child
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUTF8", "1")
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
         self.proc.setWorkingDirectory(str(REPO))
@@ -925,18 +972,46 @@ class TrackerGUI(QMainWindow):
         # the output arrives in arbitrary pieces: a character cut in two by a piece
         # boundary ("—", "→", "…") is kept back until its other half arrives
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self.proc.start(sys.executable, ["-u", str(RUNNER), root])
+        self.proc.start(sys.executable, args)
 
-        dry = " (step l: dry run)" if "l" in steps and self.lfp_dry_run.isChecked() else ""
-        only = f" (only the {len(self.only_sessions)} listed sessions)" if self.only_sessions else ""
-        self._append(f"$ HM_STEPS={steps}  {sys.executable} runner.py {root}{dry}{only}\n")
-        self._show_running(steps)
+    # ------------------------------------------------- disk space: processed_binary
+    def _clean_processed_binary(self, delete):
+        """Run processed_binary_tool.py --clean --root <data root>: a dry run that
+        lists every *_sorting_output/processed_binary below the root and its size,
+        or (`delete`, after a yes) really deleting them."""
+        if self.proc is not None:
+            return
+        self._check_root()
+        if self.root_kind in ("empty", "missing"):
+            self._set_hint("Pick a valid data-root folder first.", "error")
+            return
+        root = self.root_edit.text().strip()
+        force = self.pb_force.isChecked()
+        if delete:
+            which = ("EVERY processed_binary folder, also where the units are not in "
+                     "the session NWB yet (step u will need --restore first)"
+                     if force else
+                     "every processed_binary folder whose units are already in the "
+                     "session NWB")
+            if not self._confirm(f"Delete {which} below\n\n{root}\n\nThis cannot be undone "
+                                 f"(it can be rebuilt from the .rec with --restore). "
+                                 f"Run the check first to see the list and the size."):
+                return
+        self._remember_root(root)
+        args = ["-u", str(PB_TOOL), "--clean", "--root", root]
+        args += ["--force"] if force else []
+        args += ["--yes"] if delete else []
+        what = "deleting processed_binary" if delete else "checking processed_binary (dry run)"
+        self._reset_jobs()
+        self._start_process(QProcessEnvironment.systemEnvironment(), args)
+        self._append(f"$ {sys.executable} {' '.join(args[1:])}\n")
+        self._show_running(what, title=what)
         self.stop_btn.setEnabled(True)
-        self._set_hint(f"Running steps:  {' '.join(steps)}{dry}{only}")
-        self.statusBar().showMessage(f"Running steps: {steps}")
+        self._set_hint(f"{what[0].upper()}{what[1:]} below {root}")
+        self.statusBar().showMessage(what)
 
     # ---------------------------------------------------------- run button looks
-    def _show_running(self, steps):
+    def _show_running(self, steps, title=None):
         """Run button -> orange "Running…  m:ss" with a turning arrow."""
         self.run_started = time.monotonic()
         self.spinner_index = 0
@@ -945,7 +1020,9 @@ class TrackerGUI(QMainWindow):
         self._turn_spinner()                     # show the first frame now, not 80 ms later
         self.spinner_timer.start()
         # the title shows in the taskbar / Dock too, so a run is visible there as well
-        self.setWindowTitle(f"Genzel Tracker — running steps {steps}")
+        self.setWindowTitle(f"Genzel Tracker — {title or f'running steps {steps}'}")
+        self.pb_check_btn.setEnabled(False)
+        self.pb_delete_btn.setEnabled(False)
 
     def _turn_spinner(self):
         """Next spinner frame + the time since Run was pressed."""
@@ -961,6 +1038,8 @@ class TrackerGUI(QMainWindow):
         self.run_btn.setText("▶  Run")
         self.run_btn.setStyleSheet(RUN_BUTTON_STYLE.format(color=IDLE_GREEN))
         self.run_btn.setEnabled(True)
+        self.pb_check_btn.setEnabled(True)
+        self.pb_delete_btn.setEnabled(True)
         self.setWindowTitle("Genzel Tracker")
 
     # -------------------------------------------------------------------- stop
