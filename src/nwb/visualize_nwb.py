@@ -883,7 +883,11 @@ def visualize(output_folder, bin_cm=5.0, sigma=2.0, speed=0.05,
         has_wf = "waveform_mean" in udf.columns
         pos = load_position(nwb)
         if pos is None:
-            print("  WARNING: no Position data — rate maps/place fields will be skipped.")
+            # e.g. an NWB that step 8 created and step 4 never wrote the behaviour
+            # into: each unit PDF is then only its first page
+            print("  WARNING: no Position data in the NWB — rate maps, place fields, "
+                  "speed and trial pages will be skipped (only page 1 per unit). "
+                  "Run step 4 for this session first, then step v again.")
         else:
             # to metres in the plot_trials frame (px / SCALE), so bins are physical
             _px, _py, _t = pos
