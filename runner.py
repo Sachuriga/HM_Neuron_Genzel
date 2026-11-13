@@ -545,6 +545,10 @@ def _run_per_op(label, tag, script, ops, config, extra_ip=None):
             continue
         cmd = [PYTHON, "-u", script]
         if extra_ip:
+            # This step builds its output from the raw ip folder, so the op folder
+            # may not exist yet (e.g. step 7 chosen alone, before any worker step
+            # made it). Create it first, like run_worker does.
+            Path(op).mkdir(parents=True, exist_ok=True)
             cmd += ["--input_folder", ip]
         cmd += ["--output_folder", op, "--config", config]
         rc = run(cmd)
