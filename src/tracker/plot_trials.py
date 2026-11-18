@@ -17,7 +17,9 @@ import textwrap
 # --- Imports for Graph Theory ---
 import networkx as nx
 from scipy.spatial.distance import pdist, squareform
-from scipy import stats 
+from scipy import stats
+
+from stale_coords import drop_stale_with_frames
 
 # Camera frame rate. Frame indices are the only clock that survives for non-ephys
 # sessions (step 2 needs the .rec DIO), so timing is derived from them.
@@ -91,10 +93,15 @@ def build_df_from_coords(work_dir, input_dir):
     Trial_Num, Timestamp) + stitched_framewise_seconds.csv (relative seconds) —
     cleaner and consistent with the decoder/NWB — instead of the raw .log. Returns
     (df, file_stem) with the same schema the log path produces, or (None, None)."""
+    # A with_frames copy left by an earlier tracker run is deleted here, not read:
+    # it holds that run's trials, not the ones in the current Coordinates_Full.csv.
+    stale = {p for d in (work_dir, input_dir) for p in drop_stale_with_frames(d)}
+
     def _first(pat):
         for d in (work_dir, input_dir):
             # skip macOS AppleDouble sidecars ("._*") that glob would match first
-            hits = [p for p in sorted(Path(d).glob(pat)) if not p.name.startswith("._")]
+            hits = [p for p in sorted(Path(d).glob(pat))
+                    if not p.name.startswith("._") and p not in stale]
             if hits:
                 return hits[0]
         return None

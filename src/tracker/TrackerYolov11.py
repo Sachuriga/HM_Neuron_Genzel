@@ -33,6 +33,7 @@ if _SRC_DIR not in _sys.path:
     _sys.path.insert(0, _SRC_DIR)
 
 from tools import mask
+from stale_coords import drop_stale_with_frames      # beside this script, in src/tracker
 import cv2
 
 # Every frame is resized to this before detection, annotation and writing, so all
@@ -609,6 +610,9 @@ class Tracker:
 
         df_tracking.to_csv(save_path, index=False)
         print(f">> Full coordinate data saved to: {save_path}  ({len(df_tracking)} rows, {len(df_tracking.columns)} cols)")
+        # the with_frames copy step d made from the previous tracking is now out of
+        # date, and the later steps read it first
+        drop_stale_with_frames(self.out_path)
 
     def check_special_schedule(self):
         """Per-frame time-lock scheduling for the active trial:
