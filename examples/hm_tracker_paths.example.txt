@@ -75,8 +75,15 @@ NWB_RAT_NR=1
 # FREQ_MAX         : band-pass low-pass cutoff in Hz   [8000]
 # DETECT_THRESHOLD : spike detection threshold         [5]
 # DETECT_SIGN      : spikes to detect: -1 negative, 0 both, 1 positive  [0]
+# SHARED_NOISE_COMPONENTS : interference that reaches the tetrodes with a
+#                    different gain each (so that no reference can remove it):
+#                    how many such patterns to remove per second, after the
+#                    global median. 0 = off, 2 = recommended. Only seconds with
+#                    real interference are changed; step 7 prints how many.
+#                    It changes processed_binary/, so keep the value a
+#                    recording was sorted with (as for FREQ_MIN / FREQ_MAX). [0]
 #
-# RESORT           : 1 = sort recordings again even if they already have a
+# RESORT          : 1 = sort recordings again even if they already have a
 #                    phy_export (the old phy_export is backed up first).
 #                    0 / omitted = don't sort them again (their Phy export is
 #                    still auto-curated again; see AUTO_CURATE_REDO).        [0]

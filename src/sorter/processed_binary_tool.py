@@ -11,7 +11,8 @@ recording hour), and it is only needed while you are still curating.
 It can be deleted safely because it is NOT original data: it is rebuilt from
 the .rec with exactly the code sorting.py used (sorting.build_preprocessed_recording),
 which gives a byte-identical file as long as the per-rat channel settings and
-FREQ_MIN / FREQ_MAX in hm_tracker_paths.txt have not changed since sorting.
+FREQ_MIN / FREQ_MAX / SHARED_NOISE_COMPONENTS in hm_tracker_paths.txt have not
+changed since sorting.
 
 WHAT IT DOES
 ------------
@@ -371,7 +372,8 @@ def restore(input_folder, output_folder, config_path=None):
         bad, ref, eeg = sorting.resolve_rat_settings(recordings[0].stem, config)
         rec = sorting.build_preprocessed_recording(
             recordings, bad_channel_ids=bad, ref_channels=ref, eeg_channel_ids=eeg,
-            freq_min=sorting_params["freq_min"], freq_max=sorting_params["freq_max"])
+            freq_min=sorting_params["freq_min"], freq_max=sorting_params["freq_max"],
+            shared_noise_components=sorting_params["shared_noise_components"])
 
         # Phy's spike files assume this exact channel count. A different count
         # means the EEG tetrodes in the config changed since sorting.
@@ -409,7 +411,8 @@ def _check_against_fingerprint(out_dir, processed, phy):
     else:
         print("  WARNING: rebuilt, but it is NOT identical to the original. Spike times "
               "in Phy are still valid; waveforms may differ slightly. Did BAD_CHANNELS / "
-              "REF_CHANNEL / FREQ_MIN / FREQ_MAX change since sorting?")
+              "REF_CHANNEL / FREQ_MIN / FREQ_MAX / SHARED_NOISE_COMPONENTS change "
+              "since sorting?")
 
 
 # ---------------------------------------------------------------------------

@@ -52,6 +52,10 @@ SORTING_PARAM_SPEC = {
     "FREQ_MAX": ("freq_max", float, 8000.0),         # band-pass low-pass cutoff (Hz)
     "DETECT_THRESHOLD": ("detect_threshold", float, 5.0),  # spike detection threshold
     "DETECT_SIGN": ("detect_sign", int, 0),          # -1 neg, 0 both, 1 pos
+    # Shared-noise patterns removed after the global median (shared_noise.py):
+    # 0 = off (the global median only), 2 = recommended when interference reaches
+    # the tetrodes with different gains.
+    "SHARED_NOISE_COMPONENTS": ("shared_noise_components", int, 0),
 }
 
 
@@ -246,6 +250,9 @@ def load_sorting_config(config_path, quiet=False):
         FREQ_MAX=8000                    band-pass low-pass cutoff (Hz)
         DETECT_THRESHOLD=5               spike detection threshold
         DETECT_SIGN=0                    -1 neg, 0 both, 1 pos
+        SHARED_NOISE_COMPONENTS=0        shared-noise patterns removed after the
+                                         global median (0 = off, 2 = recommended
+                                         against interference; see shared_noise.py)
         BAD_CHANNELS_<RAT>=0 1 2 3 ...   channels to interpolate
         REF_CHANNEL_<RAT>=64             single (or space separated) reference
                                          channel(s) for common_reference.
@@ -366,6 +373,7 @@ try:
 except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 from trodes_rec import find_rec_files, open_rec, SPLICED_GAPS  # noqa: E402  (.rec reader; needed for step 7)
+from shared_noise import remove_shared_noise_recording  # noqa: E402
 
 LAST_SPLICED_GAPS = []   # set by open_raw_recording; see spliced_gaps.json
 
@@ -639,9 +647,11 @@ def attach_tetrode_probe(rec):
 
 
 def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
-                           eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0):
+                           eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0,
+                           shared_noise_components=0):
     """Steps 4.1-5: drop EEG tetrodes -> band-pass -> interpolate bad channels
-    -> optional single-channel reference -> global median reference.
+    -> optional single-channel reference -> global median reference
+    -> optional shared-noise removal (shared_noise_components > 0).
     Returns the lazy preprocessed recording (nothing is written yet)."""
     # 4.1. Drop EEG tetrode channels — they are not spike-sorted.
     eeg_channel_ids = list(eeg_channel_ids) if eeg_channel_ids else []
@@ -697,6 +707,16 @@ def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
         rec_ref = rec_interpolated
     rec_cmr = spre.common_reference(rec_ref, reference='global', operator='median')
 
+    # 5.4b. Shared noise the reference cannot remove (SHARED_NOISE_COMPONENTS).
+    #   A reference subtracts one waveform with gain 1 from every channel. Noise
+    #   that reaches the tetrodes with different gains survives it; this removes
+    #   up to that many such patterns per 1 s block. Off (0) by default.
+    if shared_noise_components and shared_noise_components > 0:
+        print(f"Removing up to {shared_noise_components} shared-noise pattern(s) "
+              f"per 1 s block (after the global median).")
+        rec_cmr = remove_shared_noise_recording(
+            rec_cmr, max_components=shared_noise_components)
+
     # 5.5. No manual whitening here — MountainSort does its own whitening
     #      (para['whiten']=True in process_single_file), so whitening twice
     #      would be wrong.
@@ -705,14 +725,16 @@ def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
 
 def build_preprocessed_recording(paths, bad_channel_ids=None, ref_channels=None,
                                  eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0,
-                                 fs=30000.0, gain=0.195, offset=0.0):
+                                 fs=30000.0, gain=0.195, offset=0.0,
+                                 shared_noise_components=0):
     """Steps 2-5 in one call: raw files -> probe -> preprocessed recording."""
     rec = open_raw_recording(paths, fs=fs, gain=gain, offset=offset)
     rec = attach_tetrode_probe(rec)
     return preprocess_for_sorting(rec, bad_channel_ids=bad_channel_ids,
                                   ref_channels=ref_channels,
                                   eeg_channel_ids=eeg_channel_ids,
-                                  freq_min=freq_min, freq_max=freq_max)
+                                  freq_min=freq_min, freq_max=freq_max,
+                                  shared_noise_components=shared_noise_components)
 
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
@@ -737,6 +759,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     freq_max = sorting_params.get('freq_max', 8000.0)
     detect_threshold = sorting_params.get('detect_threshold', 5.0)
     detect_sign = sorting_params.get('detect_sign', 0)
+    shared_noise_components = sorting_params.get('shared_noise_components', 0)
 
     # 1. SETUP PATHS
     # An existing output folder is one of two things:
@@ -761,7 +784,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     rec_preprocessed = build_preprocessed_recording(
         paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
         eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
-        fs=fs, gain=gain, offset=offset)
+        fs=fs, gain=gain, offset=offset,
+        shared_noise_components=shared_noise_components)
 
     # Record where sample/fs stops matching the Trodes clock (spliced gaps).
     import json
@@ -778,6 +802,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
 
     rec_saved = rec_preprocessed.save(folder=processed_folder,
                                       **PROCESSED_BINARY_SAVE_KWARGS)
+    if hasattr(rec_preprocessed, "removed_summary"):
+        print(rec_preprocessed.removed_summary())    # how much shared noise this recording had
 
     # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
