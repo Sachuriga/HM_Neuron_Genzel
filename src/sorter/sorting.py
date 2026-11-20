@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import shutil
 import traceback
 from datetime import datetime
@@ -806,6 +807,176 @@ def build_preprocessed_recording(paths, bad_channel_ids=None, ref_channels=None,
                                   shared_noise_file=shared_noise_file)
 
 
+# ---------------------------------------------------------------------------
+#   Using processed_binary/ again after an interrupted run.
+#
+#   Writing processed_binary/ is the first long part of a sort. When a run is
+#   stopped after it (during the sorting, say), the next run does not have to
+#   write it again - if it is COMPLETE and was made with the SAME settings.
+#   A small note inside the folder says so. It is written only after the last
+#   sample is on disk, so a half-written folder never has one.
+# ---------------------------------------------------------------------------
+PROCESSED_BINARY_NOTE = "write_complete.json"
+
+
+def processed_binary_recipe(paths, bad_channel_ids, ref_channels, eeg_channel_ids,
+                            freq_min, freq_max, fs, gain, offset, shared_noise_components):
+    """Everything that decides the samples in processed_binary/, as plain data.
+
+    Two runs with the same recipe write the same file. The raw files are named
+    with their size, so a recording that was copied again or cut is noticed.
+    """
+    return dict(
+        raw_files=[[Path(p).name, Path(p).stat().st_size] for p in paths],
+        bad_channel_ids=sorted(int(c) for c in (bad_channel_ids or [])),
+        ref_channels=sorted(int(c) for c in (ref_channels or [])),
+        eeg_channel_ids=sorted(int(c) for c in (eeg_channel_ids or [])),
+        freq_min=float(freq_min), freq_max=float(freq_max),
+        fs=float(fs), gain=float(gain), offset=float(offset),
+        shared_noise_components=int(shared_noise_components or 0),
+        chunk_duration=PROCESSED_BINARY_SAVE_KWARGS["chunk_duration"],
+    )
+
+
+def note_processed_binary_complete(folder, recipe, recording, shared_noise_summary=None):
+    """Write the note: processed_binary/ is complete, and this is how it was made."""
+    note = dict(recipe=recipe, num_samples=int(recording.get_num_samples()),
+                num_channels=int(recording.get_num_channels()),
+                shared_noise_summary=shared_noise_summary)
+    (Path(folder) / PROCESSED_BINARY_NOTE).write_text(json.dumps(note, indent=1))
+
+
+def load_complete_processed_binary(folder, recipe):
+    """The saved recording in ``folder`` when it can be used again, else None.
+
+    It can be used again when its note is there (the write finished), the recipe
+    in the note is today's recipe, and the file still has every sample.
+    Returns ``(recording, note)`` or ``(None, why not)``.
+    """
+    note_file = Path(folder) / PROCESSED_BINARY_NOTE
+    if not note_file.exists():
+        return None, "it was not written to the end"
+    try:
+        note = json.loads(note_file.read_text())
+        if note["recipe"] != recipe:
+            changed = [k for k in recipe if note["recipe"].get(k) != recipe[k]]
+            return None, f"the settings changed since ({', '.join(changed)})"
+        recording = si.load(folder)
+        if (recording.get_num_samples() != note["num_samples"]
+                or recording.get_num_channels() != note["num_channels"]):
+            return None, "the file does not have the samples its note says"
+        # the note counts the samples; the file on disk must really hold them
+        on_disk = sum(f.stat().st_size for f in Path(folder).glob("*.raw"))
+        expected = (note["num_samples"] * note["num_channels"]
+                    * np.dtype(recording.get_dtype()).itemsize)
+        if on_disk != expected:
+            return None, "the file on disk is not complete"
+    except Exception as error:
+        return None, f"it could not be read ({error!r})"
+    return recording, note
+
+
+def keep_only_processed_binary(output_dir):
+    """Delete the leftovers of an unfinished run, except processed_binary/ and
+    spliced_gaps.json (which belongs to it)."""
+    for item in Path(output_dir).iterdir():
+        if item.name in ("processed_binary", "spliced_gaps.json"):
+            continue
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            item.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+#   Sorting the tetrodes (step 6). Every tetrode is sorted on its own, so
+#   several can be sorted side by side.
+# ---------------------------------------------------------------------------
+
+# RAM one MountainSort4 job is expected to need. MountainSort4 keeps the
+# tetrode's samples in a temporary file on disk, not in RAM, so this is a
+# rule of thumb for its events and clustering.
+MS4_GB_PER_SORT = 4.0
+# Free disk space never handed out to the sorter's temporary files.
+SORT_KEEP_FREE_GB = 20.0
+
+
+def one_tetrode_gb(recording):
+    """Size of ONE tetrode of the recording as float32, in GB.
+
+    That is what a sort of one tetrode has to hold: MountainSort4 writes it to
+    a temporary file (ms4_temp/.../timeseries.hdf5), MountainSort5 loads it
+    into RAM.
+    """
+    channels = 4
+    return recording.get_num_samples() * channels * 4 / 2 ** 30
+
+
+def sorter_jobs(recording, sorter_name, temp_folder):
+    """How many tetrodes are sorted side by side (at least 1).
+
+    SORT_JOBS from the config file when it is a number (1 = one after the other,
+    as it always was). Otherwise the smallest of:
+      - the tetrodes there are;
+      - the cores (src/tools/machine.py);
+      - what fits in half the RAM;
+      - MountainSort4 only: what fits on the disk of its temporary files.
+    """
+    n_tetrodes = len(np.unique(recording.get_property("group")))
+    forced = machine.setting_n_jobs("SORT_JOBS")
+    if forced:
+        return min(forced, n_tetrodes)
+
+    tetrode_gb = one_tetrode_gb(recording)
+    if sorter_name == "mountainsort4":
+        gb_per_sort = MS4_GB_PER_SORT
+        # the temporary file of each sort, with half as much again to be safe
+        free_gb = shutil.disk_usage(temp_folder).free / 2 ** 30
+        by_disk = int((free_gb - SORT_KEEP_FREE_GB) / (1.5 * tetrode_gb))
+    else:
+        gb_per_sort = max(2.0 * tetrode_gb, 2.0)     # the samples in RAM, and a working copy
+        by_disk = n_tetrodes                         # no large temporary files
+    by_machine = machine.step_n_jobs(gb_per_worker=gb_per_sort)
+    return max(1, min(n_tetrodes, by_machine, by_disk))
+
+
+def sort_tetrodes(recording, sorter_name, sorter_params, work_folder):
+    """Step 6: sort every tetrode of ``recording`` and return the joined sorting.
+
+    Each tetrode is a job of its own, so its result does not depend on how many
+    are sorted at the same time. Should sorting side by side fail, the tetrodes
+    are sorted again one after the other.
+    """
+    n_jobs = sorter_jobs(recording, sorter_name, work_folder.parent)
+    print(f"Starting sorting using {sorter_name}: {n_jobs} tetrode(s) at a time "
+          f"(SORT_JOBS).")
+
+    def run(engine, engine_kwargs):
+        if work_folder.exists():
+            shutil.rmtree(work_folder)
+        return si.run_sorter_by_property(
+            sorter_name=sorter_name,
+            recording=recording,
+            grouping_property='group',
+            folder=work_folder,
+            verbose=True,
+            engine=engine,
+            engine_kwargs=engine_kwargs,
+            **sorter_params
+        )
+
+    if n_jobs == 1:
+        return run("loop", {})
+    try:
+        # loky starts separate processes, the same way on Windows, macOS and Linux
+        return run("joblib", {"n_jobs": n_jobs, "backend": "loky"})
+    except Exception as error:
+        print(f"WARNING: sorting {n_jobs} tetrodes at a time failed ({error!r}).")
+        print("Sorting them again one after the other. SORT_JOBS=1 in "
+              "hm_tracker_paths.txt makes that the rule.")
+        return run("loop", {})
+
+
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
                         sorter_name=DEFAULT_SORTER, sorting_params=None):
@@ -834,12 +1005,23 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # An existing output folder is one of two things:
     #   - a FINISHED sort (it has phy_export/): it may hold manual Phy curation,
     #     so phy_export/ is backed up, never deleted;
-    #   - leftovers of a run that crashed before export: safe to wipe.
+    #   - leftovers of a run that stopped before export: wiped - except a
+    #     COMPLETE processed_binary/ made with today's settings, which is used
+    #     again instead of being written a second time.
+    processed_folder = output_dir / 'processed_binary'
+    recipe = processed_binary_recipe(
+        paths, bad_channel_ids, ref_channels, eeg_channel_ids, freq_min, freq_max,
+        fs, gain, offset, shared_noise_components)
+    rec_saved = None                      # the processed_binary/ of an earlier run, if usable
     if output_dir.exists():
         if has_phy_export(output_dir):
             backup_dir = back_up_phy_export(output_dir)
             print(f"Previous phy_export kept in: {backup_dir}")
-        else:
+        elif processed_folder.exists():
+            rec_saved, note = load_complete_processed_binary(processed_folder, recipe)
+            if rec_saved is None:
+                print(f"processed_binary/ of an unfinished run is not used again: {note}.")
+        if rec_saved is None and output_dir.exists():
             print(f"Cleaning leftovers of an unfinished run: {output_dir}")
             shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -847,35 +1029,44 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     print(f"\n--- Processing {file_stem} ---")
     print(f"Output folder: {output_dir}")
 
-    # 2-5. Load the raw data, attach the tetrode probe and preprocess it.
-    #      The same function rebuilds processed_binary/ later
-    #      (processed_binary_tool.py --restore), so both stay identical.
-    rec_preprocessed = build_preprocessed_recording(
-        paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
-        eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
-        fs=fs, gain=gain, offset=offset,
-        shared_noise_components=shared_noise_components,
-        shared_noise_file=output_dir / SHARED_NOISE_STRENGTHS_FILE)
+    if rec_saved is not None:
+        # An earlier run wrote processed_binary/ to the end, with these settings.
+        print(f"Using the processed_binary/ of an earlier, unfinished run again "
+              f"({rec_saved.get_num_samples()} samples, {rec_saved.get_num_channels()} channels); "
+              f"it is not written a second time. Delete the folder to have it rebuilt.")
+        keep_only_processed_binary(output_dir)
+        if note.get("shared_noise_summary"):
+            print(note["shared_noise_summary"])
+    else:
+        # 2-5. Load the raw data, attach the tetrode probe and preprocess it.
+        #      The same function rebuilds processed_binary/ later
+        #      (processed_binary_tool.py --restore), so both stay identical.
+        rec_preprocessed = build_preprocessed_recording(
+            paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
+            eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
+            fs=fs, gain=gain, offset=offset,
+            shared_noise_components=shared_noise_components,
+            shared_noise_file=output_dir / SHARED_NOISE_STRENGTHS_FILE)
 
-    # Record where sample/fs stops matching the Trodes clock (spliced gaps).
-    import json
-    with open(output_dir / "spliced_gaps.json", "w") as fh:
-        json.dump(dict(sampling_frequency=fs, gaps=LAST_SPLICED_GAPS), fh, indent=1)
-    if LAST_SPLICED_GAPS:
-        lost = sum(g["missing_samples"] for g in LAST_SPLICED_GAPS) / fs
-        print(f"WARNING: {len(LAST_SPLICED_GAPS)} spliced gap(s) — spike times after them "
-              f"are off the behaviour clock by up to {lost:+.3f} s (see spliced_gaps.json)")
+        # Record where sample/fs stops matching the Trodes clock (spliced gaps).
+        with open(output_dir / "spliced_gaps.json", "w") as fh:
+            json.dump(dict(sampling_frequency=fs, gaps=LAST_SPLICED_GAPS), fh, indent=1)
+        if LAST_SPLICED_GAPS:
+            lost = sum(g["missing_samples"] for g in LAST_SPLICED_GAPS) / fs
+            print(f"WARNING: {len(LAST_SPLICED_GAPS)} spliced gap(s) — spike times after them "
+                  f"are off the behaviour clock by up to {lost:+.3f} s (see spliced_gaps.json)")
 
-    processed_folder = output_dir / 'processed_binary'
-    if processed_folder.exists():
-        shutil.rmtree(processed_folder)
-
-    rec_saved = save_processed_binary(rec_preprocessed, processed_folder)
-    if hasattr(rec_preprocessed, "removed_summary"):
-        print(rec_preprocessed.removed_summary())    # how much shared noise this recording had
-    # The table behind that line has done its job (it is not there when the
-    # shared-noise step is off).
-    (output_dir / SHARED_NOISE_STRENGTHS_FILE).unlink(missing_ok=True)
+        rec_saved = save_processed_binary(rec_preprocessed, processed_folder)
+        summary = None
+        if hasattr(rec_preprocessed, "removed_summary"):
+            summary = rec_preprocessed.removed_summary()  # how much shared noise this recording had
+            print(summary)
+        # The table behind that line has done its job (it is not there when the
+        # shared-noise step is off).
+        (output_dir / SHARED_NOISE_STRENGTHS_FILE).unlink(missing_ok=True)
+        # Only now is processed_binary/ complete: note it, so that a run that stops
+        # after this point does not have to write it again.
+        note_processed_binary_complete(processed_folder, recipe, rec_saved, summary)
 
     # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
@@ -894,20 +1085,7 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         para['scheme'] = '2'
 
     sorter_work_folder = output_dir / 'sorting_work_folder'
-    if sorter_work_folder.exists():
-        shutil.rmtree(sorter_work_folder)
-
-    print(f"Starting sorting using {sorter_name}...")
-    sorting = si.run_sorter_by_property(
-        sorter_name=sorter_name,
-        recording=rec_saved,
-        grouping_property='group',
-        folder=sorter_work_folder,
-        verbose=True,
-        engine="loop",
-        engine_kwargs={},
-        **para
-    )
+    sorting = sort_tetrodes(rec_saved, sorter_name, para, sorter_work_folder)
 
     final_output_folder = output_dir / 'final_sorting_result'
     if final_output_folder.exists():

@@ -26,6 +26,8 @@ Settings (hm_tracker_paths.txt, or the environment):
                       N_JOBS says (see phy_autocurate.curate_jobs).
     PREPROCESS_JOBS   a number = step 7 writes processed_binary/ with that many,
                       whatever N_JOBS says (see sorting.processed_binary_jobs).
+    SORT_JOBS         a number = step 7 sorts that many tetrodes side by side
+                      (see sorting.sorter_jobs).
     HM_PARALLEL_JOBS  set by runner.py for the jobs it starts: how many of them
                       run side by side. Not meant for the config file.
 

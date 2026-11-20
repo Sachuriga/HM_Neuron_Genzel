@@ -26,6 +26,11 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 # PREPROCESS_JOBS : step 7 only: worker processes that write processed_binary/
 #                   (filter + reference + shared noise). Not set / auto = N_JOBS.
 #                   1 = one worker, as it always was (the file is the same).
+# SORT_JOBS       : step 7 only: tetrodes sorted side by side. Not set / auto =
+#                   what the cores, the RAM (4 GB a sort with MountainSort4) and
+#                   the free disk space for its temporary files allow.
+#                   1 = one after the other, as it always was. Lower it when
+#                   the sorts run out of memory.
 # MONITOR_SECONDS : how often the status block (machine + each job) is printed.
 # MIN_FREE_GB     : disk guard, for all parallel jobs (also the ip*/op* workers):
 #                   space always kept free on each disk the jobs write to. A job

@@ -369,6 +369,10 @@ On the lab PC (20 cores, 64 GB) a step that runs alone gets 18 workers, and each
 
 `processed_binary/` used to be written by 1 worker (more than one crashed on Windows while the raw data was held in memory; it is read from the files now). The file is the same for any number of workers — the 1 s chunks are the same, only who computes them changes — and should the worker processes fail, the write starts again with 1. A recording that is still held in memory (an old `.dat` with an unexpected layout) always gets 1. `PREPROCESS_JOBS=1` is the old behaviour.
 
+The sort itself (step 7, MountainSort) handles every tetrode on its own, so several tetrodes are sorted side by side (`SORT_JOBS`, default `auto`): as many as there are cores, as fit in half the RAM (MountainSort4: 4 GB a sort; MountainSort5: twice one tetrode of the recording, which it holds in RAM) and, for MountainSort4, as its temporary files fit on the disk (1.5 × one tetrode as float32 each — ~14 GB for a 5.6 h recording — with 20 GB kept free). On the lab PC that is 7 tetrodes at a time with MountainSort4. Should it fail, the tetrodes are sorted again one after the other; `SORT_JOBS=1` is the old behaviour.
+
+**A stopped sort does not write `processed_binary/` twice.** Once the last sample is on disk, step 7 puts a note in the folder (`processed_binary/write_complete.json`: the raw files with their size, the channel settings, the filter, the shared-noise setting). When step 7 runs again on a recording that has no `phy_export/` yet, a `processed_binary/` with that note, made with today's settings and with every sample still on disk, is used again (`Using the processed_binary/ of an earlier, unfinished run again`) and only the sorting and what follows is redone; anything else is deleted and written anew, as before. Delete the folder to have it rebuilt.
+
 ### Disk guard
 
 Parallel jobs that write at the same time must not fill a disk (`src/tools/disk_guard.py`). Watched are the disk of each job's folders and the disk of the temporary folder (step `l` works on local copies there, also when the sessions are on the share).
@@ -398,6 +402,7 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `POST_JOBS` | auto | tree mode: parallel session jobs |
 | `N_JOBS` | auto | [worker processes](#worker-processes-n_jobs) of one step: `auto` = fitted to this computer's cores and RAM; a number = exactly that many |
 | `PREPROCESS_JOBS` | auto | step 7: worker processes that write `processed_binary/` (a number wins over `N_JOBS`; `1` = one worker, as it was) |
+| `SORT_JOBS` | auto | step 7: tetrodes sorted side by side (`auto` = what the cores, the RAM and the temporary disk space allow; `1` = one after the other, as it was) |
 | `TREE_DEPTH` | 4 | tree mode: levels searched for session folders |
 | `HM_SESSIONS_FILE` | — (all sessions) | tree mode: a text file, one session folder per line; only those run, no tree walk (set by the GUI's "Only failed of a run…") |
 | `MONITOR_SECONDS` | 30 | tree mode: status-block interval |

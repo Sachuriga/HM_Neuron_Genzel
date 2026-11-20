@@ -128,3 +128,119 @@ def test_one_worker_failing_is_an_error(tmp_path, monkeypatch):
     monkeypatch.setenv("PREPROCESS_JOBS", "1")
     with pytest.raises(RuntimeError, match="disk full"):
         sorting.save_processed_binary(Broken(), tmp_path / "processed_binary")
+
+
+# ------------------------------------------------- sorting the tetrodes side by side
+class TetrodeRecording:
+    """Stands in for the saved recording: 31 tetrodes, 5.6 h at 30 kHz."""
+
+    def get_num_samples(self):
+        return 606362611
+
+    def get_property(self, name):
+        return np.repeat(np.arange(31), 4)
+
+
+def lab_pc(monkeypatch, free_disk_gb):
+    for name in ("SORT_JOBS", "N_JOBS", "HM_PARALLEL_JOBS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(sorting.machine, "cpu_cores", lambda: 20)
+    monkeypatch.setattr(sorting.machine, "total_ram_gb", lambda: 63.7)
+    monkeypatch.setattr(sorting.shutil, "disk_usage",
+                        lambda folder: type("Usage", (), {"free": free_disk_gb * 2 ** 30})())
+
+
+def test_tetrodes_sorted_side_by_side_fit_the_ram_and_the_disk(tmp_path, monkeypatch):
+    rec = TetrodeRecording()
+    assert round(sorting.one_tetrode_gb(rec), 1) == 9.0     # one tetrode as float32
+    lab_pc(monkeypatch, free_disk_gb=500)
+    # MountainSort4: half of 64 GB at 4 GB a sort
+    assert sorting.sorter_jobs(rec, "mountainsort4", tmp_path) == 7
+    # ...and its temporary files (13.6 GB a sort) must fit on top of 20 GB kept free
+    lab_pc(monkeypatch, free_disk_gb=60)
+    assert sorting.sorter_jobs(rec, "mountainsort4", tmp_path) == 2
+    lab_pc(monkeypatch, free_disk_gb=10)
+    assert sorting.sorter_jobs(rec, "mountainsort4", tmp_path) == 1
+    # MountainSort5 holds the tetrode in RAM: 18 GB a sort, the disk does not matter
+    assert sorting.sorter_jobs(rec, "mountainsort5", tmp_path) == 1
+    monkeypatch.setenv("SORT_JOBS", "3")                    # a number in the config wins
+    assert sorting.sorter_jobs(rec, "mountainsort4", tmp_path) == 3
+    monkeypatch.setenv("SORT_JOBS", "99")                   # never more than tetrodes
+    assert sorting.sorter_jobs(rec, "mountainsort4", tmp_path) == 31
+
+
+def test_sorting_side_by_side_falls_back_to_one_after_the_other(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SORT_JOBS", "4")
+    engines = []
+
+    def fake_run_sorter_by_property(engine, engine_kwargs, **kwargs):
+        engines.append((engine, engine_kwargs))
+        if engine == "joblib":
+            raise RuntimeError("a sorter process died")
+        return "sorted in a loop"
+
+    monkeypatch.setattr(sorting.si, "run_sorter_by_property", fake_run_sorter_by_property)
+    result = sorting.sort_tetrodes(TetrodeRecording(), "mountainsort4", {}, tmp_path / "work")
+    assert result == "sorted in a loop"
+    assert engines == [("joblib", {"n_jobs": 4, "backend": "loky"}), ("loop", {})]
+    assert "one after the other" in capsys.readouterr().out
+
+
+# ------------------------------------- using processed_binary/ again after a stopped run
+def recipe_for(raw_file, **changes):
+    settings = dict(paths=[raw_file], bad_channel_ids=[3], ref_channels=[98],
+                    eeg_channel_ids=[44, 45, 46, 47], freq_min=300.0, freq_max=6000.0,
+                    fs=30000.0, gain=0.195, offset=0.0, shared_noise_components=2)
+    settings.update(changes)
+    return sorting.processed_binary_recipe(**settings)
+
+
+def test_a_complete_processed_binary_is_used_again(tmp_path, monkeypatch):
+    raw_file = tmp_path / "raw.dat"
+    write_raw_file(raw_file, seconds=2.0)
+    monkeypatch.setenv("PREPROCESS_JOBS", "1")
+    folder = tmp_path / "out" / "processed_binary"
+    (tmp_path / "out").mkdir()
+    saved = sorting.save_processed_binary(preprocessed(raw_file, tmp_path / "out"), folder)
+    recipe = recipe_for(raw_file)
+
+    # written, but the run stopped before the note: not to be trusted
+    rec, why = sorting.load_complete_processed_binary(folder, recipe)
+    assert rec is None and "not written to the end" in why
+
+    sorting.note_processed_binary_complete(folder, recipe, saved, "Shared noise: the line")
+    rec, note = sorting.load_complete_processed_binary(folder, recipe)
+    assert rec.get_num_samples() == saved.get_num_samples()
+    assert np.array_equal(rec.get_traces(end_frame=5000), saved.get_traces(end_frame=5000))
+    assert list(rec.get_property("group")) == list(GROUPS)          # the sorter needs the tetrodes
+    assert note["shared_noise_summary"] == "Shared noise: the line"
+
+    # other settings today: the file is not what a new sort would write
+    rec, why = sorting.load_complete_processed_binary(folder, recipe_for(raw_file, freq_min=600.0))
+    assert rec is None and "freq_min" in why
+    rec, why = sorting.load_complete_processed_binary(folder, recipe_for(raw_file, bad_channel_ids=[]))
+    assert rec is None and "bad_channel_ids" in why
+
+    # the raw file is another one now (its size is in the recipe)
+    with open(raw_file, "ab") as f:
+        f.write(b"\0" * 128)
+    rec, why = sorting.load_complete_processed_binary(folder, recipe_for(raw_file))
+    assert rec is None and "raw_files" in why
+
+    # the samples are no longer all on disk
+    del rec, saved
+    traces = next(folder.glob("*.raw"))
+    with open(traces, "r+b") as f:
+        f.truncate(traces.stat().st_size - 64)
+    rec, why = sorting.load_complete_processed_binary(folder, recipe)
+    assert rec is None
+
+
+def test_leftovers_are_deleted_but_processed_binary_is_kept(tmp_path):
+    out = tmp_path / "out"
+    for folder in ("processed_binary", "sorting_work_folder", "ms4_temp"):
+        (out / folder).mkdir(parents=True)
+    for name in ("spliced_gaps.json", "shared_noise_strengths.npy"):
+        (out / name).write_text("x")
+    sorting.keep_only_processed_binary(out)
+    assert sorted(p.name for p in out.iterdir()) == ["processed_binary", "spliced_gaps.json"]
