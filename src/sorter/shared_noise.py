@@ -62,6 +62,8 @@ good). Fitting each channel on the time course shifted by a few samples halves
 the average again (not implemented); the real fix is at the source.
 """
 
+from pathlib import Path
+
 import numpy as np
 from spikeinterface.preprocessing.basepreprocessor import (BasePreprocessor,
                                                            BasePreprocessorSegment)
@@ -156,6 +158,35 @@ def remove_shared_noise(y, groups, max_components=2):
     return y, strengths
 
 
+def blocks_in(n_samples, block):
+    """How many blocks a segment of ``n_samples`` has (the last one takes the remainder)."""
+    return max(n_samples // block, 1)
+
+
+def start_strengths_file(path, recording, max_components, block_s=BLOCK_S):
+    """Create the table that collects what was removed in every block.
+
+    WHY a file: when worker PROCESSES read the recording (rec.save with n_jobs > 1),
+    each of them has its own copy of the recording object. What a worker notes in
+    its copy never reaches the main process, so removed_summary() would have
+    nothing to report. A small table on disk is shared by all of them.
+
+    The table is a float32 .npy with one row per block (of all segments, one after
+    the other) and one column per pattern:
+        NaN in a row    the block was not read yet
+        numbers         the strengths of the patterns removed, strongest first;
+                        0 where no (further) pattern was removed
+    """
+    block = max(int(round(block_s * recording.get_sampling_frequency())), 1)
+    n_rows = sum(blocks_in(segment.get_num_samples(), block)
+                 for segment in recording._recording_segments)
+    table = np.lib.format.open_memmap(str(path), mode="w+", dtype=np.float32,
+                                      shape=(n_rows, max(int(max_components), 1)))
+    table[:] = np.nan
+    table.flush()
+    del table                       # close it: the segments open it again when they write
+
+
 class SharedNoiseRemovalRecording(BasePreprocessor):
     """SpikeInterface step: remove_shared_noise on fixed 1 s blocks.
 
@@ -167,9 +198,13 @@ class SharedNoiseRemovalRecording(BasePreprocessor):
     request is always answered from whole blocks. So the output does not depend
     on how the recording is read: saving it in other chunk sizes, or reading any
     window of it lazily, gives the same samples.
+
+    ``strengths_file``: a table made by start_strengths_file, in which every
+    process that reads the recording notes what it removed (see there). Without
+    it removed_summary() only knows the blocks this process read itself.
     """
 
-    def __init__(self, recording, max_components=2, block_s=BLOCK_S):
+    def __init__(self, recording, max_components=2, block_s=BLOCK_S, strengths_file=None):
         BasePreprocessor.__init__(self, recording)
         groups = recording.get_property("group")
         if groups is None:
@@ -177,16 +212,30 @@ class SharedNoiseRemovalRecording(BasePreprocessor):
         _, groups = np.unique(np.asarray(groups), return_inverse=True)
         block = max(int(round(block_s * recording.get_sampling_frequency())), 1)
         enabled = max_components > 0 and (int(groups.max()) + 1) >= MIN_TETRODES
+        # a plain string (or None): the settings below are sent to the worker processes
+        strengths_file = None if strengths_file is None else str(strengths_file)
+        first_row = 0                                    # this segment's first row in the table
         for parent_segment in recording._recording_segments:
             self.add_recording_segment(SharedNoiseRemovalSegment(
                 parent_segment, groups, int(max_components) if enabled else 0, block,
-                np.dtype(recording.get_dtype())))
+                np.dtype(recording.get_dtype()), strengths_file, first_row))
+            first_row += blocks_in(parent_segment.get_num_samples(), block)
+        self.strengths_file = strengths_file
         self._kwargs = dict(recording=recording, max_components=int(max_components),
-                            block_s=float(block_s))
+                            block_s=float(block_s), strengths_file=strengths_file)
+
+    def strengths_of_blocks_read(self):
+        """One list per block read so far: the strengths of the patterns removed in it."""
+        if self.strengths_file is None or not Path(self.strengths_file).exists():
+            # only what THIS process read (all of it, when no worker processes were used)
+            return [s for seg in self._recording_segments for s in seg.removed.values()]
+        table = np.load(self.strengths_file)             # small: read it whole
+        rows_read = table[~np.isnan(table[:, 0])]
+        return [[float(s) for s in row if s > 0] for row in rows_read]
 
     def removed_summary(self):
         """One line on what was removed in the blocks read so far (for the log)."""
-        strengths = [s for seg in self._recording_segments for s in seg.removed.values()]
+        strengths = self.strengths_of_blocks_read()
         if not strengths:
             return "Shared noise: no block read yet."
         n_blocks = len(strengths)
@@ -203,13 +252,33 @@ class SharedNoiseRemovalRecording(BasePreprocessor):
 
 
 class SharedNoiseRemovalSegment(BasePreprocessorSegment):
-    def __init__(self, parent_segment, groups, max_components, block, dtype):
+    def __init__(self, parent_segment, groups, max_components, block, dtype,
+                 strengths_file=None, first_row=0):
         BasePreprocessorSegment.__init__(self, parent_segment)
         self.groups = groups
         self.max_components = max_components
         self.block = block
         self.dtype = dtype
         self.removed = {}            # block number -> strengths of the patterns removed
+        self.strengths_file = strengths_file    # the same, in a table all processes share
+        self.first_row = first_row              # row of this segment's block 0 in that table
+
+    def note_removed(self, k, strengths):
+        """Remember what was removed in block ``k`` (for removed_summary)."""
+        self.removed[k] = strengths
+        if self.strengths_file is None:
+            return
+        # Every block has a row of its own, so two workers never write the same bytes.
+        try:
+            table = np.load(self.strengths_file, mmap_mode="r+")
+            row = np.zeros(table.shape[1], dtype=np.float32)
+            kept = strengths[:table.shape[1]]
+            row[:len(kept)] = kept
+            table[self.first_row + k] = row
+            table.flush()
+            del table                # close it at once (Windows cannot delete an open file)
+        except (OSError, ValueError, IndexError):
+            pass                     # the table is only for the log: never stop the data for it
 
     def get_traces(self, start_frame, end_frame, channel_indices):
         parent = self.parent_recording_segment
@@ -219,7 +288,7 @@ class SharedNoiseRemovalSegment(BasePreprocessorSegment):
         if self.max_components <= 0 or end_frame <= start_frame:
             return parent.get_traces(start_frame, end_frame, channel_indices)
 
-        n_blocks = max(n_samples // self.block, 1)       # the last block takes the remainder
+        n_blocks = blocks_in(n_samples, self.block)      # the last block takes the remainder
         first = min(start_frame // self.block, n_blocks - 1)
         last = min((end_frame - 1) // self.block, n_blocks - 1)
         pieces = []
@@ -228,7 +297,7 @@ class SharedNoiseRemovalSegment(BasePreprocessorSegment):
             block_end = n_samples if k == n_blocks - 1 else block_start + self.block
             traces = parent.get_traces(block_start, block_end, slice(None))
             cleaned, strengths = remove_shared_noise(traces, self.groups, self.max_components)
-            self.removed[k] = strengths
+            self.note_removed(k, strengths)
             if not strengths:
                 cleaned = traces                         # untouched: exactly the input samples
             elif self.dtype.kind in "iu":
@@ -241,6 +310,15 @@ class SharedNoiseRemovalSegment(BasePreprocessorSegment):
         return out if channel_indices is None else out[:, channel_indices]
 
 
-def remove_shared_noise_recording(recording, max_components=2, block_s=BLOCK_S):
-    """The recording with its shared noise removed (lazy); see the module text."""
-    return SharedNoiseRemovalRecording(recording, max_components=max_components, block_s=block_s)
+def remove_shared_noise_recording(recording, max_components=2, block_s=BLOCK_S,
+                                  strengths_file=None):
+    """The recording with its shared noise removed (lazy); see the module text.
+
+    Give ``strengths_file`` (a path for a small .npy, started afresh here) when the
+    recording will be read by worker processes and removed_summary() is wanted
+    afterwards; see start_strengths_file.
+    """
+    if strengths_file is not None:
+        start_strengths_file(strengths_file, recording, max_components, block_s)
+    return SharedNoiseRemovalRecording(recording, max_components=max_components,
+                                       block_s=block_s, strengths_file=strengths_file)

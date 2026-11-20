@@ -21,8 +21,8 @@ The `.dat` file header does not match the expected Trodes format.
 
 - Check GPU memory: `nvidia-smi`. If VRAM is full, close other GPU processes.
 - Mountainsort4 can be memory-intensive for long recordings. Ensure at least 16 GB of system RAM is free.
-- On Windows, multi-job sorting (`n_jobs > 1`) can cause crashes. The script sets `n_jobs=1` by default for writing `processed_binary/` — do not change this.
-- The analysis after the sort (waveforms, PCA, metrics, Phy auto-curation) uses as many worker processes as fit the computer (`[MACHINE]` line at the start of the run). If it runs out of memory, set `N_JOBS` to a small number (e.g. `N_JOBS=4`) in `hm_tracker_paths.txt`.
+- Writing `processed_binary/` and the analysis after the sort (waveforms, PCA, metrics, Phy auto-curation) use as many worker processes as fit the computer (`[MACHINE]` line at the start of the run). If a step runs out of memory, set `N_JOBS` to a small number (e.g. `N_JOBS=4`) in `hm_tracker_paths.txt`.
+- If writing `processed_binary/` with worker processes fails, it starts again with one by itself (`WARNING: writing with N worker processes failed`). If it hangs instead, set `PREPROCESS_JOBS=1`: one worker, as it always was (multi-job writing used to crash on Windows).
 - If the process freezes during preprocessing (bandpass filter step), the recording may be very long. Allow up to several hours for large datasets.
 
 **Bad channel list produces unexpected results**

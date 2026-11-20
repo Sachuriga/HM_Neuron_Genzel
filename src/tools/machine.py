@@ -24,6 +24,8 @@ Settings (hm_tracker_paths.txt, or the environment):
                       a number = every step uses exactly that many workers.
     AUTO_CURATE_JOBS  a number = the Phy auto-curation uses that many, whatever
                       N_JOBS says (see phy_autocurate.curate_jobs).
+    PREPROCESS_JOBS   a number = step 7 writes processed_binary/ with that many,
+                      whatever N_JOBS says (see sorting.processed_binary_jobs).
     HM_PARALLEL_JOBS  set by runner.py for the jobs it starts: how many of them
                       run side by side. Not meant for the config file.
 

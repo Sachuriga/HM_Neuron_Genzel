@@ -541,13 +541,71 @@ def _flag_is_on(value):
 
 # How processed_binary/ is written. Shared by sorting and the rebuild tool:
 # a different chunk size would change the filter edges very slightly.
+# The number of worker processes is NOT in here: it follows the computer (see
+# save_processed_binary) and does not change the result.
 PROCESSED_BINARY_SAVE_KWARGS = dict(
     format='binary',
     overwrite=True,
-    n_jobs=1,             # Keep this at 1 for Windows!
     chunk_duration="1s",
     progress_bar=True,
 )
+
+# Name of the small table in which the shared-noise step notes, per 1 s block,
+# what it removed (shared_noise.start_strengths_file). Only for the log line
+# after the write; deleted once that line is printed.
+SHARED_NOISE_STRENGTHS_FILE = "shared_noise_strengths.npy"
+
+
+def read_from_files(recording):
+    """True when every part of the recording is read from files on disk.
+
+    Only such a recording can be given to worker processes: each worker opens
+    the files itself. A recording that holds its samples in memory (the fallback
+    for a .dat with an unexpected layout, see open_raw_recording) would be copied
+    whole into every worker - with n_jobs > 1 that is what used to crash on
+    Windows.
+    """
+    try:
+        return bool(recording.check_serializability("json"))
+    except Exception:
+        return False            # cannot tell: stay on the safe side
+
+
+def processed_binary_jobs(recording):
+    """Worker processes that write processed_binary/ (at least 1).
+
+    PREPROCESS_JOBS from the config file when it is a number (1 = one worker, as
+    it always was), else as many as fit this computer (src/tools/machine.py).
+    """
+    if not read_from_files(recording):
+        print("This recording is held in memory, not read from files: 1 worker.")
+        return 1
+    return machine.setting_n_jobs("PREPROCESS_JOBS") or machine.step_n_jobs()
+
+
+def save_processed_binary(recording, folder):
+    """Step 5, the slow part: compute the preprocessed recording, write it to
+    ``folder`` and return the saved recording.
+
+    The work is split into 1 s chunks. With several worker processes the chunks
+    are computed side by side; which process computes a chunk does not change
+    its samples, so the file is the same for any number of workers.
+
+    Should the worker processes fail, the write starts again with one worker:
+    slower, but the sort still gets done.
+    """
+    n_jobs = processed_binary_jobs(recording)
+    print(f"Writing {Path(folder).name}/ with {n_jobs} worker process(es) (n_jobs).")
+    try:
+        return recording.save(folder=folder, n_jobs=n_jobs, **PROCESSED_BINARY_SAVE_KWARGS)
+    except Exception as error:
+        if n_jobs == 1:
+            raise                                   # nothing slower to fall back to
+        print(f"WARNING: writing with {n_jobs} worker processes failed ({error!r}).")
+        print("Starting again with 1 worker. PREPROCESS_JOBS=1 in hm_tracker_paths.txt "
+              "makes that the rule.")
+        shutil.rmtree(folder, ignore_errors=True)   # the half-written file
+        return recording.save(folder=folder, n_jobs=1, **PROCESSED_BINARY_SAVE_KWARGS)
 
 
 def open_raw_recording(paths, fs=30000.0, gain=0.195, offset=0.0):
@@ -653,11 +711,15 @@ def attach_tetrode_probe(rec):
 
 def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
                            eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0,
-                           shared_noise_components=0):
+                           shared_noise_components=0, shared_noise_file=None):
     """Steps 4.1-5: drop EEG tetrodes -> band-pass -> interpolate bad channels
     -> optional single-channel reference -> global median reference
     -> optional shared-noise removal (shared_noise_components > 0).
-    Returns the lazy preprocessed recording (nothing is written yet)."""
+    Returns the lazy preprocessed recording (nothing is written yet).
+
+    ``shared_noise_file``: where the shared-noise step notes what it removed, so
+    that its summary line also works when worker processes write the recording
+    (see shared_noise.start_strengths_file). None = no such file."""
     # 4.1. Drop EEG tetrode channels — they are not spike-sorted.
     eeg_channel_ids = list(eeg_channel_ids) if eeg_channel_ids else []
     if eeg_channel_ids:
@@ -720,7 +782,8 @@ def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
         print(f"Removing up to {shared_noise_components} shared-noise pattern(s) "
               f"per 1 s block (after the global median).")
         rec_cmr = remove_shared_noise_recording(
-            rec_cmr, max_components=shared_noise_components)
+            rec_cmr, max_components=shared_noise_components,
+            strengths_file=shared_noise_file)
 
     # 5.5. No manual whitening here — MountainSort does its own whitening
     #      (para['whiten']=True in process_single_file), so whitening twice
@@ -731,7 +794,7 @@ def preprocess_for_sorting(rec, bad_channel_ids=None, ref_channels=None,
 def build_preprocessed_recording(paths, bad_channel_ids=None, ref_channels=None,
                                  eeg_channel_ids=None, freq_min=600.0, freq_max=8000.0,
                                  fs=30000.0, gain=0.195, offset=0.0,
-                                 shared_noise_components=0):
+                                 shared_noise_components=0, shared_noise_file=None):
     """Steps 2-5 in one call: raw files -> probe -> preprocessed recording."""
     rec = open_raw_recording(paths, fs=fs, gain=gain, offset=offset)
     rec = attach_tetrode_probe(rec)
@@ -739,7 +802,8 @@ def build_preprocessed_recording(paths, bad_channel_ids=None, ref_channels=None,
                                   ref_channels=ref_channels,
                                   eeg_channel_ids=eeg_channel_ids,
                                   freq_min=freq_min, freq_max=freq_max,
-                                  shared_noise_components=shared_noise_components)
+                                  shared_noise_components=shared_noise_components,
+                                  shared_noise_file=shared_noise_file)
 
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
@@ -790,7 +854,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         paths, bad_channel_ids=bad_channel_ids, ref_channels=ref_channels,
         eeg_channel_ids=eeg_channel_ids, freq_min=freq_min, freq_max=freq_max,
         fs=fs, gain=gain, offset=offset,
-        shared_noise_components=shared_noise_components)
+        shared_noise_components=shared_noise_components,
+        shared_noise_file=output_dir / SHARED_NOISE_STRENGTHS_FILE)
 
     # Record where sample/fs stops matching the Trodes clock (spliced gaps).
     import json
@@ -805,10 +870,12 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     if processed_folder.exists():
         shutil.rmtree(processed_folder)
 
-    rec_saved = rec_preprocessed.save(folder=processed_folder,
-                                      **PROCESSED_BINARY_SAVE_KWARGS)
+    rec_saved = save_processed_binary(rec_preprocessed, processed_folder)
     if hasattr(rec_preprocessed, "removed_summary"):
         print(rec_preprocessed.removed_summary())    # how much shared noise this recording had
+    # The table behind that line has done its job (it is not there when the
+    # shared-noise step is off).
+    (output_dir / SHARED_NOISE_STRENGTHS_FILE).unlink(missing_ok=True)
 
     # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
@@ -977,8 +1044,7 @@ if __name__ == "__main__":
 
     # Worker processes for the post-sorting analysis (waveforms, PCA, metrics):
     # as many as fit this computer. N_JOBS=<number> in hm_tracker_paths.txt forces
-    # a number. (Writing processed_binary/ stays at 1 worker: see
-    # PROCESSED_BINARY_SAVE_KWARGS.)
+    # a number. (Writing processed_binary/ asks for itself: save_processed_binary.)
     n_jobs = machine.step_n_jobs()
     print(f"Post-sorting analysis: {n_jobs} worker process(es) (n_jobs).")
 

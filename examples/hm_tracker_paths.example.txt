@@ -23,6 +23,9 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 #                   shared equally between the jobs that run side by side.
 #                   A number = every step uses exactly that many (e.g. 4, as it
 #                   was before; lower it when a step runs out of memory).
+# PREPROCESS_JOBS : step 7 only: worker processes that write processed_binary/
+#                   (filter + reference + shared noise). Not set / auto = N_JOBS.
+#                   1 = one worker, as it always was (the file is the same).
 # MONITOR_SECONDS : how often the status block (machine + each job) is printed.
 # MIN_FREE_GB     : disk guard, for all parallel jobs (also the ip*/op* workers):
 #                   space always kept free on each disk the jobs write to. A job

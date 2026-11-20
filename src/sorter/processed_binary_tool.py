@@ -399,7 +399,7 @@ def restore(input_folder, output_folder, config_path=None):
                   f"put the old setting back and try again.")
             continue
 
-        rec.save(folder=processed, **sorting.PROCESSED_BINARY_SAVE_KWARGS)
+        sorting.save_processed_binary(rec, processed)
         _check_against_fingerprint(out_dir, processed, phy)
         note = out_dir / REMOVED_NOTE_FILE
         if note.exists():
