@@ -1,5 +1,5 @@
 """runner.py: a sleep ip folder (pre/post) is emptied only when its recordings are
-sorted (processed_binary kept) and the session NWB holds LFP + EMG + motion.
+sorted (processed_binary kept) and the session NWB holds LFP + EMG.
 processed_binary_tool --clean then keeps processed_binary/ (the last 30 kHz copy)."""
 import sys
 from pathlib import Path
@@ -94,13 +94,21 @@ def test_kept_when_processed_binary_is_gone(pair):
     assert runner.sleep_ip_problems(ip, op)
 
 
-def test_kept_without_lfp_emg_or_motion_in_the_nwb(pair):
+def test_kept_without_lfp_or_emg_in_the_nwb(pair):
     ip, op = pair
     add_recording(ip, POST)
     add_sort(op, POST)
     assert "no session NWB" in runner.sleep_ip_problems(ip, op)[0]
-    add_nwb(op, series=("lfp", "emg_from_lfp"))
-    assert "motion" in runner.sleep_ip_problems(ip, op)[0]
+    add_nwb(op, series=("lfp",))
+    assert "emg_from_lfp" in runner.sleep_ip_problems(ip, op)[0]
+
+
+def test_motion_in_the_nwb_is_not_needed(pair):
+    ip, op = pair
+    add_recording(ip, POST)
+    add_sort(op, POST)
+    add_nwb(op, series=("lfp", "emg_from_lfp"))           # no motion (IMU) series
+    assert runner.sleep_ip_problems(ip, op) == []
 
 
 def test_split_parts_of_one_phase_need_one_sort(pair):
@@ -131,3 +139,51 @@ def test_clean_keeps_processed_binary_after_the_ip_was_emptied(pair):
     counts = pbt.clean(op, really_delete=True, force=True)
     assert counts["deleted"] == 0 and counts["kept"] == 1
     assert (out / "processed_binary" / "traces_cached_seg0.raw").exists()
+
+
+# ------------------------------------------- a complete processed_binary/ is enough
+def add_binary_of_a_stopped_sort(op, name, note_bytes=1):
+    """processed_binary/ written to the end (it has its note), but no Phy export:
+    the run stopped during the sorting. touch() writes 1 byte into the .raw."""
+    import json
+    out = op / f"{name}.raw_group0_mountainsort4_sorting_output"
+    touch(out / "processed_binary" / "traces_cached_seg0.raw")
+    touch(out / "processed_binary" / "write_complete.json", json.dumps({"num_bytes": note_bytes}))
+    return out
+
+
+def test_emptied_as_soon_as_processed_binary_is_complete(pair):
+    ip, op = pair
+    add_recording(ip, PRE)
+    add_binary_of_a_stopped_sort(op, PRE)                 # not sorted yet
+    add_nwb(op)
+    assert runner.sleep_ip_problems(ip, op) == []
+    runner.empty_sleep_ip_folders([(ip, op)])
+    assert list(ip.iterdir()) == []
+    assert "processed_binary/ was complete" in (op / runner.IP_CLEARED_NOTE).read_text()
+
+
+def test_kept_while_processed_binary_is_half_written(pair):
+    ip, op = pair
+    add_recording(ip, PRE)
+    out = op / f"{PRE}.raw_group0_mountainsort4_sorting_output"
+    touch(out / "processed_binary" / "traces_cached_seg0.raw")   # no note: still being written
+    add_nwb(op)
+    assert "no complete processed_binary/" in runner.sleep_ip_problems(ip, op)[0]
+
+
+def test_kept_when_the_file_is_smaller_than_its_note_says(pair):
+    ip, op = pair
+    add_recording(ip, PRE)
+    add_binary_of_a_stopped_sort(op, PRE, note_bytes=1000)
+    add_nwb(op)
+    assert runner.sleep_ip_problems(ip, op)
+
+
+def test_complete_processed_binary_without_lfp_is_kept(pair):
+    ip, op = pair
+    add_recording(ip, PRE)
+    add_binary_of_a_stopped_sort(op, PRE)                 # step 7 alone, step 8 never ran
+    assert "no session NWB" in runner.sleep_ip_problems(ip, op)[0]
+    runner.empty_sleep_ip_folders([(ip, op)])
+    assert (ip / f"{PRE}.rec").exists()

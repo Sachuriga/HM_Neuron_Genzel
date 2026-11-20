@@ -161,7 +161,7 @@ def test_old_steps_c_and_a_are_retired(tmp_path, monkeypatch, capsys):
         (tmp_path / d).mkdir()
     calls = []
 
-    def fake_run_per_op(label, tag, script, ops, config, extra_ip=None):
+    def fake_run_per_op(label, tag, script, ops, config, extra_ip=None, extra_args=None):
         calls.append((tag, script, len(ops)))
 
     monkeypatch.setattr(runner, "_run_per_op", fake_run_per_op)

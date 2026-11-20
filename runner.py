@@ -61,6 +61,8 @@ PYTHON = sys.executable  # run child python steps with the same interpreter
 # machine.py fits the number of worker processes to this computer (see its docstring).
 sys.path.insert(0, str(SCRIPT_DIR / "src"))
 from tools import disk_guard, machine  # noqa: E402
+from tools.sleep_ip import (  # noqa: E402,F401  (the tests reach these through runner)
+    IP_CLEARED_NOTE, empty_sleep_ip_folders, recording_phase, sleep_ip_problems)
 
 # ------------------------------------------------------------
 #                 THE MENU — single source of truth
@@ -75,8 +77,10 @@ MENU = [
     ("4", "Tracker (+ fix .txt timestamps + write/refresh the session NWB: behaviour/trials)"),
     ("5", "Plotting"),
     ("6", "Compression (always runs LAST, over all op folders)"),
-    ("7", "Sorting + clock QC/repair + Phy auto-curation (recluster + cut + label; sorted ones are curated again)"),
+    # 8 is listed before 7 because it runs before 7 (8 in the parallel workers,
+    # 7 afterwards); the keys stay the same, so presets like "18" still work.
     ("8", "LFP + Motion (IMU Accel) + EMG-from-LFP + sleep NWB"),
+    ("7", "Sorting + clock QC/repair + Phy auto-curation (recluster + cut + label; sorted ones are curated again)"),
     ("l", "Rewrite the NWB LFP from the old LFP_Output export (5 Hz stubs / 30 kHz stamps; at LFP_OUTPUT_RATE)"),
     ("d", "deeplabcut (extract eye frames + run DLC inference -> keypoints in CSV)"),
     ("9", "Cleaning"),
@@ -676,171 +680,22 @@ def clean_folder(target):
 
 
 # ------------------------------------------------------------
-#     SLEEP ip FOLDERS: emptied once sorted + LFP is in the NWB
+#     SLEEP ip FOLDERS: emptied once processed_binary/ + LFP are there
 # ------------------------------------------------------------
-# A sleep ip folder (every recording in it is a "pre" or a "post") only holds a
-# COPY of the .rec, and it is as big as the recording. Once step 7 has sorted it
-# and step 8 has written the LFP / EMG / motion into the session NWB, everything
-# the later steps read lives in the op folder:
-#   - <op>/*_sorting_output/processed_binary/  (30 kHz, filtered) -> Phy + step u
-#   - <op>/*.nwb                               (LFP, EMG, motion) -> sleep scoring
-# So the ip folder is emptied at the end of the run. Maze (task) folders are never
-# touched: their videos and .rec are still needed (re-track, step 2, ...).
-#
-# The same phase rule as the sorter (src/sorter/sorting.py, _PHASE_KEYS). The
-# order matters: "post" and the task words are tested before "pre".
-_PHASE_KEYS = (("post", "post"), ("maze", "task"), ("mazs", "task"),
-               ("awake", "task"), ("hab", "task"), ("pre", "pre"))
-_REC_DATE_RE = __import__("re").compile(r"(\d{8})_\d{6}")
-_RAT_NUMBER_RE = __import__("re").compile(r"[Rr]at\s*_?(\d+)")
-
-# Written into the op folder when its ip folder was emptied. processed_binary_tool
-# reads it: from then on processed_binary/ is the only 30 kHz copy on this disk,
-# so --clean must not delete it. Keep the name the same in both files.
-IP_CLEARED_NOTE = "RAW_IP_CLEARED.txt"
-
-# What step 8 must have written into the session NWB before the .rec may go.
-_NWB_SERIES_FROM_RAW = ("lfp", "emg_from_lfp", "motion")
-
-
-def recording_phase(name):
-    """'pre', 'post' or 'task' from a recording name; None when it says neither."""
-    lower_name = name.lower()
-    for key, phase in _PHASE_KEYS:
-        if key in lower_name:
-            return phase
-    return None
-
-
-def _sorted_and_kept(op, rec_file):
-    """True when step 7 finished sorting this .rec and its processed binary is
-    still in the op folder."""
-    # the sorter names the folder <recording>.raw_group0_<sorter>_sorting_output
-    for out_dir in Path(op).glob(f"{rec_file.stem}.raw_group0_*_sorting_output"):
-        # params.py is written at the very end of a sort: it means "finished"
-        sort_finished = (out_dir / "phy_export" / "params.py").is_file()
-        binary_files = list((out_dir / "processed_binary").glob("*.raw"))
-        binary_has_data = any(f.stat().st_size > 0 for f in binary_files)
-        if sort_finished and binary_has_data:
-            return True
-    return False
-
-
-def _nwb_problems(op):
-    """Why the session NWB of `op` does not yet hold everything step 8 makes from
-    the raw data. An empty list means it is all there."""
-    try:
-        import h5py
-    except ImportError:
-        return ["h5py is not installed, so the session NWB could not be checked"]
-    nwb_files = [p for p in sorted(Path(op).glob("*.nwb"))
-                 if not p.name.endswith(".tmp.nwb") and not p.name.startswith("._")]
-    if not nwb_files:
-        return ["no session NWB in the op folder (run step 8)"]
-    try:
-        with h5py.File(str(nwb_files[0]), "r") as f:
-            missing = []
-            for name in _NWB_SERIES_FROM_RAW:
-                data_path = f"acquisition/{name}/data"
-                if data_path not in f or f[data_path].shape[0] == 0:
-                    missing.append(name)
-    except OSError as e:
-        return [f"the session NWB could not be read ({e})"]
-    if missing:
-        return [f"{nwb_files[0].name} has no {' / '.join(missing)} yet (run steps 1 and 8)"]
-    return []
-
-
-def sleep_ip_problems(ip, op):
-    """Decide whether a sleep ip folder may be emptied.
-
-    Returns None when `ip` is not a sleep folder (no .rec, or a recording that is
-    not pre/post) — such a folder is simply left alone. Otherwise returns the list
-    of reasons to KEEP it; an empty list means it is safe to empty.
-    """
-    ip, op = Path(ip), Path(op)
-    rec_files = sorted(ip.rglob("*.rec"))     # the sorter also looks in subfolders
-    if not rec_files:
-        return None
-    phases = [recording_phase(rec.stem) for rec in rec_files]
-    if any(phase not in ("pre", "post") for phase in phases):
-        return None
-
-    # Split parts of one phase (..._post + ..._post2, after a crash of the
-    # acquisition PC) are sorted as ONE recording, into the output folder of the
-    # first part. So the check is per (rat, date, phase) group, not per file.
-    groups = {}
-    for rec, phase in zip(rec_files, phases):
-        rat = _RAT_NUMBER_RE.search(rec.stem)
-        date = _REC_DATE_RE.search(rec.stem)
-        key = (rat.group(1) if rat else None, date.group(1) if date else None, phase)
-        groups.setdefault(key, []).append(rec)
-
-    problems = []
-    for parts in groups.values():
-        if not any(_sorted_and_kept(op, rec) for rec in parts):
-            problems.append(f"{parts[0].name} has no finished sort with its "
-                            f"processed_binary/ in the op folder (run step 7)")
-    problems += _nwb_problems(op)
-    return problems
-
-
-def empty_sleep_ip_folder(ip, op):
-    """Delete everything inside `ip` (the folder itself stays, so ipN still pairs
-    with opN) and leave a note in `op`. Returns True when nothing is left."""
-    ip, op = Path(ip), Path(op)
-    rec_names = [rec.name for rec in sorted(ip.rglob("*.rec"))]
-    for item in sorted(ip.iterdir()):
-        try:
-            if item.is_dir() and not item.is_symlink():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-        except OSError as e:
-            # e.g. a file still open in another program (Windows)
-            print(f"    could not delete {item.name}: {e}")
-    left = [item.name for item in ip.iterdir()]
-    if left:
-        print(f"    NOT empty yet, still there: {', '.join(left)}")
-    if not any(ip.rglob("*.rec")):
-        (op / IP_CLEARED_NOTE).write_text(
-            f"The sleep ip folder of this session ({ip}) was emptied on "
-            f"{time.strftime('%Y-%m-%d %H:%M')} after sorting and the LFP export.\n"
-            f"Deleted recordings: {', '.join(rec_names)}\n\n"
-            "On this disk the 30 kHz data now only exists as\n"
-            "  <recording>_sorting_output/processed_binary/   (band-passed + re-referenced)\n"
-            "so processed_binary_tool.py --clean does not delete it while this note is here.\n"
-            "The unfiltered data (new LFP, other filter settings, a new sort from raw)\n"
-            "needs the original .rec from the recording drive.\n")
-    return not left
-
-
-def empty_sleep_ip_folders(ops):
-    """End of a run with step 7 or 8: empty every sleep ip folder that passes
-    sleep_ip_problems(); say why for the ones that are kept."""
-    print("\n" + "=" * 56)
-    print("[MASTER] Sleep ip folders (pre/post): emptying the ones that are sorted "
-          "and have their LFP in the NWB...")
-    print("=" * 56)
-    for ip, op in ops:
-        problems = sleep_ip_problems(ip, op)
-        if problems is None:
-            continue                     # a maze folder, or nothing to delete
-        if problems:
-            print(f"[SLEEP-IP] KEPT {ip}:")
-            for reason in problems:
-                print(f"    - {reason}")
-            continue
-        print(f"[SLEEP-IP] Emptying {ip} (its data is in {op})")
-        if empty_sleep_ip_folder(ip, op):
-            print(f"[SLEEP-IP] Emptied {ip}")
+# The rules and the deleting live in src/tools/sleep_ip.py (imported at the top),
+# because step 7 (sorting.py) uses them too: it empties a sleep ip folder right
+# after its processed_binary/ is complete, before the long sorting starts. The
+# runner checks every ip folder once more at the end of a run with step 7 or 8.
 
 
 # ------------------------------------------------------------
 #                 SEQUENTIAL (master) STEP RUNNERS
 # ------------------------------------------------------------
-def _run_per_op(label, tag, script, ops, config, extra_ip=None):
-    """Run a python step sequentially over every op folder (used by 7/l/u/v)."""
+def _run_per_op(label, tag, script, ops, config, extra_ip=None, extra_args=None):
+    """Run a python step sequentially over every op folder (used by 7/l/u/v).
+
+    extra_args: more command-line arguments for the script (a list), or None.
+    """
     print("\n" + "=" * 56)
     print(f"[MASTER] Running {label} sequentially...")
     print("=" * 56)
@@ -858,6 +713,7 @@ def _run_per_op(label, tag, script, ops, config, extra_ip=None):
             Path(op).mkdir(parents=True, exist_ok=True)
             cmd += ["--input_folder", ip]
         cmd += ["--output_folder", op, "--config", config]
+        cmd += extra_args or []
         rc = run(cmd)
         print(f"[{tag} {i}/{total}] {'Done.' if rc == 0 else 'Python exited with error. Continuing...'}")
     print(f"\n[MASTER] {label} complete for all {total} folder(s).")
@@ -1668,9 +1524,15 @@ def main():
     os.environ.pop("HM_PARALLEL_JOBS", None)
 
     # --- Sequential master steps, in fixed order ---
+    # Sleep ip folders are emptied once nothing reads them any more
+    # (CLEAR_SLEEP_IP=0 switches that off): by step 7, and at the end of the run.
+    clear_sleep_ip = _str_env("CLEAR_SLEEP_IP", default="1").lower() not in ("0", "false", "no", "off")
     if has["7"]:
+        # --clear_sleep_ip: the sorter empties a sleep ip folder as soon as its
+        # processed_binary/ is complete (see src/tools/sleep_ip.py).
         _run_per_op("SORTING + PHY AUTO-CURATION", "SORT", "./src/sorter/sorting.py", ops, config,
-                    extra_ip=True)
+                    extra_ip=True,
+                    extra_args=["--clear_sleep_ip"] if clear_sleep_ip and not tree else None)
         clock_qc_after_sorting(ops)
 
     if has["9"]:
@@ -1757,7 +1619,6 @@ def main():
     # --- Sleep ip folders: emptied at the very end, when nothing reads them any
     # more. Only after a run that sorted (7) or exported the LFP (8); the checks
     # in sleep_ip_problems() decide per folder. CLEAR_SLEEP_IP=0 switches it off.
-    clear_sleep_ip = _str_env("CLEAR_SLEEP_IP", default="1").lower() not in ("0", "false", "no", "off")
     if clear_sleep_ip and not tree and (has["7"] or "8" in selection):
         empty_sleep_ip_folders(ops)
 

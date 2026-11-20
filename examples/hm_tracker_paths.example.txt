@@ -110,9 +110,11 @@ NWB_RAT_NR=1
 #                    0 / omitted = don't sort them again (their Phy export is
 #                    still auto-curated again; see AUTO_CURATE_REDO).        [0]
 #
-# CLEAR_SLEEP_IP  : 1 / omitted = at the end of a run with step 7 or 8, empty
-#                    every sleep ip folder (all its .rec are pre / post) that
-#                    is sorted and has its LFP + EMG + motion in the NWB. The
+# CLEAR_SLEEP_IP  : 1 / omitted = empty a sleep ip folder (all its .rec are
+#                    pre / post) as soon as its processed_binary/ is complete
+#                    and its LFP + EMG are in the NWB (motion is not needed). Step 7 does it
+#                    before the sorting starts; a sort that is stopped later is
+#                    finished from processed_binary/. The
 #                    ip folder is a copy: keep the .rec on the recording drive.
 #                    0 = never empty an ip folder.                           [1]
 #

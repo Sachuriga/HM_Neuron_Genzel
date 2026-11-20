@@ -246,3 +246,91 @@ def test_leftovers_are_deleted_but_processed_binary_is_kept(tmp_path):
         (out / name).write_text("x")
     sorting.keep_only_processed_binary(out)
     assert sorted(p.name for p in out.iterdir()) == ["processed_binary", "spliced_gaps.json"]
+
+
+# ------------------------------------- the raw data is deleted once processed_binary/ is complete
+def complete_processed_binary(tmp_path, monkeypatch, name="Rat6_20260707_091045_pre.raw_group0"):
+    """An output folder as a stopped sort leaves it: processed_binary/ with its
+    note, leftovers of the sorter, no Phy export. Returns (raw file, output folder)."""
+    raw_file = tmp_path / "ip1" / f"{name}.dat"
+    raw_file.parent.mkdir()
+    write_raw_file(raw_file, seconds=2.0)
+    monkeypatch.setenv("PREPROCESS_JOBS", "1")
+    out = tmp_path / "op1" / f"{name}_mountainsort4_sorting_output"
+    out.mkdir(parents=True)
+    saved = sorting.save_processed_binary(preprocessed(raw_file, out), out / "processed_binary")
+    sorting.note_processed_binary_complete(out / "processed_binary", recipe_for(raw_file), saved)
+    (out / "sorting_work_folder").mkdir()
+    return raw_file, out
+
+
+def record_sorts(monkeypatch):
+    """Replace the long part (sorting + export) by a list of what was asked for."""
+    sorts = []
+
+    def fake_sort_and_export(rec_saved, output_dir, file_stem, sorter_name, sorting_params, n_jobs):
+        sorts.append((Path(output_dir).name, file_stem, rec_saved.get_num_samples()))
+
+    monkeypatch.setattr(sorting, "sort_and_export", fake_sort_and_export)
+    return sorts
+
+
+def test_the_note_says_how_big_the_file_must_be(tmp_path, monkeypatch):
+    import json
+    _, out = complete_processed_binary(tmp_path, monkeypatch)
+    note = json.loads((out / "processed_binary" / sorting.PROCESSED_BINARY_NOTE).read_text())
+    on_disk = sum(f.stat().st_size for f in (out / "processed_binary").glob("*.raw"))
+    assert note["num_bytes"] == on_disk
+    assert sorting.sleep_ip.processed_binary_is_complete(out)
+
+
+def test_a_stopped_sort_is_finished_without_its_raw_data(tmp_path, monkeypatch, capsys):
+    raw_file, out = complete_processed_binary(tmp_path, monkeypatch)
+    sorts = record_sorts(monkeypatch)
+    raw_file.unlink()                                     # the sleep ip folder was emptied
+    monkeypatch.setattr(sorting, "recurate_sorted_exports", lambda *args, **kwargs: None)
+
+    sorting.run_sorting_pipeline(tmp_path / "ip1", tmp_path / "op1", n_jobs=1,
+                                 config={sorting.SORTER_CONFIG_KEY: "mountainsort4"})
+    assert sorts == [(out.name, "Rat6_20260707_091045_pre.raw_group0", 60000)]
+    assert not (out / "sorting_work_folder").exists()     # leftovers of the stopped sort
+    assert (out / "processed_binary").is_dir()
+
+
+def test_raw_data_gone_in_the_middle_of_a_run_goes_on_from_processed_binary(tmp_path, monkeypatch):
+    raw_file, out = complete_processed_binary(tmp_path, monkeypatch)
+    sorts = record_sorts(monkeypatch)
+    raw_file.unlink()
+    sorting.process_single_file(raw_file, tmp_path / "op1", sorter_name="mountainsort4")
+    assert len(sorts) == 1
+
+
+def test_without_raw_data_a_half_written_processed_binary_is_an_error(tmp_path, monkeypatch):
+    raw_file, out = complete_processed_binary(tmp_path, monkeypatch)
+    record_sorts(monkeypatch)
+    raw_file.unlink()
+    (out / "processed_binary" / sorting.PROCESSED_BINARY_NOTE).unlink()
+    with pytest.raises(RuntimeError, match="Copy the .rec"):
+        sorting.process_single_file(raw_file, tmp_path / "op1", sorter_name="mountainsort4")
+    assert (out / "processed_binary").is_dir()            # nothing was deleted
+
+
+def test_the_ip_folder_is_emptied_before_the_sorting_starts(tmp_path, monkeypatch):
+    raw_file, out = complete_processed_binary(tmp_path, monkeypatch)
+    order = []
+    monkeypatch.setattr(sorting, "sort_and_export", lambda *args: order.append("sort"))
+    monkeypatch.setattr(sorting.sleep_ip, "empty_if_ready",
+                        lambda ip, op: order.append(("empty", Path(ip).name, Path(op).name)))
+    settings = dict(bad_channel_ids=[3], ref_channels=[98], eeg_channel_ids=[44, 45, 46, 47],
+                    sorter_name="mountainsort4",
+                    sorting_params=dict(freq_min=300.0, freq_max=6000.0, shared_noise_components=2))
+
+    # asked for (the runner does): emptied first, then sorted
+    sorting.process_single_file(raw_file, tmp_path / "op1", clear_raw_folder=tmp_path / "ip1",
+                                **settings)
+    assert order == [("empty", "ip1", "op1"), "sort"]
+
+    # not asked for (sorting.py started by hand): the raw data is never touched
+    order.clear()
+    sorting.process_single_file(raw_file, tmp_path / "op1", **settings)
+    assert order == ["sort"]

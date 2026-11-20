@@ -137,8 +137,8 @@ STEP_GROUPS = [
         "t": "Drive scan",
     }),
     ("Ephys", 1, {
+        "8": "LFP + motion + EMG (sleep)",       # runs before 7, so it is listed first
         "7": "Spike sorting (+ auto-curation)",
-        "8": "LFP + motion + EMG (sleep)",
         "l": "Rewrite NWB LFP",
     }),
     ("NWB & analysis", 1, {

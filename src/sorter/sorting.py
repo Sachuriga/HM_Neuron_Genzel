@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import json
@@ -380,6 +381,7 @@ from shared_noise import remove_shared_noise_recording  # noqa: E402
 # machine.py (src/tools) fits the number of worker processes to this computer.
 sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
 import machine  # noqa: E402
+import sleep_ip  # noqa: E402  (empties a sleep ip folder once its data is in the op folder)
 
 LAST_SPLICED_GAPS = []   # set by open_raw_recording; see spliced_gaps.json
 
@@ -840,8 +842,12 @@ def processed_binary_recipe(paths, bad_channel_ids, ref_channels, eeg_channel_id
 
 def note_processed_binary_complete(folder, recipe, recording, shared_noise_summary=None):
     """Write the note: processed_binary/ is complete, and this is how it was made."""
+    # num_bytes: the size the file must have; sleep_ip.py compares it with the
+    # disk before it deletes the raw data.
+    num_bytes = (int(recording.get_num_samples()) * int(recording.get_num_channels())
+                 * np.dtype(recording.get_dtype()).itemsize)
     note = dict(recipe=recipe, num_samples=int(recording.get_num_samples()),
-                num_channels=int(recording.get_num_channels()),
+                num_channels=int(recording.get_num_channels()), num_bytes=num_bytes,
                 shared_noise_summary=shared_noise_summary)
     (Path(folder) / PROCESSED_BINARY_NOTE).write_text(json.dumps(note, indent=1))
 
@@ -851,6 +857,8 @@ def load_complete_processed_binary(folder, recipe):
 
     It can be used again when its note is there (the write finished), the recipe
     in the note is today's recipe, and the file still has every sample.
+    ``recipe=None`` skips the recipe check: for a recording whose raw data is
+    gone, so that there is nothing to make a new processed_binary/ from.
     Returns ``(recording, note)`` or ``(None, why not)``.
     """
     note_file = Path(folder) / PROCESSED_BINARY_NOTE
@@ -858,7 +866,7 @@ def load_complete_processed_binary(folder, recipe):
         return None, "it was not written to the end"
     try:
         note = json.loads(note_file.read_text())
-        if note["recipe"] != recipe:
+        if recipe is not None and note["recipe"] != recipe:
             changed = [k for k in recipe if note["recipe"].get(k) != recipe[k]]
             return None, f"the settings changed since ({', '.join(changed)})"
         recording = si.load(folder)
@@ -984,11 +992,16 @@ def sort_tetrodes(recording, sorter_name, sorter_params, work_folder):
 
 def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset=0.0, n_jobs=4,
                         bad_channel_ids=None, ref_channels=None, eeg_channel_ids=None,
-                        sorter_name=DEFAULT_SORTER, sorting_params=None):
+                        sorter_name=DEFAULT_SORTER, sorting_params=None,
+                        clear_raw_folder=None):
     """
     Runs the spike sorting pipeline on a single .dat file.
     Plotting is disabled, progress bars are enabled for all computations.
     All intermediate files are deleted at the end, leaving only phy_export.
+
+    clear_raw_folder: the ip folder the raw data is in. When given, it is emptied
+    as soon as processed_binary/ is complete - if it is a sleep folder whose LFP
+    is in the NWB (the rules are in src/tools/sleep_ip.py). None = never.
     """
     # `file_path` may be a single .dat, or a list of split parts of one phase to
     # concatenate in time. Parts are pre-ordered by the caller (acquisition time).
@@ -1002,9 +1015,13 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         sorting_params = resolve_sorting_params(None)
     freq_min = sorting_params.get('freq_min', 600.0)
     freq_max = sorting_params.get('freq_max', 8000.0)
-    detect_threshold = sorting_params.get('detect_threshold', 5.0)
-    detect_sign = sorting_params.get('detect_sign', 0)
     shared_noise_components = sorting_params.get('shared_noise_components', 0)
+
+    # The raw data can be gone: a sleep ip folder is emptied once its
+    # processed_binary/ is complete. The sort then goes on from that folder.
+    if not all(p.exists() for p in paths):
+        finish_sort_from_processed_binary(output_dir, sorter_name, sorting_params, n_jobs)
+        return
 
     # 1. SETUP PATHS
     # An existing output folder is one of two things:
@@ -1066,12 +1083,33 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
         if hasattr(rec_preprocessed, "removed_summary"):
             summary = rec_preprocessed.removed_summary()  # how much shared noise this recording had
             print(summary)
+        # Let go of the raw files: from here on only processed_binary/ is read,
+        # and Windows cannot delete a file that is still open.
+        rec_preprocessed = None
+        gc.collect()
         # The table behind that line has done its job (it is not there when the
         # shared-noise step is off).
         (output_dir / SHARED_NOISE_STRENGTHS_FILE).unlink(missing_ok=True)
         # Only now is processed_binary/ complete: note it, so that a run that stops
         # after this point does not have to write it again.
         note_processed_binary_complete(processed_folder, recipe, rec_saved, summary)
+
+    # The raw data has done its job for the sorter. A sleep ip folder is emptied
+    # now, before the long sorting, so the disk is free for the next recording.
+    if clear_raw_folder is not None:
+        sleep_ip.empty_if_ready(clear_raw_folder, output_parent)
+
+    # 6-10. Sort, analyse, export to Phy.
+    sort_and_export(rec_saved, output_dir, file_stem, sorter_name, sorting_params, n_jobs)
+
+
+def sort_and_export(rec_saved, output_dir, file_stem, sorter_name, sorting_params, n_jobs):
+    """Steps 6-10 of a sort job: everything after processed_binary/ is on disk.
+
+    rec_saved is the recording loaded from processed_binary/; the raw data is
+    not read here any more.
+    """
+    output_dir = Path(output_dir)
 
     # 6. SPIKE SORTING (MountainSort4 / MountainSort5, selected via config)
     win_temp = output_dir / "ms4_temp"
@@ -1083,8 +1121,8 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     # but still do its own whitening. Detect both spike polarities.
     para['filter'] = False
     para['whiten'] = True
-    para['detect_sign'] = detect_sign
-    para['detect_threshold'] = detect_threshold
+    para['detect_sign'] = sorting_params.get('detect_sign', 0)
+    para['detect_threshold'] = sorting_params.get('detect_threshold', 5.0)
     if sorter_name == 'mountainsort5':
         # scheme '2' is MS5's recommended multi-pass clustering scheme.
         para['scheme'] = '2'
@@ -1106,8 +1144,56 @@ def process_single_file(file_path, output_parent, fs=30000.0, gain=0.195, offset
     )
 
 
+def finish_sort_from_processed_binary(output_dir, sorter_name, sorting_params, n_jobs):
+    """Sort a recording whose raw data is gone, from its complete processed_binary/.
+
+    This is the sort of an emptied sleep ip folder that was stopped before the
+    Phy export. processed_binary/ is used as it is: without the raw data it
+    cannot be made again, so today's filter settings are not compared with it.
+    Nothing is deleted when it turns out not to be complete.
+    """
+    output_dir = Path(output_dir)
+    file_stem = output_dir.name[:-len(f"_{sorter_name}_sorting_output")]
+    if sorting_params is None:
+        sorting_params = resolve_sorting_params(None)
+
+    rec_saved, note = load_complete_processed_binary(output_dir / "processed_binary", recipe=None)
+    if rec_saved is None:
+        raise RuntimeError(
+            f"The raw data of {file_stem} is not in the input folder, and its "
+            f"processed_binary/ cannot be used ({note}). Copy the .rec from the "
+            f"recording drive into the ip folder and run step 7 again.")
+
+    print(f"\n--- Processing {file_stem} (raw data gone: from processed_binary/) ---")
+    print(f"Output folder: {output_dir}")
+    print(f"Sorting from the processed_binary/ of an earlier run "
+          f"({rec_saved.get_num_samples()} samples, {rec_saved.get_num_channels()} channels), "
+          f"with the filter settings of that run.")
+    if has_phy_export(output_dir):
+        # a re-sort (RESORT=1): the old curation is kept; processed_binary/ stays
+        backup_dir = output_dir.with_name(
+            f"{output_dir.name}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        backup_dir.mkdir()
+        (output_dir / "phy_export").rename(backup_dir / "phy_export")
+        print(f"Previous phy_export kept in: {backup_dir}")
+    keep_only_processed_binary(output_dir)
+    sort_and_export(rec_saved, output_dir, file_stem, sorter_name, sorting_params, n_jobs)
+
+
+def unfinished_sorts_without_raw(output_path, sorter_name, known_output_dirs):
+    """Output folders with a complete processed_binary/ but no Phy export, whose
+    raw data is not in the input folder (so no sort job was made for them)."""
+    found = []
+    for output_dir in sorted(Path(output_path).glob(f"*_{sorter_name}_sorting_output")):
+        if output_dir in known_output_dirs or has_phy_export(output_dir):
+            continue
+        if (output_dir / "processed_binary" / PROCESSED_BINARY_NOTE).is_file():
+            found.append(output_dir)
+    return found
+
+
 def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=None,
-                         resort=False):
+                         resort=False, clear_sleep_ip=False):
     """
     Scans the base_data_folder for .rec files (read directly, no raw export
     needed) — plus, for recordings whose .rec is gone, old *.raw/*_group0.dat
@@ -1123,6 +1209,11 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
     AUTO_CURATE_REDO=0 leaves them alone). `resort=True` sorts them again; their
     old phy_export is then moved to a dated backup folder first (see
     back_up_phy_export).
+
+    `clear_sleep_ip=True`: a sleep input folder (pre/post) is emptied as soon as
+    its processed_binary/ is complete and its LFP is in the NWB (sleep_ip.py).
+    A sort that was stopped after that has no .rec any more; it is found by its
+    processed_binary/ and finished from it.
     """
     config = config or {}
     sorter_name = resolve_sorter(config)
@@ -1141,8 +1232,6 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
 
     if not dat_files:
         print(f"No .rec files (or *.raw/*_group0.dat exports) found under '{base_data_folder}'.")
-        recurate_sorted_exports(output_path)        # sorted earlier: curate their exports again
-        return
 
     # Split parts of the same phase (..._post + ..._post2) are concatenated and
     # sorted as one recording; everything else is one sort per file, as before.
@@ -1152,6 +1241,21 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
           + (f" ({n_concat} multi-part phase(s) will be concatenated)." if n_concat else "."))
 
     just_sorted = []   # their exports were curated by the post-sorting already
+
+    # Sorts that were stopped after their raw data was deleted: finish them first.
+    known_output_dirs = {sorting_output_dir(g[0], output_path, sorter_name) for g in groups}
+    for output_dir in unfinished_sorts_without_raw(output_path, sorter_name, known_output_dirs):
+        print(f"\n{'='*60}")
+        print(f"Unfinished sort without raw data: {output_dir.name}")
+        print(f"{'='*60}")
+        just_sorted.append(output_dir / "phy_export")
+        try:
+            finish_sort_from_processed_binary(output_dir, sorter_name, sorting_params, n_jobs)
+        except Exception as e:
+            print(f"Error processing {output_dir.name}:\n{e}")
+            traceback.print_exc()
+            print("Skipping to next job...")
+
     for i, group in enumerate(groups, 1):
         first = group[0]
         name = _recording_name(first)
@@ -1184,6 +1288,7 @@ def run_sorting_pipeline(base_data_folder, output_data_folder, n_jobs=4, config=
                 eeg_channel_ids=eeg_channel_ids,
                 sorter_name=sorter_name,
                 sorting_params=sorting_params,
+                clear_raw_folder=base_path if clear_sleep_ip else None,
             )
         except Exception as e:
             print(f"Error processing {first.name}:\n{e}")
@@ -1213,6 +1318,11 @@ if __name__ == "__main__":
                              "(the old phy_export is backed up first). Same as RESORT=1 in "
                              "the config file.")
 
+    parser.add_argument('--clear_sleep_ip', action='store_true',
+                        help="Empty the input folder as soon as processed_binary/ is complete, "
+                             "when it is a sleep folder (pre/post) whose LFP is in the session "
+                             "NWB. The runner passes this unless CLEAR_SLEEP_IP=0.")
+
     args = parser.parse_args()
     # The runner exports every config key into the environment, so RESORT=1 in
     # hm_tracker_paths.txt arrives here as an environment variable.
@@ -1233,7 +1343,8 @@ if __name__ == "__main__":
 
     try:
         run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=n_jobs,
-                             config=sorting_config, resort=resort)
+                             config=sorting_config, resort=resort,
+                             clear_sleep_ip=args.clear_sleep_ip)
     except Exception as e:
         print(f"\n[FATAL] Pipeline crashed for folder '{args.input_folder}':\n{e}")
         traceback.print_exc()
