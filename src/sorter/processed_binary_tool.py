@@ -61,6 +61,9 @@ if str(NWB_DIR) not in sys.path:
 
 FINGERPRINT_FILE = "processed_binary_fingerprint.json"
 REMOVED_NOTE_FILE = "processed_binary_REMOVED.txt"
+# Written by runner.py into an op folder whose (sleep) ip folder was emptied.
+# Keep the name the same as runner.IP_CLEARED_NOTE.
+IP_CLEARED_NOTE = "RAW_IP_CLEARED.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +177,22 @@ def clean(output_folder, really_delete=False, force=False):
             print(f"  could not read the session NWB of {output_folder} ({e}).")
     total_freed = 0
 
+    # The runner empties a sleep ip folder once it is sorted (runner.py,
+    # empty_sleep_ip_folders) and leaves this note. processed_binary/ is then the
+    # only 30 kHz copy on this disk and --restore has no .rec to rebuild it from,
+    # so it is kept — also with --force. Delete the note yourself to overrule this.
+    raw_ip_cleared = (Path(output_folder) / IP_CLEARED_NOTE).exists()
+
     for out_dir in outputs:
         processed = out_dir / "processed_binary"
         phy = out_dir / "phy_export"
         print(f"\n{out_dir.name}")
+
+        if raw_ip_cleared and processed.exists():
+            print(f"  the ip folder of this session was emptied ({IP_CLEARED_NOTE}): "
+                  "processed_binary/ is the only 30 kHz copy here — keeping it.")
+            counts["kept"] += 1
+            continue
 
         # Each check below protects data you might still need.
         if not processed.exists():

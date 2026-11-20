@@ -88,6 +88,12 @@ NWB_RAT_NR=1
 #                    0 / omitted = don't sort them again (their Phy export is
 #                    still auto-curated again; see AUTO_CURATE_REDO).        [0]
 #
+# CLEAR_SLEEP_IP  : 1 / omitted = at the end of a run with step 7 or 8, empty
+#                    every sleep ip folder (all its .rec are pre / post) that
+#                    is sorted and has its LFP + EMG + motion in the NWB. The
+#                    ip folder is a copy: keep the .rec on the recording drive.
+#                    0 = never empty an ip folder.                           [1]
+#
 # Phy auto-curation (part of menu [7]):
 # PHY_AUTOCURATE     : 0 = no auto-curation in step 7: a new sort keeps the
 #                      threshold labels, sorted ones are left as they are.   [1]
