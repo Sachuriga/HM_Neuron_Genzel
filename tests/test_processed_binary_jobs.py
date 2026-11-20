@@ -175,14 +175,16 @@ def test_sorting_side_by_side_falls_back_to_one_after_the_other(tmp_path, monkey
 
     def fake_run_sorter_by_property(engine, engine_kwargs, **kwargs):
         engines.append((engine, engine_kwargs))
-        if engine == "joblib":
+        if engine != "loop":
             raise RuntimeError("a sorter process died")
         return "sorted in a loop"
 
     monkeypatch.setattr(sorting.si, "run_sorter_by_property", fake_run_sorter_by_property)
     result = sorting.sort_tetrodes(TetrodeRecording(), "mountainsort4", {}, tmp_path / "work")
     assert result == "sorted in a loop"
-    assert engines == [("joblib", {"n_jobs": 4, "backend": "loky"}), ("loop", {})]
+    # plain worker processes, not joblib/loky: MountainSort4 starts processes of its own
+    assert [engine for engine, _ in engines] == ["processpoolexecutor", "loop"]
+    assert engines[0][1]["max_workers"] == 4
     assert "one after the other" in capsys.readouterr().out
 
 

@@ -968,8 +968,13 @@ def sort_tetrodes(recording, sorter_name, sorter_params, work_folder):
     if n_jobs == 1:
         return run("loop", {})
     try:
-        # loky starts separate processes, the same way on Windows, macOS and Linux
-        return run("joblib", {"n_jobs": n_jobs, "backend": "loky"})
+        # Plain Python worker processes, started the same way ("spawn") on Windows,
+        # macOS and Linux. NOT joblib/loky: MountainSort4 starts processes of its
+        # own (through dask), and inside a loky worker that fails with
+        # "'Process' object has no attribute 'env'".
+        import multiprocessing
+        return run("processpoolexecutor", {"max_workers": n_jobs,
+                                           "mp_context": multiprocessing.get_context("spawn")})
     except Exception as error:
         print(f"WARNING: sorting {n_jobs} tetrodes at a time failed ({error!r}).")
         print("Sorting them again one after the other. SORT_JOBS=1 in "
