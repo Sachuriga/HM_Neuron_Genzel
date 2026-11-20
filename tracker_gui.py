@@ -169,7 +169,8 @@ def grouped_steps():
 _TREE_TOTAL = re.compile(r"^\[TREE\] (\d+) session\(s\) x steps \[(\w*)\]")
 _TREE_EVENT = re.compile(r"^\[TREE\] (start|done|FAILED)\s+(\S+)")
 _MON = re.compile(r"^\[MON [\d:]+\] (.*?) \| \d+ running, \d+ queued, \d+ done")
-_JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?")
+# the last group is "PAUSED (disk)" while the runner's disk guard holds the job
+_JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?(?:\s+(PAUSED.*))?")
 
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")
 # where the runner's tree mode keeps its per-run logs + summary.csv (POST_LOG_DIR)
@@ -1137,8 +1138,9 @@ class TrackerGUI(QMainWindow):
                                 + ", ".join(self._failed) if self._failed else ""))
         rows = []
         for label in sorted(self._running):
-            step, minutes, gb = self._job_rows.get(label, ("-", "", None))
-            rows.append(f"{label:<28} step {step:<2} {minutes:>6} min" + (f"  {gb} GB" if gb else ""))
+            step, minutes, gb, paused = self._job_rows.get(label, ("-", "", None, None))
+            rows.append(f"{label:<28} step {step:<2} {minutes:>6} min" + (f"  {gb} GB" if gb else "")
+                        + (f"  {paused}" if paused else ""))
         if self._waits:
             rows.append(self._waits)
         self.jobs.setText("\n".join(rows))

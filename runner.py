@@ -15,6 +15,8 @@
 #     - Sequential master steps (7 9 l u ...) run afterwards, one
 #       folder at a time, in that order.
 #     - Each parallel worker logs to <tmp>/hm_worker_<name>.log.
+#     - Parallel jobs never fill a disk: a job starts only when its expected
+#       output fits, and jobs are paused while a disk runs low (disk_guard.py).
 #     - A missing tool (nvidia-smi, trodes, ...) never blocks the run.
 #     - TREE MODE — a root without ip* folders, e.g. the share's task folder
 #       where each session sits at <rat>/<YYYYMMDD>/: the session folders are
@@ -25,6 +27,7 @@
 #   Env overrides: MAX_CPU MAX_GPU MAX_MEM WAIT_SECONDS LAUNCH_GAP
 #   FFMPEG_VCODEC SYNC_START_SEC NWB_RAT_NR DISABLE_RESOURCE_CHECK
 #   HM_CONFIG_FILE POST_JOBS TREE_DEPTH MONITOR_SECONDS POST_LOG_DIR
+#   MIN_FREE_GB JOB_DISK_GB (disk guard for the parallel jobs)
 # ============================================================
 
 import os
@@ -34,6 +37,7 @@ import json
 import shlex
 import shutil
 import tempfile
+import atexit
 import threading
 import subprocess
 from pathlib import Path
@@ -49,6 +53,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 os.chdir(SCRIPT_DIR)
 
 PYTHON = sys.executable  # run child python steps with the same interpreter
+
+# The disk guard keeps the parallel jobs from filling a disk (see its docstring).
+sys.path.insert(0, str(SCRIPT_DIR / "src"))
+from tools import disk_guard  # noqa: E402
 
 # ------------------------------------------------------------
 #                 THE MENU — single source of truth
@@ -230,6 +238,118 @@ def wait_for_resources():
         else:
             print(f"    [CHECK] CPU: {cpu}% | GPU: {gpu}% | MEM: {mem}% - OK.")
             return
+
+
+# ------------------------------------------------------------
+#                 DISK GUARD (parallel jobs must not fill a disk)
+# ------------------------------------------------------------
+# The rules live in src/tools/disk_guard.py. In short: a job starts only when its
+# expected output fits on the disks it writes to, and when a disk still runs low
+# the newest running jobs are paused until there is room again.
+def disk_gate_on():
+    """DISABLE_RESOURCE_CHECK=1 switches the disk guard off with the rest of the gate."""
+    return os.environ.get("DISABLE_RESOURCE_CHECK", "0") != "1"
+
+
+def disk_room(budget, need):
+    """(True, '') when a job with this expected output (`need`) fits, else (False, why)."""
+    if not disk_gate_on():
+        return True, ""
+    return budget.room_for(need)
+
+
+def wait_for_disk(budget, need):
+    """Worker mode: wait until a job with this expected output fits on its disks.
+    Finished workers give their space back in the background (watch_worker_disks),
+    so the wait ends by itself — or once the user has freed up space."""
+    wait = _int_env("WAIT_SECONDS", WAIT_SECONDS)
+    while True:
+        ok, why = disk_room(budget, need)
+        if ok:
+            return
+        print(f"    [WAIT] {why}. Pausing {wait}s...")
+        time.sleep(wait)
+
+
+def pause_for_disk(jobs, budget, tag):
+    """Pause or resume ONE running job when the fullest watched disk asks for it.
+
+    `jobs` are the running jobs, oldest first. Each is a dict with "label", "pid"
+    (None while it is not known) and "paused". Called every few seconds, so the
+    number of running jobs goes down, and back up, one job at a time."""
+    if not disk_gate_on() or not disk_guard.can_pause():
+        return
+    free, folder = budget.fullest()
+    active = [job for job in jobs if not job["paused"]]
+    paused = [job for job in jobs if job["paused"]]
+    action = disk_guard.pause_decision(free, len(active), len(paused))
+
+    if action == "pause":
+        pausable = [job for job in active if job["pid"] is not None]
+        if not pausable:
+            return
+        job = pausable[-1]                                  # the newest one
+        if not disk_guard.pause_job(job["pid"]):
+            return
+        job["paused"] = True
+        still_running = len(active) - 1
+        print(f"{tag} pause  {job['label']} — DISK {folder}: only {disk_guard.gb_text(free)} GB "
+              f"free (MIN_FREE_GB {disk_guard.gb_text(disk_guard.min_free_bytes())}); "
+              f"{still_running} job(s) keep running")
+        if still_running == 0:
+            print(f"{tag} every job is paused: free up space on {folder} — "
+                  f"they go on by themselves.")
+
+    elif action == "resume":
+        job = paused[0]                                     # the oldest one
+        disk_guard.resume_job(job["pid"])
+        # Not paused any more in either case: when resuming failed the job is
+        # gone, and it must not block the other paused jobs from going on.
+        job["paused"] = False
+        free_txt = "?" if free is None else disk_guard.gb_text(free)   # unreadable disk
+        print(f"{tag} resume {job['label']} — DISK {folder}: {free_txt} GB free")
+
+
+def _worker_finished(worker):
+    """A windowed worker writes its marker file when done; a thread worker just ends."""
+    if worker["thread"] is not None:
+        return not worker["thread"].is_alive()
+    return worker["marker"].exists()
+
+
+def _read_pid(pid_file):
+    """The process id a windowed worker wrote at its start, or None (not yet)."""
+    try:
+        return int(Path(pid_file).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def watch_worker_disks(budget, workers, stop):
+    """Worker mode, in a background thread, until `stop` is set: every few seconds
+    give back the space promised to finished workers, and pause / resume workers
+    when a disk runs low. A background thread, because the master itself is busy
+    waiting (for CPU/GPU/MEM, for the launch gap, for the workers to end).
+
+    Only workers in their own window can be paused (their process id is known);
+    with WORKER_WINDOWS=0 the check before each launch is the only protection."""
+    while not stop.is_set():
+        for worker in list(workers):
+            if _worker_finished(worker):
+                budget.release(worker["label"])
+                workers.remove(worker)
+            elif worker["pid"] is None and worker["pid_file"] is not None:
+                worker["pid"] = _read_pid(worker["pid_file"])
+        pause_for_disk(list(workers), budget, "[MASTER]")
+        stop.wait(POLL_SECONDS)
+
+
+def resume_paused_workers(workers):
+    """When the master ends (also after Ctrl-C), no worker may stay frozen."""
+    for worker in workers:
+        if worker["paused"]:
+            disk_guard.resume_job(worker["pid"])
+            worker["paused"] = False
 
 
 # ------------------------------------------------------------
@@ -1167,8 +1287,11 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
     """Tree mode: run the per-session steps for every session folder as parallel
     jobs — one child process per session (runner.py --post-job), each logging to its
     own file. A job starts only while fewer than POST_JOBS run, LAUNCH_GAP seconds
-    after the previous one, and while CPU / GPU / MEM are under MAX_CPU / MAX_GPU /
-    MAX_MEM; every MONITOR_SECONDS a status block shows the machine and each job.
+    after the previous one, while CPU / GPU / MEM are under MAX_CPU / MAX_GPU /
+    MAX_MEM, and when its expected output fits on the disks it writes to; when a
+    disk still runs low, the newest jobs are paused until there is room again (see
+    src/tools/disk_guard.py). Every MONITOR_SECONDS a status block shows the
+    machine and each job.
     `job_cmd(op, steps, config)` builds a job's command (tests swap in a stand-in).
     Returns one result dict per session."""
     order = "".join(k for k in POST_JOB_STEPS if k in steps)
@@ -1195,7 +1318,14 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
     if psutil is None:
         print("[TREE] psutil is not installed: CPU/MEM are not monitored or gated "
               "(pip install psutil).")
+    if disk_gate_on():
+        print(f"[TREE] Disk guard: a job starts only when its expected output fits, with "
+              f"{disk_guard.gb_text(disk_guard.min_free_bytes())} GB kept free (MIN_FREE_GB)"
+              + ("; jobs are paused when a disk runs low." if disk_guard.can_pause()
+                 else "; running jobs cannot be paused without psutil."))
 
+    budget = disk_guard.DiskBudget()       # the disk space promised to the running jobs
+    needs = {}                             # session label -> its expected output, worked out once
     running, results = {}, []
     monitor = ResourceMonitor()
     last_launch = last_status = 0.0
@@ -1215,10 +1345,19 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
                 print(f"[TREE] {'done  ' if rc == 0 else 'FAILED'} {label} ({minutes:.1f} min)"
                       + ("" if rc == 0 else f" — see {job['log']}"))
                 del running[label]
+                budget.release(label)                       # its promised disk space is free again
+
+            # a disk running low: pause the newest job; room again: resume the oldest
+            pause_for_disk(list(running.values()), budget, "[TREE]")
 
             now = time.time()
             if queue and len(running) < n_jobs and now - last_launch >= gap:
                 ok, waiting = resources_free()
+                if ok:                                      # ...and does its output fit?
+                    label, op = queue[0]
+                    if label not in needs:
+                        needs[label] = disk_guard.session_job_need(op, order)
+                    ok, waiting = disk_room(budget, needs[label])
                 if ok:
                     label, op = queue.pop(0)
                     logpath = logdir / f"{label}.log"
@@ -1229,20 +1368,26 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
                     proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR), stdout=logf,
                                             stderr=subprocess.STDOUT, env=env)
                     running[label] = {"proc": proc, "op": op, "start": now,
-                                      "log": logpath, "logf": logf}
+                                      "log": logpath, "logf": logf,
+                                      # what pause_for_disk works with:
+                                      "label": label, "pid": proc.pid, "paused": False}
+                    budget.promise(label, needs[label])
                     last_launch = now
                     print(f"[TREE] start  {label}  ({len(running)} running, {len(queue)} queued)")
 
             if now - last_status >= every:
                 last_status = now
                 n_failed = sum(r["status"] != "ok" for r in results)
-                print(f"\n[MON {time.strftime('%H:%M:%S')}] {monitor.line()} | {len(running)} "
+                disk_free, _folder = budget.fullest()       # the fullest disk the jobs write to
+                disk_txt = "" if disk_free is None else f" | DISK {disk_guard.gb_text(disk_free)} GB free"
+                print(f"\n[MON {time.strftime('%H:%M:%S')}] {monitor.line()}{disk_txt} | {len(running)} "
                       f"running, {len(queue)} queued, {len(results)} done ({n_failed} failed)")
                 for label, job in running.items():
                     gb = _job_memory_gb(job["proc"].pid)
                     print(f"    {label:<28} step {_job_step(job['log']):<2} "
                           f"{(now - job['start']) / 60:6.1f} min"
-                          + (f"  {gb:5.1f} GB" if gb is not None else ""))
+                          + (f"  {gb:5.1f} GB" if gb is not None else "")
+                          + ("  PAUSED (disk)" if job["paused"] else ""))
                 if queue and waiting and len(running) < n_jobs:
                     print(f"    next start waits: {waiting}")
             time.sleep(POLL_SECONDS)
@@ -1419,21 +1564,39 @@ def main():
     use_windows = os.environ.get("WORKER_WINDOWS", "1") != "0"
     threads, markers, count = [], [], 0
     launch_gap = _int_env("LAUNCH_GAP", LAUNCH_GAP)          # the config file's, if set
+    # Disk guard: a worker starts only when its expected output fits; a background
+    # thread pauses / resumes the launched workers when a disk still runs low.
+    budget = disk_guard.DiskBudget()
+    workers = []                              # the launched workers, oldest first
+    stop_watching = threading.Event()
+    if parallel_trim and ops and disk_gate_on():
+        print(f"[CONFIG] Disk guard: {disk_guard.gb_text(disk_guard.min_free_bytes())} GB "
+              f"kept free on the disks the jobs write to (MIN_FREE_GB)")
+        threading.Thread(target=watch_worker_disks, args=(budget, workers, stop_watching),
+                         daemon=True).start()
+        atexit.register(resume_paused_workers, workers)     # never leave a worker frozen
     if parallel_trim:
         for ip_path, op_path in ops:
             print(f"\n[QUEUE] Preparing: {ip_path.name}")
             wait_for_resources()
+            need = disk_guard.worker_job_need(ip_path, op_path, parallel_steps)
+            wait_for_disk(budget, need)
             count += 1
             name = f"{session_pfx(ip_path)}{ip_path.name}"   # rat_sessiondate_ log/marker
             marker = tmp / f"hm_worker_{name}.done"
-            try:
-                marker.unlink()
-            except FileNotFoundError:
-                pass
+            pid_file = marker.with_suffix(".pid")           # the worker writes its process id here
+            for stale in (marker, pid_file):                # left by an earlier run
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+            budget.promise(name, need)                      # its expected output is set aside
             opened = launch_worker_window(ip_path, op_path, parallel_steps, marker, name) \
                 if use_windows else False
             if opened:
                 markers.append((marker, name))
+                workers.append({"label": name, "pid": None, "paused": False,
+                                "marker": marker, "pid_file": pid_file, "thread": None})
                 print(f"[MASTER] Job launched in its own window: Job-{name}")
             else:                                   # fallback: background thread + log file
                 logpath = tmp / f"hm_worker_{name}.log"
@@ -1449,6 +1612,8 @@ def main():
                 t = threading.Thread(target=_job, daemon=True)
                 t.start()
                 threads.append((t, name))
+                workers.append({"label": name, "pid": None, "paused": False,
+                                "marker": None, "pid_file": None, "thread": t})
             print(f"[MASTER] Job launched. Waiting {launch_gap}s for stability...")
             time.sleep(launch_gap)
 
@@ -1464,6 +1629,7 @@ def main():
             t.join()
             print(f"[MASTER] Worker finished: {name}")
         print("[MASTER] All parallel workers have completed.")
+    stop_watching.set()
 
     # --- Sequential master steps, in fixed order ---
     if has["7"]:
@@ -1574,6 +1740,13 @@ def _worker_main(argv):
     os.chdir(os.path.dirname(os.path.abspath(__file__)))   # scripts use ./src/... paths
     ip, op, steps = argv[0], argv[1], argv[2]
     marker = argv[3] if len(argv) > 3 else None
+    if marker:
+        # Tell the master which process this worker is, so that its disk guard can
+        # pause and resume it (watch_worker_disks).
+        try:
+            Path(marker).with_suffix(".pid").write_text(str(os.getpid()))
+        except OSError:
+            pass
     load_config()                                          # inherit paths/FREQ/etc. into env
     try:
         run_worker(Path(ip), Path(op), steps, sys.stdout)

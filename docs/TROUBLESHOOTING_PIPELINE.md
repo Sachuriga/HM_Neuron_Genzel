@@ -187,6 +187,10 @@ A session folder holds its `*.nwb`, or is named `YYYYMMDD` and holds a file with
 
 A new session job starts only while CPU / GPU / RAM are under `MAX_CPU` / `MAX_GPU` / `MAX_MEM` (90 / 90 / 65 %) and fewer than `POST_JOBS` run. Lower `POST_JOBS` if jobs run out of memory; raise `MAX_MEM` on a machine with RAM to spare. Without `psutil` (`pip install psutil`) CPU and RAM read as 0 and do not gate anything.
 
+**`next start waits: DISK …` / `[WAIT] DISK …` / `[TREE] pause <session> — DISK …`**
+
+The disk guard: a parallel job starts only when its expected output fits on the disks it writes to with `MIN_FREE_GB` (20) to spare, and running jobs are paused, newest first, while a disk is below `MIN_FREE_GB`. Nothing is lost — a paused job is frozen and goes on by itself once there is room (another job finished and deleted its temporary files, or you freed up space). `every job is paused: free up space on <folder>` means only you can help: delete or move something on that disk. If the estimate is far off for your data, set `JOB_DISK_GB` (GB one job writes); lower `MIN_FREE_GB` to use more of the disk.
+
 **`[TREE] FAILED <session>`**
 
 Open the session's log (path printed, and listed in `summary.csv` of the run's log folder); each step starts with a `[POST-STEP]` line. A failed step does not stop that session's later steps or the other sessions; re-run with only the failed sessions' folder as the root (or the failed steps) once fixed.

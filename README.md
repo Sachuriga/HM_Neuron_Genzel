@@ -233,12 +233,12 @@ task/                          ← python runner.py <...>/task
 
 The per-session steps **`l u v b 5 m`** then run as **parallel jobs, one per session** (`runner.py --post-job <op> <steps> <config>`), each running its steps in the order `l → u → v → b → 5 → m` (the LFP before the theta pages; units before everything that reads them; the decode before `plot_trials`, which overlays it). Step 5 takes the session folder as its input folder too. Step `c` and the NWB refresh (`w`) still run one folder at a time over the found folders; steps that read the raw recordings (`1 2 3 4 7 8 9 d n`) are skipped with a notice. A root **with** `ip*` folders runs exactly as before.
 
-Jobs start while fewer than `POST_JOBS` run (default `auto`: half the CPU cores, one job per 12 GB RAM, at most 6), `LAUNCH_GAP` s apart, and only while CPU / GPU / RAM are under `MAX_CPU` / `MAX_GPU` / `MAX_MEM`. Every `MONITOR_SECONDS` (30) a status block shows the machine and each job:
+Jobs start while fewer than `POST_JOBS` run (default `auto`: half the CPU cores, one job per 12 GB RAM, at most 6), `LAUNCH_GAP` s apart, only while CPU / GPU / RAM are under `MAX_CPU` / `MAX_GPU` / `MAX_MEM`, and only when the job's expected output fits on the disks it writes to (see [Disk guard](#disk-guard)). Every `MONITOR_SECONDS` (30) a status block shows the machine and each job:
 
 ```text
-[MON 14:02:31] CPU 54% | MEM 61% (19.5/32 GB) | GPU 0% | net in 41.2 out 3.0 MB/s | 3 running, 30 queued, 7 done (0 failed)
+[MON 14:02:31] CPU 54% | MEM 61% (19.5/32 GB) | GPU 0% | net in 41.2 out 3.0 MB/s | DISK 212.4 GB free | 3 running, 30 queued, 7 done (0 failed)
     Rat5_20260630                step b    12.3 min    4.1 GB
-    Rat5_20260701                step v     3.0 min    1.2 GB
+    Rat5_20260701                step v     3.0 min    1.2 GB  PAUSED (disk)
     next start waits: MEM 70% > 65%
 ```
 
@@ -351,8 +351,19 @@ Before each worker launch, the master checks system load (psutil for CPU/RAM, `n
 | `DISABLE_RESOURCE_CHECK` | 0 | `1` skips the gate entirely |
 | `POST_JOBS` | auto | tree mode: sessions run at once (`auto` = min(cores/2, RAM/12 GB, 6)) |
 | `MONITOR_SECONDS` | 30 | tree mode: interval of the status block |
+| `MIN_FREE_GB` | 20 | disk guard: space always kept free on each disk the jobs write to |
+| `JOB_DISK_GB` | — (rules of thumb) | disk guard: expected output of one job in GB |
 
-In tree mode the same gate decides when the next session job may start (without blocking the jobs already running), and the status block shows CPU, RAM, GPU, network traffic (the share is read over the network) and each job's step, run time and memory.
+In tree mode the same gate decides when the next session job may start (without blocking the jobs already running), and the status block shows CPU, RAM, GPU, network traffic (the share is read over the network), the free space of the fullest disk the jobs write to, and each job's step, run time and memory.
+
+### Disk guard
+
+Parallel jobs that write at the same time must not fill a disk (`src/tools/disk_guard.py`). Watched are the disk of each job's folders and the disk of the temporary folder (step `l` works on local copies there, also when the sessions are on the share).
+
+1. **Before a job starts**, its expected output must fit: `free − what the running jobs still have to write − MIN_FREE_GB ≥ expected output`. A job that does not fit waits (`[WAIT] DISK …` for workers, `next start waits: DISK …` in tree mode) until running jobs have finished or space was freed up.
+2. **While jobs run**, the free space is checked every few seconds. Below `MIN_FREE_GB` the newest job is paused (one more at each check) and the oldest keeps running, so it can finish and delete its temporary files; below half of it every job is paused. Paused jobs go on, oldest first, once 1.5 × `MIN_FREE_GB` is free again (`[TREE] pause …` / `resume …`, `PAUSED (disk)` in the status block). A paused job is frozen, not stopped: nothing is lost.
+
+The expected output is a rule of thumb from the size of the inputs (worker: the `.rec` and the camera videos — Trodes export 10 % of the `.rec`, `stitched.mp4` and the tracker video each as large as the camera videos, LFP 15 % of the `.rec`; session job: step `l` twice the NWB plus twice the LFP export in the temporary folder, a few GB for `u` / `v` / `b`). Set `JOB_DISK_GB` to use one number per job instead. Pausing needs `psutil`; workers run with `WORKER_WINDOWS=0` cannot be paused (the check before each launch still applies). `DISABLE_RESOURCE_CHECK=1` switches the disk guard off too.
 
 ---
 
@@ -371,6 +382,8 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `TREE_DEPTH` | 4 | tree mode: levels searched for session folders |
 | `HM_SESSIONS_FILE` | — (all sessions) | tree mode: a text file, one session folder per line; only those run, no tree walk (set by the GUI's "Only failed of a run…") |
 | `MONITOR_SECONDS` | 30 | tree mode: status-block interval |
+| `MIN_FREE_GB` | 20 | [disk guard](#disk-guard): GB kept free on each disk the parallel jobs write to |
+| `JOB_DISK_GB` | — (rules of thumb) | [disk guard](#disk-guard): expected output of one parallel job in GB |
 | `POST_LOG_DIR` | `<tmp>/hm_post` | tree mode: per-session logs + `summary.csv` |
 | `CLEAR_SLEEP_IP` | 1 | empty a sleep (pre/post) ip folder at the end of a run with step 7 or 8, once it is sorted and its LFP is in the NWB; `0` = never |
 | `LFP_OUTPUT_RATE` | 1500 | step 8 export rate; step l writes the NWB LFP at it |

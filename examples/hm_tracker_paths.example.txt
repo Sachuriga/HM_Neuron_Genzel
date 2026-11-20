@@ -18,12 +18,19 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 #                   RAM, at most 6. A new job also waits while CPU/GPU/RAM are over
 #                   MAX_CPU / MAX_GPU / MAX_MEM (90 / 90 / 65 %).
 # MONITOR_SECONDS : how often the status block (machine + each job) is printed.
+# MIN_FREE_GB     : disk guard, for all parallel jobs (also the ip*/op* workers):
+#                   space always kept free on each disk the jobs write to. A job
+#                   starts only when its expected output fits on top of that, and
+#                   running jobs are paused (newest first) while a disk is below it.
+# JOB_DISK_GB     : optional. Expected output of ONE job in GB, instead of the
+#                   pipeline's own estimate from the size of the inputs.
 # TREE_DEPTH      : how many folder levels below the root are searched.
 # LFP_OUTPUT_RATE : step 8's LFP rate; step l writes the NWB LFP at this rate.
 # LFP_FIX_DRY_RUN : 1 = step l rewrites and verifies each NWB on a local copy only
 #                   and changes nothing (a first pass); 0 = really replace them.
 POST_JOBS=auto
 MONITOR_SECONDS=30
+MIN_FREE_GB=20
 TREE_DEPTH=4
 LFP_OUTPUT_RATE=1500
 LFP_FIX_DRY_RUN=0
