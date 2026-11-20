@@ -55,7 +55,7 @@ Phy's own templates.npy is NOT used: it is keyed by the pre-curation cluster ids
 and goes stale after merges/splits.
 
 Usage:
-    python add_units.py --output_folder <op_folder> [--n_jobs 4]
+    python add_units.py --output_folder <op_folder> [--n_jobs N]
 """
 
 import sys
@@ -71,6 +71,10 @@ from pynwb import NWBHDF5IO
 # here and what visualize_nwb.py shows, so they can't drift apart.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from spike_metrics import waveform_metrics, acg_tau_rise, classify_cell_type  # noqa: E402
+
+# machine.py (src/tools) fits the number of worker processes to this computer.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
+import machine  # noqa: E402
 
 # NOTE: the spikeinterface-based phy loaders are imported lazily inside
 # _extract_waveforms, so importing this module does not need the sorting stack.
@@ -594,12 +598,17 @@ if __name__ == "__main__":
                         help="op folder containing the NWB and *_sorting_output/phy_export.")
     parser.add_argument("--config", required=False, default=None,
                         help="Accepted for runner consistency (unused).")
-    parser.add_argument("--n_jobs", type=int, default=4,
-                        help="Parallel jobs for the metric recompute and the waveform extraction.")
+    parser.add_argument("--n_jobs", type=int, default=None,
+                        help="Worker processes for the metric recompute and the waveform "
+                             "extraction. Default: as many as fit this computer, shared with "
+                             "the other sessions the runner does at the same time (N_JOBS in "
+                             "hm_tracker_paths.txt forces a number).")
     args = parser.parse_args()
+    n_jobs = args.n_jobs or machine.step_n_jobs()
+    print(f"[units] Worker processes (n_jobs): {n_jobs}")
 
     try:
-        ok = add_units_to_nwb(args.output_folder, n_jobs=args.n_jobs)
+        ok = add_units_to_nwb(args.output_folder, n_jobs=n_jobs)
     except Exception as e:
         print(f"[units] Failed: {e}")
         traceback.print_exc()

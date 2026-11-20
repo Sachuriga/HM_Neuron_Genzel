@@ -21,7 +21,8 @@ Every disk a job writes to is watched: the disk of its output folders and the
 disk of the temporary folder (some steps work on local copies there).
 
 Settings (hm_tracker_paths.txt, or the environment):
-    MIN_FREE_GB   space always kept free on each of those disks (default 20)
+    MIN_FREE_GB   space always kept free on each of those disks (default 20).
+                  The GUI's "keep free" box sets HM_MIN_FREE_GB, which wins.
     JOB_DISK_GB   expected output of ONE job in GB, used instead of the rules of
                   thumb below (default: not set = use the rules of thumb)
 """
@@ -57,8 +58,11 @@ def _number_setting(name):
 
 
 def min_free_bytes():
-    """The space that must always stay free on a watched disk (MIN_FREE_GB)."""
-    gb = _number_setting("MIN_FREE_GB")
+    """The space that must always stay free on a watched disk: HM_MIN_FREE_GB
+    (set by the GUI) wins over MIN_FREE_GB (the config file)."""
+    gb = _number_setting("HM_MIN_FREE_GB")
+    if gb is None or gb < 0:
+        gb = _number_setting("MIN_FREE_GB")
     if gb is None or gb < 0:
         gb = DEFAULT_MIN_FREE_GB
     return gb * GB
@@ -132,10 +136,11 @@ def _files_bytes(folder, suffixes, skip_prefix=""):
     return total
 
 
-def worker_job_need(ip, op, steps):
+def worker_job_need(ip, op, steps, exports_raw=False):
     """Expected bytes one worker job (ip*/op* mode) writes, as {folder: bytes}.
 
-    The inputs are the raw recording (.rec) and the camera videos in `ip`."""
+    The inputs are the raw recording (.rec) and the camera videos in `ip`.
+    `exports_raw`: step 1 also asks Trodes for the raw (wideband) signal."""
     fixed = fixed_job_bytes()
     if fixed is not None:
         return {Path(op): fixed}
@@ -149,6 +154,9 @@ def worker_job_need(ip, op, steps):
     if "1" in steps:
         # Trodes analog (IMU) + DIO export: about 10 of the ~130 channels in the .rec
         into_ip += 0.10 * rec
+        if exports_raw:
+            # the raw signal is nearly all of the .rec: a second copy of the same size
+            into_ip += 1.0 * rec
     if "3" in steps:
         # stitched.mp4: taken to be as large as the camera videos together
         into_ip += 1.0 * videos
@@ -267,6 +275,44 @@ class DiskBudget:
                         why += " — free up space; it goes on by itself"
                     return False, why
             return True, ""
+
+    def forecast(self, needs):
+        """For the start of a run: one line of text per disk, saying what ALL jobs
+        together expect to write there and how much of the disk can be used.
+        `needs` holds one {folder: bytes} per job."""
+        with self.lock:
+            reserve = min_free_bytes()
+            total, stays_total, largest, n_jobs = {}, {}, {}, {}
+            for need in needs:
+                everything, stays = self._per_disk(need)
+                for disk, n_bytes in everything.items():
+                    if n_bytes <= 0:
+                        continue
+                    total[disk] = total.get(disk, 0.0) + n_bytes
+                    largest[disk] = max(largest.get(disk, 0.0), n_bytes)
+                    n_jobs[disk] = n_jobs.get(disk, 0) + 1
+                    stays_total[disk] = stays_total.get(disk, 0.0) + stays.get(disk, 0.0)
+
+            lines = []
+            for disk, all_bytes in total.items():
+                free = self._measure(disk)
+                if free is None:
+                    continue
+                usable = max(free - reserve, 0.0)
+                temporary = all_bytes - stays_total[disk]
+                line = (f"{self.disks[disk]['folder']}: {n_jobs[disk]} job(s) expect to write "
+                        f"~{gb_text(all_bytes)} GB"
+                        + (f" ({gb_text(temporary)} GB of it temporary)" if temporary > 0 else "")
+                        + f"; {gb_text(usable)} GB can be used ({gb_text(free)} free"
+                          f" - {gb_text(reserve)} kept free)")
+                if largest[disk] > usable:
+                    line += " — NOT ENOUGH for one job: free up space"
+                elif stays_total[disk] > usable:
+                    line += " — not enough for all: the last jobs wait until space is freed up"
+                elif all_bytes > usable:
+                    line += " — not all at once: jobs take turns"
+                lines.append(line)
+            return lines
 
     def promise(self, label, need):
         """A job starts: set its expected output aside."""

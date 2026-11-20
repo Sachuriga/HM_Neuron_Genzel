@@ -393,7 +393,8 @@ def run_phy_autocuration(phy_folder, n_jobs=4):
         return None
     try:
         import phy_autocurate
-        n_jobs = int(os.environ.get("AUTO_CURATE_JOBS", "") or n_jobs)
+        # AUTO_CURATE_JOBS (a number) wins over the n_jobs of the post-sorting
+        n_jobs = phy_autocurate.curate_jobs(n_jobs)
         return phy_autocurate.autocurate_phy_folder(
             phy_folder, n_jobs=n_jobs, params=phy_autocurate.env_params(), reason="step 7")
     except Exception as e:

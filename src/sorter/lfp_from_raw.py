@@ -26,10 +26,14 @@ disk and returned memory-mapped, so a multi-hour, 128-channel session (~8 GB at
 """
 
 import io
-import os
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# machine.py (src/tools) fits the number of worker processes to this computer.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
+import machine  # noqa: E402
 
 RAW_FS = 30000.0        # raw acquisition rate (Hz)
 GAIN = 0.195            # uV per bit (as in sorting.py)
@@ -37,6 +41,11 @@ LFP_LOWPASS = 700.0     # Hz — as exportLFP -lfplowpass 700 (the retired step 
 FILTER_ORDER = 4
 FILTER_MARGIN_MS = 50.0 # chunk-edge padding; the 700 Hz filter settles in a few ms
 CH_PER_TETRODE = 4
+
+# RAM one worker process needs here, for machine.step_n_jobs(). A worker filters
+# 10 s of all 128 channels at 30 kHz at a time: ~150 MB as float32, and the
+# forward-backward filter holds a few copies of it.
+LFP_GB_PER_WORKER = 2.0
 
 # What the LFP is referenced to. Stored in the NWB (session_info.lfp_reference)
 # so a re-run can tell whether the LFP already there was made the same way.
@@ -116,15 +125,17 @@ def build_lfp_from_raw(sessions, out_npy, output_rate=1500.0, n_jobs=None,
     ``(n_samples, n_channels)`` float32 memmap of ``out_npy`` in uV;
     ``boundaries`` is ``[{'name', 'start', 'n'}]`` in LFP samples;
     ``channel_map`` is ``[{'index', 'ntrode', 'channel', 'source_file'}]``.
-    ``n_jobs`` defaults to at most 8 workers — the runner may be doing several
-    sessions at once.
+    ``n_jobs`` defaults to what fits this computer: its cores and RAM, shared
+    with the other sessions the runner is doing at the same time
+    (``src/tools/machine.py``; ``N_JOBS`` in the config file forces a number).
     """
     import scipy.signal
     import spikeinterface.full as si
     import spikeinterface.preprocessing as spre
 
     if n_jobs is None:
-        n_jobs = min(8, os.cpu_count() or 1)
+        n_jobs = machine.step_n_jobs(gb_per_worker=LFP_GB_PER_WORKER)
+    log(f"  LFP: {n_jobs} worker process(es) (n_jobs)")
     factor = RAW_FS / float(output_rate)
     if abs(factor - round(factor)) > 1e-9:
         raise ValueError(f"output rate {output_rate} Hz must divide {RAW_FS:.0f} Hz")

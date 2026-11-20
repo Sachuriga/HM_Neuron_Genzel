@@ -17,6 +17,12 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 # POST_JOBS       : sessions at once. auto = half the CPU cores, one per 12 GB of
 #                   RAM, at most 6. A new job also waits while CPU/GPU/RAM are over
 #                   MAX_CPU / MAX_GPU / MAX_MEM (90 / 90 / 65 %).
+# N_JOBS          : worker processes of ONE step (sorting's post-analysis, the
+#                   LFP, step u, the Phy auto-curation). auto = fitted to this
+#                   computer: all cores but one or two, at most half the RAM,
+#                   shared equally between the jobs that run side by side.
+#                   A number = every step uses exactly that many (e.g. 4, as it
+#                   was before; lower it when a step runs out of memory).
 # MONITOR_SECONDS : how often the status block (machine + each job) is printed.
 # MIN_FREE_GB     : disk guard, for all parallel jobs (also the ip*/op* workers):
 #                   space always kept free on each disk the jobs write to. A job
@@ -29,6 +35,7 @@ TRODES_EXPORT_CMD=C:\Users\YOUR_NAME\Desktop\Trodes_2-8-1_Windows11\trodesexport
 # LFP_FIX_DRY_RUN : 1 = step l rewrites and verifies each NWB on a local copy only
 #                   and changes nothing (a first pass); 0 = really replace them.
 POST_JOBS=auto
+N_JOBS=auto
 MONITOR_SECONDS=30
 MIN_FREE_GB=20
 TREE_DEPTH=4
@@ -112,7 +119,8 @@ NWB_RAT_NR=1
 # AUTO_GOOD_BOOST_NARROW : P(good) weight for narrow waveforms (interneurons,
 #                      which keep more short ISIs); 1 = same rule as pyramidal. [1.5]
 # AUTO_SPLIT_BIAS    : > 1 reclusters units more readily, < 1 less.          [1]
-# AUTO_CURATE_JOBS   : parallel worker processes.                           [4]
+# AUTO_CURATE_JOBS   : parallel worker processes; a number here wins over
+#                      N_JOBS for the auto-curation.               [auto = N_JOBS]
 # AUTO_AMP_CUT_SD    : cut spikes with |amplitude| > mean + this x SD out of
 #                      good clusters (0 = no amplitude cut).                 [4]
 # -------------------------------------------------------------------

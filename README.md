@@ -331,7 +331,7 @@ The interactive menu:
 
 Type any combination (order irrelevant — execution order is fixed: parallel workers `1→e→2→3→4→5→8→d→n`, then sequential `7→9→f→w→l→u→v→b→m→t`, then `6` last; in [tree mode](#tree-mode-renamed--grouped-session-folders-eg-the-share) `l u v b 5 m` run per session as parallel jobs). A stray `s` is ignored with a notice — the cross-session summary moved to the HM_Rat_Analysis repo. The old step `r` is part of step `u` now; an `r` in an old preset or `HM_STEPS` string runs step `u`. Step `c` (continue after sorting) was removed; a `c` is ignored with a notice (a sort that crashed before its Phy export has no `phy_export/`, so re-running step 7 sorts it again). Step `a` (auto-curate existing Phy exports) is part of step 7 now; an `a` runs step 7.
 
-Each parallel worker opens its **own terminal window** by default (`runner.py --worker <ip> <op> <steps> <marker>`); the master polls a `<tmp>/hm_worker_<name>.done` marker. Set `WORKER_WINDOWS=0` to run workers as background threads logging to `<tmp>/hm_worker_<name>.log`. Workers are launched `LAUNCH_GAP` (20 s) apart.
+Each parallel worker opens its **own terminal window** by default (`runner.py --worker <ip> <op> <steps> <marker> <workers side by side>`); the master polls a `<tmp>/hm_worker_<name>.done` marker. Set `WORKER_WINDOWS=0` to run workers as background threads logging to `<tmp>/hm_worker_<name>.log`. Workers are launched `LAUNCH_GAP` (20 s) apart.
 
 > Closing a worker's terminal before it finishes means its `.done` marker is never written — the master waits forever. Kill and re-run instead.
 
@@ -350,11 +350,22 @@ Before each worker launch, the master checks system load (psutil for CPU/RAM, `n
 | `LAUNCH_GAP` | 20 | seconds between worker launches |
 | `DISABLE_RESOURCE_CHECK` | 0 | `1` skips the gate entirely |
 | `POST_JOBS` | auto | tree mode: sessions run at once (`auto` = min(cores/2, RAM/12 GB, 6)) |
+| `N_JOBS` | auto | worker processes of one step (`auto` = fitted to this computer, see [below](#worker-processes-n_jobs)) |
 | `MONITOR_SECONDS` | 30 | tree mode: interval of the status block |
 | `MIN_FREE_GB` | 20 | disk guard: space always kept free on each disk the jobs write to |
 | `JOB_DISK_GB` | — (rules of thumb) | disk guard: expected output of one job in GB |
 
 In tree mode the same gate decides when the next session job may start (without blocking the jobs already running), and the status block shows CPU, RAM, GPU, network traffic (the share is read over the network), the free space of the fullest disk the jobs write to, and each job's step, run time and memory.
+
+### Worker processes (n_jobs)
+
+The steps that split their work over worker processes — step 7's post-sorting analysis and Phy auto-curation, step 8's LFP, step u — take as many as fit the computer they run on (`src/tools/machine.py`), instead of a fixed 4:
+
+- **CPU:** all cores but one (two from 16 cores on), so the desktop still responds.
+- **RAM:** the workers of a step may take half the RAM together, at 1 GB a worker (2 GB for the LFP).
+- **Sharing:** jobs the runner runs side by side (the `ip*`/`op*` workers; the session jobs of tree mode) each get an equal share, so together they fill the machine once.
+
+On the lab PC (20 cores, 64 GB) a step that runs alone gets 18 workers, and each of 5 session jobs gets 4. The runner prints it at the start (`[MACHINE] 20 CPU cores | 64 GB RAM | N_JOBS=auto -> 18 worker process(es) …`), and `python src/tools/machine.py` shows the numbers for any computer. `N_JOBS=<number>` in `hm_tracker_paths.txt` makes every step use exactly that many (e.g. when a step runs out of memory); `AUTO_CURATE_JOBS=<number>` does so for the Phy auto-curation only. One part is not covered: step 7 writes `processed_binary/` with 1 worker, as before (more than one crashed on Windows).
 
 ### Disk guard
 
@@ -363,7 +374,11 @@ Parallel jobs that write at the same time must not fill a disk (`src/tools/disk_
 1. **Before a job starts**, its expected output must fit: `free − what the running jobs still have to write − MIN_FREE_GB ≥ expected output`. A job that does not fit waits (`[WAIT] DISK …` for workers, `next start waits: DISK …` in tree mode) until running jobs have finished or space was freed up.
 2. **While jobs run**, the free space is checked every few seconds. Below `MIN_FREE_GB` the newest job is paused (one more at each check) and the oldest keeps running, so it can finish and delete its temporary files; below half of it every job is paused. Paused jobs go on, oldest first, once 1.5 × `MIN_FREE_GB` is free again (`[TREE] pause …` / `resume …`, `PAUSED (disk)` in the status block). A paused job is frozen, not stopped: nothing is lost.
 
-The expected output is a rule of thumb from the size of the inputs (worker: the `.rec` and the camera videos — Trodes export 10 % of the `.rec`, `stitched.mp4` and the tracker video each as large as the camera videos, LFP 15 % of the `.rec`; session job: step `l` twice the NWB plus twice the LFP export in the temporary folder, a few GB for `u` / `v` / `b`). Set `JOB_DISK_GB` to use one number per job instead. Pausing needs `psutil`; workers run with `WORKER_WINDOWS=0` cannot be paused (the check before each launch still applies). `DISABLE_RESOURCE_CHECK=1` switches the disk guard off too.
+At the start of the parallel jobs the runner says what it expects, one `[DISK]` line per disk (`3 job(s) expect to write ~310.0 GB; 223.9 GB can be used … — not enough for all: the last jobs wait until space is freed up`).
+
+The expected output is a rule of thumb from the size of the inputs (worker: the `.rec` and the camera videos — Trodes export 10 % of the `.rec` (DIO + analog; with `-raw` in the runner's `TRODES_EXPORT_FLAGS` a full second copy of the `.rec` on top), `stitched.mp4` and the tracker video each as large as the camera videos, LFP 15 % of the `.rec`; session job: step `l` twice the NWB plus twice the LFP export in the temporary folder, a few GB for `u` / `v` / `b`). Set `JOB_DISK_GB` to use one number per job instead. Pausing needs `psutil`; workers run with `WORKER_WINDOWS=0` cannot be paused (the check before each launch still applies). `DISABLE_RESOURCE_CHECK=1` switches the disk guard off too.
+
+In the GUI: the **Disk space** card shows the free space of the data root's and the temporary folder's disk (red when below the limit) and has the **Parallel jobs keep free** box (it wins over `MIN_FREE_GB` in the config file). During a run the **Disk guard** box above the log shows the runner's forecast, the job that waits for room and the paused jobs (orange; red when every job is paused or one job cannot fit), in both modes; pause / resume also show in the status bar.
 
 ---
 
@@ -379,10 +394,11 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `MAX_CPU` / `MAX_GPU` / `MAX_MEM` | 90 / 90 / 65 | resource gate |
 | `WAIT_SECONDS` / `LAUNCH_GAP` | 30 / 20 | resource gate / launch pacing |
 | `POST_JOBS` | auto | tree mode: parallel session jobs |
+| `N_JOBS` | auto | [worker processes](#worker-processes-n_jobs) of one step: `auto` = fitted to this computer's cores and RAM; a number = exactly that many |
 | `TREE_DEPTH` | 4 | tree mode: levels searched for session folders |
 | `HM_SESSIONS_FILE` | — (all sessions) | tree mode: a text file, one session folder per line; only those run, no tree walk (set by the GUI's "Only failed of a run…") |
 | `MONITOR_SECONDS` | 30 | tree mode: status-block interval |
-| `MIN_FREE_GB` | 20 | [disk guard](#disk-guard): GB kept free on each disk the parallel jobs write to |
+| `MIN_FREE_GB` | 20 | [disk guard](#disk-guard): GB kept free on each disk the parallel jobs write to (`HM_MIN_FREE_GB`, set by the GUI, wins) |
 | `JOB_DISK_GB` | — (rules of thumb) | [disk guard](#disk-guard): expected output of one parallel job in GB |
 | `POST_LOG_DIR` | `<tmp>/hm_post` | tree mode: per-session logs + `summary.csv` |
 | `CLEAR_SLEEP_IP` | 1 | empty a sleep (pre/post) ip folder at the end of a run with step 7 or 8, once it is sorted and its LFP is in the NWB; `0` = never |
@@ -546,7 +562,7 @@ Output: `<op>/<stem>_<sorter>_sorting_output/`. Curate with `phy template-gui ph
 
 ### Phy auto-curation (part of step 7)
 
-**Part of step 7** (it was step a): it runs at the end of a new sort's post-sorting, so a new sort arrives in Phy already curated, and, after the sorting, on the `phy_export` of every recording step 7 does not sort again (`RESORT=0`) — every `*_sorting_output/phy_export` in the op folder, even if its `.rec` is gone. **Script:** `src/sorter/phy_autocurate.py --output_folder <op|*_sorting_output|phy_export> [--n_jobs 4]`, e.g. for a session tree, where step 7 does not run (no `ip*` folders).
+**Part of step 7** (it was step a): it runs at the end of a new sort's post-sorting, so a new sort arrives in Phy already curated, and, after the sorting, on the `phy_export` of every recording step 7 does not sort again (`RESORT=0`) — every `*_sorting_output/phy_export` in the op folder, even if its `.rec` is gone. **Script:** `src/sorter/phy_autocurate.py --output_folder <op|*_sorting_output|phy_export> [--n_jobs N]`, e.g. for a session tree, where step 7 does not run (no `ip*` folders).
 
 Starting from the sorter's units (`spike_templates.npy`), each `phy_export` is curated the way it is done by hand in Phy — recluster a cluster, look at the pieces, keep the split or not, go on with the pieces:
 
@@ -598,7 +614,7 @@ Without the recording (an export whose `processed_binary/` is gone) there are no
 | `AUTO_SPLIT_BIAS` | 1 | > 1 reclusters more readily, < 1 less: a split is kept if P(keep) ≥ 0.30 / this |
 | `AUTO_AMP_CUT_SD` | 4 | amplitude cut at mean + this × SD (0 = no cut) |
 | `AUTO_USE_AP` | 1 | 0 = the keep model decides without the action potentials (as for an export whose recording is gone) |
-| `AUTO_CURATE_JOBS` | 4 | parallel worker processes |
+| `AUTO_CURATE_JOBS` | auto | parallel worker processes (`auto` = [fitted to this computer](#worker-processes-n_jobs); a number wins over `N_JOBS`) |
 
 **How well it agrees with manual curation** — leave-one-recording-out over the hand curations it is trained on (`evaluate`, below: the models are fit on the other recordings, the held-out recording is curated from its sorter units and compared with its hand curation). Good-cluster F1 = matching good clusters (Jaccard ≥ 0.5) on both sides; spike accuracy = same good/mua/noise label:
 
@@ -653,7 +669,7 @@ python src/sorter/phy_autocurate.py evaluate --curated <phy_export_1> <phy_expor
 
 ### Recompute Metrics after Phy curation (part 1 of step u, formerly step r)
 
-**Runs as:** the first part of [step u](#step-u--add-curated-units-to-nwb), for every phy folder of the session — also when the session has no NWB yet (then only the metrics are written), so step u is also how you prepare a session for labelling in Phy. Standalone, without touching the NWB (faster: no per-spike waveforms): `src/sorter/recompute_metrics.py --output_folder <op|sorting_output|phy_export> [--n_jobs 4]`.
+**Runs as:** the first part of [step u](#step-u--add-curated-units-to-nwb), for every phy folder of the session — also when the session has no NWB yet (then only the metrics are written), so step u is also how you prepare a session for labelling in Phy. Standalone, without touching the NWB (faster: no per-spike waveforms): `src/sorter/recompute_metrics.py --output_folder <op|sorting_output|phy_export> [--n_jobs N]`.
 
 Recomputes all quality + template metrics on the **curated** sorting (loaded directly from `spike_times.npy` + `spike_clusters.npy` so manual splits/merges are honoured) and writes into `phy_export/`: `curated_quality_metrics.csv`, `curated_template_metrics.csv`, per-metric `cluster_<metric>.tsv` (visible as Phy columns), **`curated_templates.npy`** (+ unit/channel id files — Phy's own `templates.npy` is stale after merges).
 
@@ -758,7 +774,7 @@ Writes `<op>/Rat<N>_<YYYYMMDD>.nwb` (atomic write via `.tmp.nwb`) or, when step 
 
 ### Step u — Add Curated Units to NWB
 
-**Script:** `src/nwb/add_units.py --output_folder <op> [--n_jobs 4]`
+**Script:** `src/nwb/add_units.py --output_folder <op> [--n_jobs N]` (default: [fitted to this computer](#worker-processes-n_jobs))
 
 First [recomputes the curated metrics](#recompute-metrics-after-phy-curation-part-1-of-step-u-formerly-step-r) in every phy folder of the session, then writes the curated Phy units into the session NWB (in place). If the quality metrics cannot be recomputed, the session is treated like a failed waveform extraction (below): an old `curated_quality_metrics.csv` would put pre-curation units into the NWB. Waveforms are **always extracted**: templates are recomputed from the recording referenced by `phy_export/params.py` (`dat_path` → `processed_binary/`, since the export uses `copy_binary=False`; if that absolute path is stale because the op folder was moved or copied from another PC, the same file is looked up in the sibling `processed_binary/`); cached/stale template files are never trusted. Per-spike waveforms are stored too: up to **1000 spikes per unit** (seeded random sample, so re-runs store the same spikes) on the **unit's own tetrode** (phy `channel_groups.npy` of its best channel), int16 in the recording's units (ADC counts, ×0.195 = µV), gzip-compressed — `units['waveforms'][i]` → `(n_spikes, 4, 90)`, with `waveforms_spike_index` (which of the unit's `spike_times` each row is) and `waveforms_channel_ids` (the tetrode channels, axis-1 order). ~0.2 GB for a 266-unit session. Units columns: `spike_times` (seconds, position clock; duplicated spikes dropped with the same 0.3 ms rule as the metrics), `waveform_mean` (mean over the same sampled spikes), `phy_cluster_id`, `sorting_group`, **`quality_label`** (manual Phy `cluster_group.tsv` — the human truth), **`auto_quality_label`** (automated), all curated metric CSV columns, plus recomputed `firing_rate_hz`, `trough_to_peak_s`, `peak_half_width_s`, `trough_half_width_s`, `acg_tau_rise_ms`, and **`cell_type`**.
 
@@ -1087,7 +1103,7 @@ Per-session and per-trial input for the tracker (template: `examples/RecordingMe
 
 `docs/` contains: `ERROR_REFERENCE.md` (exact error message → cause/fix), `TROUBLESHOOTING.md` (LED sync), `TROUBLESHOOTING_EPHYS.md` (sorting/LFP), `TROUBLESHOOTING_PIPELINE.md` (per-step), `TROUBLESHOOTING_SETUP.md` (env/config), `RecordingMeta_README.md`, and the experiment protocol.
 
-Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone), the step-8 backfill's stamp check (30 kHz stamps packaged at the rate the spikes imply, right stamps kept, unverifiable ones refused) and the GUI's session-tree presets and jobs panel, the quality check's ISI gate (ratio or fraction; needs spikeinterface ≥ 0.104 for the labelling part), and step u recomputing the curated metrics before it writes the units (stale quality metrics write nothing; an old `r` runs `u`), the Phy auto-curation on a synthetic tetrode export (the recluster is deterministic, training targets follow the curated spikes, a redo replaces a curated folder's curation without a backup and step 7 curates the exports it does not sort again (`AUTO_CURATE_REDO=0` leaves them alone), a full run writes a consistent curation; a model waveform is measured against the action potential rules, every piece gets its own action potential from the recording, and without the recording the keep model decides without them; needs scikit-learn), and the old steps `c` (ignored) and `a` (runs step 7). numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed, the GUI tests with PyQt6).
+Tests: `python -m pytest tests` — the step-2 clock fit (simulated missed/spurious blinks, clock jumps), the frame-index join, the clock QC (spurious windows, a useless signal, patchy coverage, drift beyond the search range), the in-place repair of a synthetic op folder (every file re-timed, other cells and CRLF kept, idempotent), the runner's tree mode (session folders below a renamed tree, classic targets unchanged, step order, jobs in parallel up to `POST_JOBS` with failures reported) step l on synthetic NWBs (stub replaced, 30 kHz stamps restamped + resampled, everything else bit-identical, dry run / step-8 LFP left alone), the step-8 backfill's stamp check (30 kHz stamps packaged at the rate the spikes imply, right stamps kept, unverifiable ones refused) and the GUI's session-tree presets and jobs panel, the quality check's ISI gate (ratio or fraction; needs spikeinterface ≥ 0.104 for the labelling part), and step u recomputing the curated metrics before it writes the units (stale quality metrics write nothing; an old `r` runs `u`), the Phy auto-curation on a synthetic tetrode export (the recluster is deterministic, training targets follow the curated spikes, a redo replaces a curated folder's curation without a backup and step 7 curates the exports it does not sort again (`AUTO_CURATE_REDO=0` leaves them alone), a full run writes a consistent curation; a model waveform is measured against the action potential rules, every piece gets its own action potential from the recording, and without the recording the keep model decides without them; needs scikit-learn), the old steps `c` (ignored) and `a` (runs step 7), and the worker processes following the computer (cores and RAM of a pretend machine, shared between jobs side by side, `N_JOBS` forcing a number). numpy/scipy/pandas only; no OpenCV or data needed (the LFP tests run when h5py/pynwb are installed, the GUI tests with PyQt6).
 
 Quick pointers:
 

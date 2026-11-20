@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import traceback
 from datetime import datetime
@@ -374,6 +375,10 @@ except ImportError:
     print("Warning: 'readTrodesExtractedDataFile3.py' not found. Please ensure it is in the directory or PYTHONPATH.")
 from trodes_rec import find_rec_files, open_rec, SPLICED_GAPS  # noqa: E402  (.rec reader; needed for step 7)
 from shared_noise import remove_shared_noise_recording  # noqa: E402
+
+# machine.py (src/tools) fits the number of worker processes to this computer.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
+import machine  # noqa: E402
 
 LAST_SPLICED_GAPS = []   # set by open_raw_recording; see spliced_gaps.json
 
@@ -970,9 +975,16 @@ if __name__ == "__main__":
             config_path = str(default_config)
     sorting_config = load_sorting_config(config_path)
 
+    # Worker processes for the post-sorting analysis (waveforms, PCA, metrics):
+    # as many as fit this computer. N_JOBS=<number> in hm_tracker_paths.txt forces
+    # a number. (Writing processed_binary/ stays at 1 worker: see
+    # PROCESSED_BINARY_SAVE_KWARGS.)
+    n_jobs = machine.step_n_jobs()
+    print(f"Post-sorting analysis: {n_jobs} worker process(es) (n_jobs).")
+
     try:
-        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=4, config=sorting_config,
-                             resort=resort)
+        run_sorting_pipeline(args.input_folder, args.output_folder, n_jobs=n_jobs,
+                             config=sorting_config, resort=resort)
     except Exception as e:
         print(f"\n[FATAL] Pipeline crashed for folder '{args.input_folder}':\n{e}")
         traceback.print_exc()

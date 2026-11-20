@@ -35,6 +35,9 @@ def test_min_free_gb_setting(monkeypatch):
     assert disk_guard.min_free_bytes() == 50 * GB
     monkeypatch.setenv("MIN_FREE_GB", "lots")                 # not a number: the default
     assert disk_guard.min_free_bytes() == 20 * GB
+    monkeypatch.setenv("MIN_FREE_GB", "50")
+    monkeypatch.setenv("HM_MIN_FREE_GB", "35")                # the GUI's box wins over the config file
+    assert disk_guard.min_free_bytes() == 35 * GB
 
 
 # ------------------------------------------------------- 1. before a job starts
@@ -178,8 +181,34 @@ def test_worker_job_need_follows_the_inputs(tmp_path, monkeypatch):
     assert need[op] == pytest.approx(small + 10_000 + 0.15 * 100_000)    # tracker video + LFP
     assert disk_guard.worker_job_need(ip, op, "25n") == {ip: 0.0, op: float(small)}
 
+    # a raw (wideband) export is a second copy of the .rec, on top of the rest
+    with_raw = disk_guard.worker_job_need(ip, op, "1", exports_raw=True)
+    assert with_raw[ip] == pytest.approx(0.10 * 100_000 + 100_000)
+    assert disk_guard.worker_job_need(ip, op, "8", exports_raw=True)[ip] == 0   # only step 1 exports
+
     monkeypatch.setenv("JOB_DISK_GB", "40")                    # the user knows better
     assert disk_guard.worker_job_need(ip, op, "1348") == {op: 40 * GB}
+
+
+def test_step_1_exports_no_raw_copy_and_the_estimate_follows_the_flags():
+    # today step 1 asks Trodes for DIO + analog only; the estimate reads the same list
+    assert "-raw" not in runner.TRODES_EXPORT_FLAGS
+
+
+def test_forecast_says_what_all_jobs_expect(disk, tmp_path):
+    import tempfile
+    temp = Path(tempfile.gettempdir())
+    budget = disk_guard.DiskBudget()                           # 100 GB free, 20 kept free
+    fits = budget.forecast([{tmp_path: 10 * GB}, {tmp_path: 20 * GB}])
+    assert len(fits) == 1 and "2 job(s) expect to write ~30.0 GB" in fits[0]
+    assert "80.0 GB can be used (100.0 free - 20.0 kept free)" in fits[0] and "—" not in fits[0]
+    too_much = budget.forecast([{tmp_path: 50 * GB}] * 3)[0]
+    assert "not enough for all" in too_much                    # 150 GB of outputs that stay
+    one_too_big = budget.forecast([{tmp_path: 90 * GB}])[0]
+    assert "NOT ENOUGH for one job" in one_too_big
+    # temporary files are deleted again: three jobs of 50 GB fit one after the other
+    turns = budget.forecast([{temp: 50 * GB}] * 3)[0]
+    assert "(150.0 GB of it temporary)" in turns and "not all at once: jobs take turns" in turns
 
 
 def test_session_job_need_puts_step_l_copies_on_the_temp_disk(tmp_path, monkeypatch):
@@ -237,6 +266,8 @@ def test_tree_jobs_wait_for_disk_room(disk, tmp_path, monkeypatch, capsys):
         assert next_start >= end                               # never two at once
     out = capsys.readouterr().out
     assert "next start waits: DISK" in out and "| DISK 100.0 GB free |" in out
+    assert "[DISK] Disk guard on: 20.0 GB kept free" in out    # the forecast the GUI shows
+    assert "3 job(s) expect to write ~150.0 GB" in out and "not enough for all" in out
 
 
 def test_tree_jobs_are_paused_while_the_disk_is_low(disk, tmp_path, monkeypatch, capsys):

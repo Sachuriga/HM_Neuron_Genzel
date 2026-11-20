@@ -17,6 +17,8 @@
 #     - Each parallel worker logs to <tmp>/hm_worker_<name>.log.
 #     - Parallel jobs never fill a disk: a job starts only when its expected
 #       output fits, and jobs are paused while a disk runs low (disk_guard.py).
+#     - The worker processes of a step (n_jobs) follow the computer: its cores
+#       and RAM, shared between the jobs that run side by side (machine.py).
 #     - A missing tool (nvidia-smi, trodes, ...) never blocks the run.
 #     - TREE MODE — a root without ip* folders, e.g. the share's task folder
 #       where each session sits at <rat>/<YYYYMMDD>/: the session folders are
@@ -28,6 +30,7 @@
 #   FFMPEG_VCODEC SYNC_START_SEC NWB_RAT_NR DISABLE_RESOURCE_CHECK
 #   HM_CONFIG_FILE POST_JOBS TREE_DEPTH MONITOR_SECONDS POST_LOG_DIR
 #   MIN_FREE_GB JOB_DISK_GB (disk guard for the parallel jobs)
+#   N_JOBS (worker processes of one step; auto = fitted to this computer)
 # ============================================================
 
 import os
@@ -55,8 +58,9 @@ os.chdir(SCRIPT_DIR)
 PYTHON = sys.executable  # run child python steps with the same interpreter
 
 # The disk guard keeps the parallel jobs from filling a disk (see its docstring).
+# machine.py fits the number of worker processes to this computer (see its docstring).
 sys.path.insert(0, str(SCRIPT_DIR / "src"))
-from tools import disk_guard  # noqa: E402
+from tools import disk_guard, machine  # noqa: E402
 
 # ------------------------------------------------------------
 #                 THE MENU — single source of truth
@@ -92,6 +96,12 @@ SEQUENTIAL_STEPS = ["7", "9", "l", "u", "v", "b", "m", "t"]
 # jobs, in this order — l before v (the theta pages read the LFP), u before v/b/m
 # (they read the units), b before 5 (plot_trials overlays the decoded track).
 POST_JOB_STEPS = ["l", "u", "v", "b", "5", "m"]
+
+# What step 1 asks trodesexport for. No -raw: steps 7 and 8 read the wideband
+# straight from the .rec (src/sorter/trodes_rec.py), so the ~27 GiB/h raw copy is
+# not written. The disk guard reads this list too: with -raw in it, it expects
+# an export as large as the .rec itself.
+TRODES_EXPORT_FLAGS = ["-dio", "-analogio"]
 
 # Retired keys, still accepted so saved presets / HM_STEPS strings keep working:
 # both now run inside step 4. Typed alone, they refresh the NWB of every op target.
@@ -258,6 +268,20 @@ def disk_room(budget, need):
     return budget.room_for(need)
 
 
+def print_disk_forecast(budget, needs):
+    """At the start of the parallel jobs: what the disk guard expects, one [DISK]
+    line per disk (the GUI shows these lines in its Disk guard box).
+    `needs` holds the expected output of every job."""
+    if not disk_gate_on():
+        print("[DISK] Disk guard off (DISABLE_RESOURCE_CHECK=1).")
+        return
+    print(f"[DISK] Disk guard on: {disk_guard.gb_text(disk_guard.min_free_bytes())} GB kept "
+          f"free on each disk the jobs write to (MIN_FREE_GB)"
+          + ("" if disk_guard.can_pause() else "; running jobs cannot be paused without psutil"))
+    for line in budget.forecast(needs):
+        print(f"[DISK] {line}")
+
+
 def wait_for_disk(budget, need):
     """Worker mode: wait until a job with this expected output fits on its disks.
     Finished workers give their space back in the background (watch_worker_disks),
@@ -378,8 +402,12 @@ def launch_worker_window(ip, op, steps, marker, title):
     writes `marker` when it finishes so the master can wait for it. Returns True if
     a window was opened, False to fall back to an in-process background thread."""
     repo = os.path.dirname(os.path.abspath(__file__))
+    # The last argument is how many workers run side by side. It is passed on the
+    # command line because a new Terminal window on macOS / Linux does not get
+    # this process's environment (on Windows it does).
     args = [sys.executable or PYTHON, "-u", os.path.join(repo, "runner.py"),
-            "--worker", str(ip), str(op), steps, str(marker)]
+            "--worker", str(ip), str(op), steps, str(marker),
+            os.environ.get("HM_PARALLEL_JOBS", "1")]
     try:
         if sys.platform.startswith("win"):
             # start "title" cmd /k "<cmd>"  — new console that stays open when done.
@@ -457,9 +485,7 @@ def run_worker(ip, op, steps, out):
     sync_led = os.environ.get("SYNC_LED", "auto")        # auto|red|blue (which LED drives sync)
     recs = sorted(ip.glob("*.rec"))
 
-    # --- STEP 1: Trodes DIO/Analog export (per .rec) ---
-    #  No -raw: steps 7 and 8 read the wideband straight from the .rec
-    #  (src/sorter/trodes_rec.py), so the ~27 GiB/h raw copy is not written.
+    # --- STEP 1: Trodes DIO/Analog export (per .rec); see TRODES_EXPORT_FLAGS ---
     if "1" in steps:
         log(out, "[STEP 1] Running Trodes DIO/Analog Export (per .rec)...")
         trodes = _tool("TRODES_EXPORT_CMD")
@@ -468,7 +494,7 @@ def run_worker(ip, op, steps, out):
                 log(out, f"[WARNING] No .rec files found in '{ip}'")
             for f in recs:
                 log(out, f"    Exporting {f.name}")
-                run([trodes, "-dio", "-analogio", "-rec", f], out=out)
+                run([trodes, *TRODES_EXPORT_FLAGS, "-rec", f], out=out)
         else:
             log(out, f"[WARNING] trodesexport not found at: {os.environ.get('TRODES_EXPORT_CMD','')}")
 
@@ -1195,9 +1221,7 @@ def post_jobs_limit(n_sessions):
             return max(1, min(int(raw), n_sessions))
         except ValueError:
             print(f"[WARN] POST_JOBS={raw!r} is not a number — using auto.")
-    cpus = os.cpu_count() or 2
-    mem_gb = psutil.virtual_memory().total / 2 ** 30 if psutil is not None else 16.0
-    return max(1, min(cpus // 2, int(mem_gb // 12), 6, n_sessions))
+    return machine.session_jobs_limit(n_sessions)
 
 
 def resources_free():
@@ -1313,24 +1337,26 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
     print(f"[TREE] {len(queue)} session(s) x steps [{order}], up to {n_jobs} at a time "
           f"(POST_JOBS), {gap} s apart, started while CPU<={limits[0]}% GPU<={limits[1]}% "
           f"MEM<={limits[2]}%")
+    print(f"[TREE] Each job's steps use up to {machine.step_n_jobs(side_by_side=n_jobs)} "
+          f"worker process(es): the cores are shared between the {n_jobs} job(s) (N_JOBS)")
     print(f"[TREE] One log per session in {logdir}")
     print("=" * 56)
     if psutil is None:
         print("[TREE] psutil is not installed: CPU/MEM are not monitored or gated "
               "(pip install psutil).")
-    if disk_gate_on():
-        print(f"[TREE] Disk guard: a job starts only when its expected output fits, with "
-              f"{disk_guard.gb_text(disk_guard.min_free_bytes())} GB kept free (MIN_FREE_GB)"
-              + ("; jobs are paused when a disk runs low." if disk_guard.can_pause()
-                 else "; running jobs cannot be paused without psutil."))
 
     budget = disk_guard.DiskBudget()       # the disk space promised to the running jobs
-    needs = {}                             # session label -> its expected output, worked out once
+    # session label -> the output its job is expected to write
+    needs = {label: disk_guard.session_job_need(op, order) for label, op in queue}
+    print_disk_forecast(budget, list(needs.values()))
     running, results = {}, []
     monitor = ResourceMonitor()
     last_launch = last_status = 0.0
     waiting = ""
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    # HM_PARALLEL_JOBS tells each job how many run side by side, so that its steps
+    # take an equal share of the cores instead of all of them (src/tools/machine.py).
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+           "HM_PARALLEL_JOBS": str(n_jobs)}
     try:
         while queue or running:
             for label, job in list(running.items()):            # finished jobs
@@ -1355,8 +1381,6 @@ def run_post_jobs(targets, steps, config, root, job_cmd=None):
                 ok, waiting = resources_free()
                 if ok:                                      # ...and does its output fit?
                     label, op = queue[0]
-                    if label not in needs:
-                        needs[label] = disk_guard.session_job_need(op, order)
                     ok, waiting = disk_room(budget, needs[label])
                 if ok:
                     label, op = queue.pop(0)
@@ -1445,6 +1469,7 @@ def main():
     print(f"[CONFIG] Max CPU: {_int_env('MAX_CPU', MAX_CPU)}% | "
           f"Max GPU: {_int_env('MAX_GPU', MAX_GPU)}% | "
           f"Max MEM: {_int_env('MAX_MEM', MAX_MEM)}%")
+    print(f"[MACHINE] {machine.summary()}")
     print(f"[DEBUG] Target Root Directory: [{root}]\n")
 
     # Steps may come non-interactively via HM_STEPS (used by the genzeltracker GUI);
@@ -1569,9 +1594,18 @@ def main():
     budget = disk_guard.DiskBudget()
     workers = []                              # the launched workers, oldest first
     stop_watching = threading.Event()
+    needs = {}                                # ip folder -> the output its worker is expected to write
+    if parallel_trim and ops:
+        # One worker per ip*/op* pair, all running side by side: each step in them
+        # takes an equal share of the cores, not all of them (src/tools/machine.py).
+        os.environ["HM_PARALLEL_JOBS"] = str(len(ops))
+        print(f"[MACHINE] {len(ops)} parallel worker(s): each step in them uses up to "
+              f"{machine.step_n_jobs(side_by_side=len(ops))} worker process(es) (N_JOBS)")
+        exports_raw = "-raw" in TRODES_EXPORT_FLAGS
+        needs = {ip_path: disk_guard.worker_job_need(ip_path, op_path, parallel_steps, exports_raw)
+                 for ip_path, op_path in ops}
+        print_disk_forecast(budget, list(needs.values()))
     if parallel_trim and ops and disk_gate_on():
-        print(f"[CONFIG] Disk guard: {disk_guard.gb_text(disk_guard.min_free_bytes())} GB "
-              f"kept free on the disks the jobs write to (MIN_FREE_GB)")
         threading.Thread(target=watch_worker_disks, args=(budget, workers, stop_watching),
                          daemon=True).start()
         atexit.register(resume_paused_workers, workers)     # never leave a worker frozen
@@ -1579,7 +1613,7 @@ def main():
         for ip_path, op_path in ops:
             print(f"\n[QUEUE] Preparing: {ip_path.name}")
             wait_for_resources()
-            need = disk_guard.worker_job_need(ip_path, op_path, parallel_steps)
+            need = needs[ip_path]
             wait_for_disk(budget, need)
             count += 1
             name = f"{session_pfx(ip_path)}{ip_path.name}"   # rat_sessiondate_ log/marker
@@ -1630,6 +1664,8 @@ def main():
             print(f"[MASTER] Worker finished: {name}")
         print("[MASTER] All parallel workers have completed.")
     stop_watching.set()
+    # The steps below run one at a time, so each one gets the whole machine again.
+    os.environ.pop("HM_PARALLEL_JOBS", None)
 
     # --- Sequential master steps, in fixed order ---
     if has["7"]:
@@ -1735,11 +1771,16 @@ def main():
 
 def _worker_main(argv):
     """Entry point for a single parallel worker launched in its own terminal
-    window: `runner.py --worker <ip> <op> <steps> [<marker>]`. Runs the worker with
-    output to this console and touches <marker> on completion so the master waits."""
+    window: `runner.py --worker <ip> <op> <steps> [<marker> [<workers side by side>]]`.
+    Runs the worker with output to this console and touches <marker> on completion
+    so the master waits."""
     os.chdir(os.path.dirname(os.path.abspath(__file__)))   # scripts use ./src/... paths
     ip, op, steps = argv[0], argv[1], argv[2]
     marker = argv[3] if len(argv) > 3 else None
+    if len(argv) > 4:
+        # How many workers the master runs side by side: each step in this worker
+        # takes that share of the cores, not all of them (src/tools/machine.py).
+        os.environ["HM_PARALLEL_JOBS"] = argv[4]
     if marker:
         # Tell the master which process this worker is, so that its disk guard can
         # pause and resume it (watch_worker_disks).

@@ -53,7 +53,10 @@ Runs as part of step 7 (sorting.py): at the end of a new sort's post-sorting
 finds already sorted (curate_sorted_exports). PHY_AUTOCURATE=0 turns it off.
 On its own:
 
-    python phy_autocurate.py --output_folder <op|sorting_output|phy_export> [--n_jobs 4]
+    python phy_autocurate.py --output_folder <op|sorting_output|phy_export> [--n_jobs N]
+
+Its worker processes: AUTO_CURATE_JOBS when that is a number, else as many as
+fit this computer (curate_jobs; src/tools/machine.py).
 
 A phy_export that was already curated (by hand or by this script) is curated
 again from the sorter's units and its curation is replaced; there is no backup.
@@ -93,6 +96,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cell_type_metrics as ctm  # noqa: E402
+
+# machine.py (src/tools) fits the number of worker processes to this computer.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
+import machine  # noqa: E402
 
 VERSION = "2.1"
 DATA_DIR = Path(__file__).resolve().parent / "phy_autocurate_data"
@@ -2336,7 +2343,7 @@ def curate_sorted_exports(output_folder, skip=(), n_jobs=None):
     if not phys:
         return {}
     redo = flag("AUTO_CURATE_REDO", default=True)
-    n_jobs = n_jobs or int(os.environ.get("AUTO_CURATE_JOBS", "4") or 4)
+    n_jobs = n_jobs or curate_jobs()
     out = {}
     for i, phy in enumerate(phys, 1):
         log(f"[{i}/{len(phys)}] already sorted: {phy}")
@@ -2378,6 +2385,18 @@ def flag(name, default=False):
     if not v:
         return default
     return v in ("1", "true", "yes", "on")
+
+
+def curate_jobs(n_jobs=None):
+    """Worker processes for the auto-curation.
+
+    In this order: AUTO_CURATE_JOBS from the config file when it is a number;
+    the caller's `n_jobs`; N_JOBS from the config file; as many as fit this
+    computer, shared with the other jobs the runner runs side by side
+    (src/tools/machine.py). "auto" or an empty AUTO_CURATE_JOBS means: not set.
+    """
+    return (machine.setting_n_jobs("AUTO_CURATE_JOBS") or n_jobs
+            or machine.step_n_jobs())
 
 
 # =============================================================================
@@ -3520,7 +3539,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd")
     ap.add_argument("--output_folder", help="op folder (or *_sorting_output / phy_export)")
-    ap.add_argument("--n_jobs", type=int, default=int(os.environ.get("AUTO_CURATE_JOBS", "4") or 4))
+    ap.add_argument("--n_jobs", type=int, default=None,
+                    help="worker processes (default: AUTO_CURATE_JOBS, else as many as fit "
+                         "this computer)")
     ap.add_argument("--redo", action="store_true",
                     help="curate curated exports again even if AUTO_CURATE_REDO=0 (the default "
                          "already does: the old curation is replaced)")
@@ -3529,7 +3550,7 @@ def main(argv=None):
     tr.add_argument("--curated", nargs="+", required=True)
     tr.add_argument("--names", nargs="+", required=True)
     tr.add_argument("--cache", required=True, help="folder for the curator banks (one sub-folder per name)")
-    tr.add_argument("--n_jobs", type=int, default=4)
+    tr.add_argument("--n_jobs", type=int, default=None)
     tr.add_argument("--data_dir", default=str(DATA_DIR))
     tr.add_argument("--replace", action="store_true",
                     help="start the training tables afresh instead of adding to them")
@@ -3539,7 +3560,7 @@ def main(argv=None):
     ev.add_argument("--curated", nargs="+", required=True)
     ev.add_argument("--names", nargs="+", required=True)
     ev.add_argument("--cache", required=True)
-    ev.add_argument("--n_jobs", type=int, default=4)
+    ev.add_argument("--n_jobs", type=int, default=None)
     ev.add_argument("--out", default=None)
     ev.add_argument("--cand_frac", type=float, default=CAND_FRAC)
     ev.add_argument("--train_only", nargs="*", default=[],
@@ -3547,6 +3568,8 @@ def main(argv=None):
                          "(automatic curations checked in Phy)")
     ev.add_argument("--train_only_names", nargs="*", default=[])
     args = ap.parse_args(argv)
+    # --n_jobs given on the command line wins; else the config file / this computer
+    args.n_jobs = args.n_jobs or curate_jobs()
     if args.cmd in ("train", "evaluate") and len(args.curated) != len(args.names):
         ap.error("give one --names entry per --curated folder")
     if args.cmd == "evaluate" and len(args.train_only) != len(args.train_only_names):

@@ -227,3 +227,74 @@ def test_disk_card_checks_then_deletes_processed_binary(gui, tmp_path, monkeypat
     _wait_for_the_process(gui)
     assert not processed.exists()
     assert "Deleted 1 processed_binary folder" in gui.log.toPlainText()
+
+
+# ------------------------------------------------------------------ disk guard
+WORKER_RUN = """[DISK] Disk guard on: 20.0 GB kept free on each disk the jobs write to (MIN_FREE_GB)
+[DISK] /data: 3 job(s) expect to write ~310.0 GB; 223.9 GB can be used (243.9 free - 20.0 kept free) — not enough for all: the last jobs wait until space is freed up
+
+[QUEUE] Preparing: ip3
+    [WAIT] DISK /data: job needs ~103.3 GB, 17.3 GB available (243.9 free - 206.6 for running jobs - 20.0 kept free). Pausing 30s...
+[MASTER] pause  Rat5_20260630_101010_ip2 — DISK /data: only 15.0 GB free (MIN_FREE_GB 20.0); 1 job(s) keep running
+"""
+
+
+def test_disk_card_follows_the_guard_of_a_worker_run(gui):
+    gui._reset_jobs()
+    assert not gui.disk_guard_line.isVisibleTo(gui) and gui.disk_guard_line.text() == ""
+    gui._follow(WORKER_RUN)
+    text = gui.disk_guard_line.text()
+    assert "3 job(s) expect to write ~310.0 GB" in text          # the runner's forecast
+    assert "Waiting for room: the next job needs ~103.3 GB, 17.3 GB available." in text
+    assert "Paused until there is room: Rat5_20260630_101010_ip2" in text
+    assert G.ORANGE in gui.disk_guard_line.styleSheet()
+
+    gui._follow("[MASTER] pause  Rat5_20260630_101010_ip1 — DISK /data: only 5.0 GB free "
+                "(MIN_FREE_GB 20.0); 0 job(s) keep running\n"
+                "[MASTER] every job is paused: free up space on /data — they go on by themselves.\n")
+    assert "Every job is paused — free up space on /data" in gui.disk_guard_line.text()
+    assert G.RED in gui.disk_guard_line.styleSheet()
+
+    gui._follow("[MASTER] resume Rat5_20260630_101010_ip1 — DISK /data: 60.0 GB free\n"
+                "[MASTER] resume Rat5_20260630_101010_ip2 — DISK /data: 60.0 GB free\n"
+                "[MASTER] Job launched in its own window: Job-Rat5_20260630_101010_ip3\n")
+    text = gui.disk_guard_line.text()
+    assert "Paused" not in text and "Waiting" not in text and "Every job" not in text
+    assert "3 job(s) expect to write" in text                     # the forecast stays to read
+
+
+def test_disk_card_follows_the_guard_of_a_tree_run(gui):
+    gui._reset_jobs()
+    gui._follow("[TREE] 2 session(s) x steps [l], up to 2 at a time (POST_JOBS), 20 s apart\n"
+                "[DISK] Disk guard on: 20.0 GB kept free on each disk the jobs write to (MIN_FREE_GB)\n"
+                "[TREE] start  Rat5_20260630  (1 running, 1 queued)\n"
+                "\n[MON 11:00:29] CPU 40% | MEM 56% (17.9/32 GB) | GPU 0% | DISK 31.0 GB free | "
+                "1 running, 1 queued, 0 done (0 failed)\n"
+                "    Rat5_20260630                step l     0.5 min    1.1 GB\n"
+                "    next start waits: DISK /tmp: job needs ~60.0 GB, 11.0 GB available "
+                "(31.0 free - 0.0 for running jobs - 20.0 kept free)\n")
+    assert "DISK 31.0 GB free" in gui.machine.text()              # the machine line shows it too
+    assert "Waiting for room: the next job needs ~60.0 GB, 11.0 GB available." in gui.disk_guard_line.text()
+    gui._follow("[TREE] start  Rat5_20260701  (2 running, 0 queued)\n"
+                "[TREE] pause  Rat5_20260701 — DISK /tmp: only 15.0 GB free (MIN_FREE_GB 20.0); "
+                "1 job(s) keep running\n"
+                "\n[MON 11:01:00] CPU 40% | MEM 56% | GPU 0% | DISK 15.0 GB free | "
+                "2 running, 0 queued, 0 done (0 failed)\n"
+                "    Rat5_20260630                step l     1.0 min    1.1 GB\n"
+                "    Rat5_20260701                step l     0.2 min    0.4 GB  PAUSED (disk)\n")
+    assert "Waiting" not in gui.disk_guard_line.text()
+    assert "Paused until there is room: Rat5_20260701" in gui.disk_guard_line.text()
+    assert gui.jobs.text().splitlines()[1].endswith("PAUSED (disk)")
+    gui._follow("[TREE] FAILED Rat5_20260701 (3.1 min) — see /tmp/x.log\n")
+    assert "Paused" not in gui.disk_guard_line.text()             # an ended job is not paused
+
+
+def test_disk_card_shows_the_free_space_and_the_keep_free_setting(gui, monkeypatch):
+    monkeypatch.setattr(G.disk_guard, "free_bytes", lambda folder: 30 * G.disk_guard.GB)
+    gui.min_free.setValue(20)
+    gui._show_free_space()                                        # as after a look at the data root
+    assert gui.disk_free.text().startswith("Free now:  30.0 GB (")
+    assert "temporary folder" in gui.disk_free.text() and G.GREY in gui.disk_free.styleSheet()
+    gui.min_free.setValue(50)                                     # now below what must stay free
+    assert G.RED in gui.disk_free.styleSheet()
+    gui.min_free.setValue(20)

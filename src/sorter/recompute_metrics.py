@@ -21,7 +21,7 @@ For each per-recording phy_export/ under the output (op) folder it:
     a 'redundant_with' Phy column; nothing is removed.
 
 Usage:
-    python recompute_metrics.py --output_folder <op_folder> [--n_jobs 4]
+    python recompute_metrics.py --output_folder <op_folder> [--n_jobs N]
 """
 
 import sys
@@ -32,6 +32,10 @@ from pathlib import Path
 # Reuse the shared recompute logic.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sorter_common import recompute_curated_metrics  # noqa: E402
+
+# machine.py (src/tools) fits the number of worker processes to this computer.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
+import machine  # noqa: E402
 
 
 def find_phy_folders(output_folder):
@@ -76,13 +80,17 @@ if __name__ == "__main__":
         description="Recompute quality + waveform metrics on a curated phy folder.")
     parser.add_argument("--output_folder", required=True,
                         help="op* folder (or a *_sorting_output / phy_export folder).")
-    parser.add_argument("--n_jobs", type=int, default=4)
+    parser.add_argument("--n_jobs", type=int, default=None,
+                        help="Worker processes. Default: as many as fit this computer "
+                             "(N_JOBS in hm_tracker_paths.txt forces a number).")
     # --config is accepted for runner compatibility but not required here.
     parser.add_argument("--config", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    n_jobs = args.n_jobs or machine.step_n_jobs()
+    print(f"Worker processes (n_jobs): {n_jobs}")
 
     try:
-        run(args.output_folder, n_jobs=args.n_jobs)
+        run(args.output_folder, n_jobs=n_jobs)
     except Exception as e:
         print(f"\n[FATAL] recompute_metrics crashed for '{args.output_folder}':\n{e}")
         traceback.print_exc()

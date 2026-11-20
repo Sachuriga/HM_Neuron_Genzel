@@ -66,6 +66,14 @@ except Exception as exc:                      # pragma: no cover - fallback
     print(f"[genzeltracker] could not import MENU from runner.py: {exc}")
     MENU, SEQUENTIAL_STEPS, POST_JOB_STEPS, find_session_folders = [], [], [], None
 
+# The disk guard of the runner's parallel jobs (src/tools/disk_guard.py): the Disk
+# space card reads the free space with the same functions the runner uses.
+try:
+    sys.path.insert(0, str(REPO / "src"))
+    from tools import disk_guard
+except Exception:                             # pragma: no cover
+    disk_guard = None
+
 # ------------------------------------------------------------------ presets
 # The preset list, in the order shown: (heading, {preset name: step keys}).
 # The headings only organise the drop-down; they cannot be picked.
@@ -172,6 +180,14 @@ _MON = re.compile(r"^\[MON [\d:]+\] (.*?) \| \d+ running, \d+ queued, \d+ done")
 # the last group is "PAUSED (disk)" while the runner's disk guard holds the job
 _JOB = re.compile(r"^    (\S+)\s+step (\S+)\s+([\d.]+) min(?:\s+([\d.]+) GB)?(?:\s+(PAUSED.*))?")
 
+# The runner's disk-guard lines the "Disk guard" box (above the log) follows
+_DISK_PLAN = re.compile(r"^\[DISK\] (.*)")
+_DISK_WAIT = re.compile(r"^\s*(?:\[WAIT\]|next start waits:) DISK .*?: job "
+                        r"(needs ~[\d.]+ GB, [\d.]+ GB available)")
+_DISK_EVENT = re.compile(r"^\[(?:TREE|MASTER)\] (pause|resume)\s+(\S+) — DISK")
+_DISK_ALL_PAUSED = re.compile(r"^\[(?:TREE|MASTER)\] every job is paused: free up space on (.*?) —")
+_JOB_STARTED = re.compile(r"^\[(?:TREE\] start|MASTER\] (?:Job launched|Launching worker))")
+
 DEFAULT_CONFIG = str(Path.home() / "Desktop" / "hm_tracker_paths.txt")
 # where the runner's tree mode keeps its per-run logs + summary.csv (POST_LOG_DIR)
 POST_LOG_DIR = Path(tempfile.gettempdir()) / "hm_post"
@@ -179,11 +195,13 @@ POST_LOG_DIR = Path(tempfile.gettempdir()) / "hm_post"
 MAX_RECENT_ROOTS = 8               # data roots offered in the Data root drop-down
 ROOT_CHECK_DELAY_MS = 400          # look at a typed data root this long after the last key
 LOG_MAX_LINES = 50000              # older log lines are dropped, so a long run stays light
+DISK_REFRESH_MS = 10000            # while a run is going: read the free disk space this often
 
 # ------------------------------------------------------------------- colours
 GREEN = "#1f6f43"                  # titles
 GREY = "#6b7785"                   # hints, group titles
 RED = "#b3261e"                    # problems, the Stop button
+ORANGE = "#b25e09"                 # warnings: a job waits for disk space, or is paused
 HINT_COLORS = {"info": GREY, "ok": GREEN, "error": RED}
 
 # The Run button's two looks. The colour is given for the :disabled state too:
@@ -375,6 +393,12 @@ class TrackerGUI(QMainWindow):
         self.root_timer.setInterval(ROOT_CHECK_DELAY_MS)
         self.root_timer.timeout.connect(self._check_root)
         self.root_edit.textChanged.connect(self.root_timer.start)
+
+        # The free space in the Disk space card is read again every few seconds,
+        # but only while a run is going (the timer is started by _show_running).
+        self.disk_timer = QTimer(self)
+        self.disk_timer.setInterval(DISK_REFRESH_MS)
+        self.disk_timer.timeout.connect(self._show_free_space)
 
         # Ctrl+Return (Cmd+Return on the Mac) = press Run
         QShortcut(QKeySequence("Ctrl+Return"), self, activated=self._run)
@@ -588,9 +612,34 @@ class TrackerGUI(QMainWindow):
         return self.tree_card
 
     def _build_disk_card(self):
-        """Free disk space: delete the processed_binary/ folders of the sorting
-        outputs below the data root (processed_binary_tool.py --clean --root)."""
+        """Disk space. On top the disk guard of the parallel jobs: the free space
+        now and how much the jobs must keep free (what the guard does during a run
+        is shown on the right, above the log). Below it, how to free space: delete
+        the processed_binary/ folders of the sorting outputs below the data root
+        (processed_binary_tool.py --clean --root)."""
         card, rows = self._card("Disk space")
+
+        # --- the disk guard ------------------------------------------------------
+        self.disk_free = self._hint_label()                  # "Free now: ..." (_show_free_space)
+        rows.addWidget(self.disk_free)
+        keep_row = QHBoxLayout()
+        keep_row.addWidget(QLabel("Parallel jobs keep free"))
+        self.min_free = QSpinBox()
+        self.min_free.setRange(0, 5000)
+        self.min_free.setValue(20)
+        self.min_free.setSuffix(" GB")
+        self.min_free.setMaximumWidth(96)
+        self.min_free.setToolTip(
+            "The disk guard. A parallel job starts only when its expected output fits on the "
+            "disks it writes to, with this much left free.\nWhile a disk is below it, the newest "
+            "running jobs are paused (frozen, nothing is lost) and go on once there is room.\n"
+            "Wins over MIN_FREE_GB in the config file. 0 = jobs may fill the disk.")
+        self.min_free.valueChanged.connect(self._show_free_space)
+        keep_row.addWidget(self.min_free)
+        keep_row.addStretch(1)
+        rows.addLayout(keep_row)
+
+        # --- freeing space: processed_binary ----------------------------------
         rows.addWidget(self._hint_label(
             "processed_binary/ in each *_sorting_output is a filtered copy of the raw "
             "data (~27 GB per recording hour), needed only for curating in Phy and for "
@@ -679,7 +728,7 @@ class TrackerGUI(QMainWindow):
         return row
 
     def _build_right_side(self):
-        """The session jobs (tree mode only) above the log."""
+        """The session jobs (tree mode only) and the disk guard above the log."""
         side = QWidget()
         rows = QVBoxLayout(side)
         rows.setContentsMargins(6, 12, 14, 8)
@@ -709,6 +758,16 @@ class TrackerGUI(QMainWindow):
             job_rows.addWidget(label)
         self.jobs_box.setVisible(False)          # shown by the first tree-mode line of a run
         rows.addWidget(self.jobs_box)
+
+        # --- disk guard (workers and session jobs): what the parallel jobs expect
+        # to write, which job waits for room, which jobs are paused ----------------
+        self.disk_box, disk_rows = self._card("Disk guard")
+        self.disk_guard_line = QLabel("")
+        self.disk_guard_line.setWordWrap(True)
+        self.disk_guard_line.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        disk_rows.addWidget(self.disk_guard_line)
+        self.disk_box.setVisible(False)          # shown by the first [DISK] line of a run
+        rows.addWidget(self.disk_box)
 
         # --- log ---------------------------------------------------------------
         header = QHBoxLayout()
@@ -756,6 +815,30 @@ class TrackerGUI(QMainWindow):
         self.root_hint.setStyleSheet(f"color:{color};")
         self.tree_card.setVisible(self.root_kind == "tree")
         self._refresh_run_hint()
+        self._show_free_space()
+
+    def _show_free_space(self, *_):
+        """The Disk space card's first line: the free space on the disks a run
+        writes to (the data root's and the temporary folder's). Red when it is
+        below what the parallel jobs must keep free."""
+        if disk_guard is None:
+            return
+        places = [("temporary folder", Path(tempfile.gettempdir()))]
+        root = self.root_edit.text().strip()
+        if root and self.root_kind not in ("empty", "missing"):
+            places.insert(0, ("data root", Path(root)))
+        disks = {}                               # disk -> [what is on it, its free bytes]
+        for name, folder in places:
+            free = disk_guard.free_bytes(folder)
+            if free is None:
+                continue
+            disks.setdefault(disk_guard.disk_of(folder), [[], free])[0].append(name)
+        parts = [f"{disk_guard.gb_text(free)} GB ({' + '.join(names)})"
+                 for names, free in disks.values()]
+        keep_free = self.min_free.value() * disk_guard.GB
+        too_low = any(free < keep_free for _names, free in disks.values())
+        self.disk_free.setText("Free now:  " + "  ·  ".join(parts) if parts else "")
+        self.disk_free.setStyleSheet(f"color:{RED if too_low else GREY};")
 
     def _remember_root(self, root):
         """Put `root` at the top of the Data root drop-down (newest first, no doubles)."""
@@ -931,6 +1014,7 @@ class TrackerGUI(QMainWindow):
         env.insert("MAX_GPU", str(self.gpu.value()))
         env.insert("MAX_MEM", str(self.mem.value()))
         env.insert("WORKER_WINDOWS", "1" if self.own_windows.isChecked() else "0")
+        env.insert("HM_MIN_FREE_GB", str(self.min_free.value()))     # the disk guard
         env.insert("PYTHONUNBUFFERED", "1")
         # tree mode; the HM_ names win over the same settings in the config file
         env.insert("HM_POST_JOBS", str(self.post_jobs.value() or "auto"))
@@ -1024,6 +1108,7 @@ class TrackerGUI(QMainWindow):
         self.setWindowTitle(f"Genzel Tracker — {title or f'running steps {steps}'}")
         self.pb_check_btn.setEnabled(False)
         self.pb_delete_btn.setEnabled(False)
+        self.disk_timer.start()                  # the free space changes while it runs
 
     def _turn_spinner(self):
         """Next spinner frame + the time since Run was pressed."""
@@ -1042,6 +1127,11 @@ class TrackerGUI(QMainWindow):
         self.pb_check_btn.setEnabled(True)
         self.pb_delete_btn.setEnabled(True)
         self.setWindowTitle("Genzel Tracker")
+        self.disk_timer.stop()
+        self._show_free_space()                  # what the run left free
+        # nothing waits or is paused any more; the run's [DISK] lines stay to read
+        self._disk_wait, self._disk_paused, self._disk_all_paused = "", [], ""
+        self._show_disk_guard()
 
     # -------------------------------------------------------------------- stop
     def _confirm(self, question):
@@ -1100,12 +1190,18 @@ class TrackerGUI(QMainWindow):
         self.progress.setValue(0)
         self.machine.setText("")
         self.jobs.setText("")
+        # the disk guard of this run: its [DISK] lines, the wait of the next job,
+        # the paused jobs, and the folder to clear when every job is paused
+        self._disk_plan, self._disk_wait, self._disk_paused, self._disk_all_paused = [], "", [], ""
+        self._show_disk_guard()
 
     def _follow(self, data):
         """Update the Session jobs panel from the runner's tree-mode lines."""
         lines = (self._buf + data).replace("\r", "").split("\n")
         self._buf = lines.pop()
         for line in lines:
+            if self._follow_disk_guard(line):
+                self._show_disk_guard()
             if m := _TREE_TOTAL.match(line):
                 self._total = int(m.group(1))
                 self.jobs_title.setText(f"Session jobs — steps [{m.group(2)}]")
@@ -1130,6 +1226,56 @@ class TrackerGUI(QMainWindow):
             else:
                 continue
             self._show_jobs()
+
+    def _follow_disk_guard(self, line):
+        """Take one line of the runner's output; True when it changed what the
+        Disk guard box (above the log) says. Both modes: workers and session jobs."""
+        if m := _DISK_PLAN.match(line):
+            self._disk_plan.append(m.group(1))
+        elif m := _DISK_WAIT.match(line):
+            self._disk_wait = m.group(1)
+        elif m := _DISK_EVENT.match(line):
+            kind, label = m.groups()
+            if kind == "pause" and label not in self._disk_paused:
+                self._disk_paused.append(label)
+            if kind == "resume" and label in self._disk_paused:
+                self._disk_paused.remove(label)
+            self._disk_all_paused = ""           # the runner says so again when it is still true
+            self.statusBar().showMessage(line.strip())
+        elif m := _DISK_ALL_PAUSED.match(line):
+            self._disk_all_paused = m.group(1)
+            self.statusBar().showMessage(line.strip())
+        elif m := _TREE_EVENT.match(line):
+            # a job that ended is not paused any more; one that started ends the wait
+            if m.group(2) in self._disk_paused and m.group(1) != "start":
+                self._disk_paused.remove(m.group(2))
+            if m.group(1) == "start":
+                self._disk_wait = ""
+        elif _JOB_STARTED.match(line) or _MON.match(line):
+            self._disk_wait = ""                 # a status block repeats the wait when it lasts
+        else:
+            return False
+        return True
+
+    def _show_disk_guard(self):
+        lines = list(self._disk_plan)
+        color = GREY
+        if any("not enough for all" in text or "not all at once" in text for text in lines):
+            color = ORANGE
+        if self._disk_wait:
+            lines.append(f"Waiting for room: the next job {self._disk_wait}.")
+            color = ORANGE
+        if self._disk_paused:
+            lines.append("Paused until there is room: " + ", ".join(self._disk_paused))
+            color = ORANGE
+        if self._disk_all_paused:
+            lines.append(f"Every job is paused — free up space on {self._disk_all_paused}; "
+                         f"they go on by themselves.")
+        if self._disk_all_paused or any("NOT ENOUGH" in text for text in lines):
+            color = RED
+        self.disk_guard_line.setText("\n".join(lines))
+        self.disk_guard_line.setStyleSheet(f"color:{color};")
+        self.disk_box.setVisible(bool(lines))
 
     def _show_jobs(self):
         self.progress.setRange(0, max(self._total, 1))
@@ -1195,6 +1341,7 @@ class TrackerGUI(QMainWindow):
         self.gpu.setValue(s.value("max_gpu", 90, type=int))
         self.mem.setValue(s.value("max_mem", 65, type=int))
         self.own_windows.setChecked(s.value("own_windows", True, type=bool))
+        self.min_free.setValue(s.value("min_free_gb", 20, type=int))
         self.post_jobs.setValue(s.value("post_jobs", 0, type=int))
         self.options_toggle.setChecked(s.value("options_open", False, type=bool))
 
@@ -1223,6 +1370,7 @@ class TrackerGUI(QMainWindow):
         s.setValue("max_gpu", self.gpu.value())
         s.setValue("max_mem", self.mem.value())
         s.setValue("own_windows", self.own_windows.isChecked())
+        s.setValue("min_free_gb", self.min_free.value())
         s.setValue("post_jobs", self.post_jobs.value())
         s.setValue("options_open", self.options_toggle.isChecked())
         s.setValue("preset", self.preset.currentText())
