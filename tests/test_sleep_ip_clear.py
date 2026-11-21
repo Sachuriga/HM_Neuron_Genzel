@@ -1,6 +1,6 @@
 """runner.py: a sleep ip folder (pre/post) is emptied only when its recordings are
 sorted (processed_binary kept) and the session NWB holds LFP + EMG.
-processed_binary_tool --clean then keeps processed_binary/ (the last 30 kHz copy)."""
+processed_binary_tool --clean deletes processed_binary/ of such a session too."""
 import sys
 from pathlib import Path
 
@@ -130,10 +130,25 @@ def test_pre_and_post_in_one_folder_both_need_a_sort(pair):
     assert len(problems) == 1 and POST in problems[0]
 
 
-def test_clean_keeps_processed_binary_after_the_ip_was_emptied(pair):
+def test_clean_deletes_processed_binary_also_after_the_ip_was_emptied(pair):
+    """The original .rec is on the recording drive, and the op folder must be
+    small to upload: an emptied ip folder is no reason to keep processed_binary/."""
     ip, op = pair
     add_recording(ip, PRE)
     out = add_sort(op, PRE)
+    add_nwb(op)
+    runner.empty_sleep_ip_folders([(ip, op)])
+    counts = pbt.clean(op, really_delete=True, force=True)
+    assert counts["deleted"] == 1 and counts["kept"] == 0
+    assert not (out / "processed_binary").exists()
+    assert "recording drive" in (out / pbt.REMOVED_NOTE_FILE).read_text()
+
+
+def test_clean_keeps_the_processed_binary_of_an_unfinished_sort(pair):
+    """Its ip folder is empty, so the sort can only be finished from this folder."""
+    ip, op = pair
+    add_recording(ip, PRE)
+    out = add_binary_of_a_stopped_sort(op, PRE)
     add_nwb(op)
     runner.empty_sleep_ip_folders([(ip, op)])
     counts = pbt.clean(op, really_delete=True, force=True)

@@ -34,9 +34,9 @@ _PHASE_KEYS = (("post", "post"), ("maze", "task"), ("mazs", "task"),
 _REC_DATE_RE = re.compile(r"(\d{8})_\d{6}")
 _RAT_NUMBER_RE = re.compile(r"[Rr]at\s*_?(\d+)")
 
-# Written into the op folder when its ip folder was emptied. processed_binary_tool
-# reads it: from then on processed_binary/ is the only 30 kHz copy on this disk,
-# so --clean must not delete it. Keep the name the same in both files.
+# Written into the op folder when its ip folder was emptied: it says where the
+# raw data went. processed_binary_tool.py reads it too (to say that a rebuild
+# needs the .rec from the recording drive). Keep the name the same in both files.
 IP_CLEARED_NOTE = "RAW_IP_CLEARED.txt"
 
 # The note step 7 writes into processed_binary/ after the last sample is on disk.
@@ -186,7 +186,7 @@ def empty_sleep_ip_folder(ip, op):
             f"Deleted recordings: {', '.join(rec_names)}\n\n"
             "On this disk the 30 kHz data now only exists as\n"
             "  <recording>_sorting_output/processed_binary/   (band-passed + re-referenced)\n"
-            "so processed_binary_tool.py --clean does not delete it while this note is here.\n"
+            "(until processed_binary_tool.py --clean deletes that too, to make the op folder small).\n"
             "A sort that was not finished is continued from it by step 7.\n"
             "The unfiltered data (new LFP, other filter settings, a new sort from raw)\n"
             "needs the original .rec from the recording drive.\n")

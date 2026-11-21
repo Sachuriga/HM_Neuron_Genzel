@@ -61,8 +61,8 @@ if str(NWB_DIR) not in sys.path:
 
 FINGERPRINT_FILE = "processed_binary_fingerprint.json"
 REMOVED_NOTE_FILE = "processed_binary_REMOVED.txt"
-# Written by runner.py into an op folder whose (sleep) ip folder was emptied.
-# Keep the name the same as runner.IP_CLEARED_NOTE.
+# Written into an op folder whose (sleep) ip folder was emptied.
+# Keep the name the same as sleep_ip.IP_CLEARED_NOTE (src/tools/sleep_ip.py).
 IP_CLEARED_NOTE = "RAW_IP_CLEARED.txt"
 
 
@@ -177,22 +177,16 @@ def clean(output_folder, really_delete=False, force=False):
             print(f"  could not read the session NWB of {output_folder} ({e}).")
     total_freed = 0
 
-    # The runner empties a sleep ip folder once it is sorted (runner.py,
-    # empty_sleep_ip_folders) and leaves this note. processed_binary/ is then the
-    # only 30 kHz copy on this disk and --restore has no .rec to rebuild it from,
-    # so it is kept — also with --force. Delete the note yourself to overrule this.
+    # A sleep ip folder is emptied once its processed_binary/ is complete
+    # (src/tools/sleep_ip.py leaves this note). processed_binary/ is deleted here
+    # all the same: the original .rec is kept on the recording drive, and a small
+    # op folder is what gets uploaded. The log only says where a rebuild starts.
     raw_ip_cleared = (Path(output_folder) / IP_CLEARED_NOTE).exists()
 
     for out_dir in outputs:
         processed = out_dir / "processed_binary"
         phy = out_dir / "phy_export"
         print(f"\n{out_dir.name}")
-
-        if raw_ip_cleared and processed.exists():
-            print(f"  the ip folder of this session was emptied ({IP_CLEARED_NOTE}): "
-                  "processed_binary/ is the only 30 kHz copy here — keeping it.")
-            counts["kept"] += 1
-            continue
 
         # Each check below protects data you might still need.
         if not processed.exists():
@@ -246,8 +240,12 @@ def clean(output_folder, really_delete=False, force=False):
             "processed_binary/ was deleted to save disk space. Phy's trace view and\n"
             "step u need it. Rebuild it from the .rec with:\n\n"
             "  python src/sorter/processed_binary_tool.py --restore "
-            "--input_folder <ip folder> --output_folder <this op folder> --config <hm_tracker_paths.txt>\n")
-        print(f"  deleted processed_binary/ — freed {human_size(size)}.")
+            "--input_folder <ip folder> --output_folder <this op folder> --config <hm_tracker_paths.txt>\n"
+            + ("\nThe ip folder of this session was emptied: copy the .rec from the\n"
+               "recording drive into it first.\n" if raw_ip_cleared else ""))
+        print(f"  deleted processed_binary/ — freed {human_size(size)}."
+              + (" The ip folder was emptied: a rebuild needs the .rec from the "
+                 "recording drive." if raw_ip_cleared else ""))
         total_freed += size
         counts["deleted"] += 1
 
