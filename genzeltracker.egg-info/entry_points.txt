@@ -1,2 +1,3 @@
 [console_scripts]
 genzeltracker = tracker_gui:main
+scandrive = scandrive:main

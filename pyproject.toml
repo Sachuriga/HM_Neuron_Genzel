@@ -48,9 +48,11 @@ gpu = [
 
 [project.scripts]
 genzeltracker = "tracker_gui:main"
+# Drive Coverage Checker GUI (src/tools/scan_drive_gui.py), via the scandrive.py shim.
+scandrive = "scandrive:main"
 
-# This repo is a script collection, not a package. Expose just the two top-level
-# modules the launcher needs; install editable (`pip install -e .`) so the GUI
+# This repo is a script collection, not a package. Expose just the top-level
+# modules the commands need; install editable (`pip install -e .`) so the GUI
 # still finds runner.py and the ./src pipeline scripts in place.
 [tool.setuptools]
-py-modules = ["tracker_gui", "runner"]
+py-modules = ["tracker_gui", "runner", "scandrive"]

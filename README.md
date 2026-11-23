@@ -135,7 +135,7 @@ pip install -e ".[gpu]" --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e ".[mac]"
 ```
 
-Dependencies live in `pyproject.toml` (extras `[gpu]` / `[mac]`); installing also creates the **`genzeltracker`** GUI command. Install **editable** (`-e`) — the repo is a script collection, and the GUI finds `runner.py` and `src/` in place.
+Dependencies live in `pyproject.toml` (extras `[gpu]` / `[mac]`); installing also creates the **`genzeltracker`** GUI command and **`scandrive`** (the Drive Coverage GUI). Install **editable** (`-e`) — the repo is a script collection, and the GUI finds `runner.py` and `src/` in place.
 
 > - `[gpu]` needs a CUDA-capable GPU and **CUDA 12.8** drivers (`torch==2.10.0+cu128` from the extra index).
 > - `mountainsort4` builds isosplit5 from C++ — on Windows install *Microsoft C++ Build Tools* first.
@@ -861,7 +861,8 @@ Integrity scan of a raw acquisition drive (`Rat<N>_*/<YYYYMMDD>/...` layout; a b
 ## Drive Coverage GUI
 
 ```bash
-python src/tools/scan_drive_gui.py
+scandrive                          # command created by `pip install -e .`
+python src/tools/scan_drive_gui.py # same thing, without installing
 ```
 
 A PyQt6 app ("HexMaze — Drive Coverage Checker") that cross-checks the experiment spreadsheet against what is actually on the drives:
@@ -869,11 +870,11 @@ A PyQt6 app ("HexMaze — Drive Coverage Checker") that cross-checks the experim
 1. **Load roster** — pick the experiment Excel (`Raw` sheet; columns `subject, day, session, Date, Implant`). `Implant=0` → video-only expectation, `Implant=1` → video + pre/task/post ephys.
 2. **Add drive folders** (any number; each directly contains the `Rat<N>_*` folders, e.g. `F:\HM_neurons`).
 3. **Scan drives** — per expected session: status **OK / PARTIAL / MISSING**, video count, per-phase GB (`✗` absent; red `⚠` = present but *short*, < 0.6× that rat's own per-phase median), split flags, found-in paths. Double-click opens the folder; on MISSING rows it offers the deep search.
-4. **Find scattered data…** — deep-search *within the selected folders* for sessions filed in odd places; classifies rows as *elsewhere* / *not-found* / *orphan* (on disk but not in the sheet) / unfiled *video* dumps (auto-assigned to rat+date by rig conventions).
+4. **Find scattered data…** — deep-search *the whole drive each listed folder is on* for sessions filed in odd places; classifies rows as *elsewhere* / *not-found* / *orphan* (on disk but not in the sheet) / unfiled *video* dumps (auto-assigned to rat+date by rig conventions).
 
-Menu bar: **Fix / Prepare** — *Organize drive…* (pick one of your listed drive folders; roster sessions already on that drive are filed into its `HM_neurons` archive by rename only — data on other drives is listed but never copied or touched), *Reset → raw…* (un-file all camera folders back to per-drive `raw/`), *Fix video names…* (canonicalise `eye<NN>_<date>_<time>.mp4`), *Prepare RecordingMeta…* (write missing tracker metadata files from the sheet); **Reports** — *Summary figure…* (status matrix per rat/repeat), *Preprocess progress…* (per-session pipeline-step completion from the `HM_neuron_preprocess` tree); **Options** — auto-RecordingMeta-after-scan (default ON; only ever creates missing files), search depth, include system drive.
+Menu bar: **Fix / Prepare** — *Organize drive…* (pick one of your listed drive folders; roster sessions already on that drive are filed into its `HM_neurons` archive by rename only — data on other drives is listed but never copied or touched), *Reset → raw…* (un-file all camera folders back to per-drive `raw/`), *Fix video names…* (canonicalise `eye<NN>_<date>_<time>.mp4`), *Prepare RecordingMeta…* (write missing tracker metadata files from the sheet); **Reports** — *Summary figure…* (status matrix per rat/repeat), *Preprocess progress…* (per-session pipeline-step completion from the `HM_neuron_preprocess` tree); **Options** — auto-RecordingMeta-after-scan (default OFF; only ever creates missing files), search depth, include system drive.
 
-**Safety model:** every writing action first builds a read-only, colour-coded *plan* and writes nothing until explicitly confirmed; nothing is ever overwritten or deleted; conflicts are skipped for a human. All "Export CSV…" buttons actually write `.xlsx` workbooks.
+**Safety model:** every writing action first builds a read-only, colour-coded *plan* and writes nothing until explicitly confirmed; nothing is ever overwritten or deleted; conflicts are skipped for a human. All "Export Excel…" buttons write `.xlsx` workbooks.
 
 ---
 

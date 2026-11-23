@@ -29,7 +29,7 @@ Workflow:
      folders on disk the sheet never asked for (*orphans*), and unfiled camera
      videos.
 
-Launch with:  python scan_drive_gui.py
+Launch with:  scandrive   (after `pip install -e .`)  or  python scan_drive_gui.py
 """
 
 from __future__ import annotations
@@ -893,7 +893,7 @@ class ScatterDialog(QDialog):
             "Missing lists which of the 4 files are absent.  ⚠ Split = recorded in parts.  "
             "Double-click a row to open the folder."))
         row = QHBoxLayout()
-        exp = QPushButton("Export CSV…")
+        exp = QPushButton("Export Excel…")
         exp.clicked.connect(self._export)
         row.addWidget(exp)
         row.addStretch(1)
@@ -1752,7 +1752,7 @@ class PreprocessDialog(QDialog):
             "inferred from the tracker output) · red ✗ = expected but missing · grey ? = "
             "not separately detectable (compression).  Double-click to open the folder."))
         row = QHBoxLayout()
-        exp = QPushButton("Export CSV…")
+        exp = QPushButton("Export Excel…")
         exp.clicked.connect(self._export)
         row.addWidget(exp)
         row.addStretch(1)
@@ -2026,7 +2026,7 @@ class ScanDriveGUI(QMainWindow):
         self.search_btn.clicked.connect(self._search_all)
         self.search_btn.setEnabled(False)
         act.addWidget(self.search_btn)
-        self.export_btn = QPushButton("Export CSV…")
+        self.export_btn = QPushButton("Export Excel…")
         self.export_btn.clicked.connect(self._export)
         self.export_btn.setEnabled(False)
         act.addWidget(self.export_btn)

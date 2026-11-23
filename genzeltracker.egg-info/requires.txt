@@ -10,13 +10,14 @@ ultralytics
 opencv-python
 sahi
 pillow
-spikeinterface[full]
+deeplabcut
+spikeinterface[full]>=0.104.8
 kilosort
 neuroconv
 ephyviewer
-probeinterface
+probeinterface>=0.3.2
 pynwb
-neo
+neo>=0.14.5
 numba
 mountainsort4
 numpy<2
@@ -48,7 +49,8 @@ opencv-python
 networkx
 openpyxl
 tqdm
-spikeinterface
+spikeinterface>=0.104.8
+neo>=0.14.5
 pynwb
 colorama
 python-dateutil
