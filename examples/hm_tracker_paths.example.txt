@@ -57,8 +57,14 @@ LFP_FIX_DRY_RUN=0
 #                   then merges the predicted keypoints back into the CSV.
 #                   Leave blank to run step [d] as export-only (no inference).
 # DLC_SHUFFLE     : DLC shuffle index to analyze with. Defaults to 2 if omitted.
+# DLC_CROP_CM     : side (cm) of the square cut around the tracked rat. Step [d]
+#                   also writes collected_frames_crop.mp4 with only that box.
+#                   DeepLabCut does not use it yet (it still analyzes
+#                   collected_frames.mp4).
+#                   Defaults to 40 (about 106 px, a whole rat). 0 = no cropping.
 DLC_CONFIG_PATH=
 DLC_SHUFFLE=2
+DLC_CROP_CM=40
 
 # -------------------------------------------------------------------
 # Video/LED sync (menu [2]).

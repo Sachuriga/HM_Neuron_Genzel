@@ -61,6 +61,83 @@ def find_video_for_region(region_idd: int | str, video_dir: Path) -> Optional[Pa
                      key=lambda p: _natural_key(p.name))
     return matches[0] if matches else None
 
+# ---------------------------------------------------------------------------
+#  Rat-centred crop
+#
+#  Rat_X / Rat_Y in the tracking CSV are pixels of the tracker's display frame
+#  (1176x712), which is the stitched canvas at half size. To cut a small box
+#  around the rat out of ONE eye camera's frame we have to undo the stitching.
+#  The numbers below are the ones src/tracker/join_views.py stitches with; if
+#  the stitch layout ever changes, change them here too.
+# ---------------------------------------------------------------------------
+STITCH_COLS = 6            # cameras per row on the canvas (2 rows x 6 columns)
+STITCH_CROP_X = 104        # px cut off the left (and right) of every eye frame
+STITCH_CROP_Y = 91         # px cut off the top of a bottom-row eye frame (after its flip)
+STITCH_TILE_W = 392        # width one camera keeps on the canvas  (600 - 2 * 104)
+STITCH_TILE_H = 709        # height one camera keeps on the canvas (800 - 91)
+CANVAS_PX_PER_DISPLAY_PX = 2.0   # canvas 2352x1424 -> display 1176x712
+
+# The 2352 px wide canvas shows the 9 m long maze (same convention as
+# plot_trials.py), and eye frames are stitched at their own resolution, so one
+# centimetre is about 2.6 pixels in an eye frame.
+EYE_PX_PER_CM = 2352 / 900.0
+
+# Side of the square cut around the rat. The CSV position is the centre of the
+# rat's body, so the box must reach from there to the nose: 40 cm (about 106 px)
+# holds a whole rat. 10 cm would be only 26 px, smaller than the rat itself.
+DEFAULT_CROP_CM = 40.0
+
+CROPPED_VIDEO_NAME = "collected_frames_crop.mp4"
+
+
+def crop_size_in_pixels(crop_cm: float) -> int:
+    """Side of the crop box in eye-frame pixels (0 = no cropping).
+
+    Rounded to an even number because video encoders want even frame sizes."""
+    if crop_cm <= 0:
+        return 0
+    size = int(round(crop_cm * EYE_PX_PER_CM))
+    if size % 2 == 1:
+        size += 1
+    return max(size, 2)
+
+
+def rat_position_in_eye_frame(rat_x: float, rat_y: float, region_id: int) -> Tuple[float, float]:
+    """Where the rat is inside the eye frame of camera `region_id`, in pixels.
+
+    For a bottom-row camera (region 6-11) the answer is for the frame AFTER it
+    was rotated 180 degrees, which is how this script writes those frames."""
+    column = region_id % STITCH_COLS
+    row = region_id // STITCH_COLS
+
+    # display pixels -> canvas pixels
+    canvas_x = rat_x * CANVAS_PX_PER_DISPLAY_PX
+    canvas_y = rat_y * CANVAS_PX_PER_DISPLAY_PX
+
+    # position inside this camera's tile on the canvas
+    tile_x = canvas_x - column * STITCH_TILE_W
+    tile_y = canvas_y - row * STITCH_TILE_H
+
+    # add back what the stitch cut off before it pasted the tile. Top-row frames
+    # lost nothing at the top; bottom-row frames lost STITCH_CROP_Y rows.
+    eye_x = tile_x + STITCH_CROP_X
+    eye_y = tile_y + (STITCH_CROP_Y if row >= 1 else 0)
+    return eye_x, eye_y
+
+
+def crop_box_origin(center_x: float, center_y: float, crop_size: int,
+                    frame_w: int, frame_h: int) -> Tuple[int, int]:
+    """Top-left corner of a crop_size box centred on the rat.
+
+    Near a border the box is pushed back inside the frame instead of being
+    filled with black, so every crop has the same size and only real pixels."""
+    x0 = int(round(center_x - crop_size / 2))
+    y0 = int(round(center_y - crop_size / 2))
+    x0 = min(max(x0, 0), max(frame_w - crop_size, 0))
+    y0 = min(max(y0, 0), max(frame_h - crop_size, 0))
+    return x0, y0
+
+
 class FastVideoReader:
     """Caches VideoCapture objects to prevent reopening files continuously."""
     MAX_SKIP = 60       # frames skipped by reading on instead of seeking
@@ -110,7 +187,8 @@ def process_tracking_data(
     output_dir: str, 
     csv_path: Optional[str] = None, 
     fps: float = 30.0,
-    show_stream: bool = True
+    show_stream: bool = True,
+    crop_cm: float = DEFAULT_CROP_CM,
 ):
     ip_path = Path(input_dir)
     op_path = Path(output_dir)
@@ -132,6 +210,20 @@ def process_tracking_data(
     
     # --- NEW: Initialize the column to store the extracted frame index ---
     df['extracted_frame_idx'] = pd.NA
+
+    # Second video: a small box around the rat, cut from the same frames. The
+    # corner of each box is kept in the CSV so a keypoint found in the cropped
+    # video can be put back into the eye frame (eye x = crop x + crop_x0).
+    crop_size = crop_size_in_pixels(crop_cm)
+    cropped_vid_path = op_path / CROPPED_VIDEO_NAME
+    crop_writer = None
+    if crop_size:
+        df['crop_x0'] = pd.NA
+        df['crop_y0'] = pd.NA
+    elif cropped_vid_path.exists():
+        # Cropping is switched off: a cropped video left from an earlier run
+        # would no longer match this run's frames, so do not leave it around.
+        cropped_vid_path.unlink()
     
     # --- OPTIMIZATION 1: Pre-map regions to video files ---
     print("Pre-mapping video paths...")
@@ -186,6 +278,24 @@ def process_tracking_data(
             target_size = (w, h)
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(str(output_vid_path), fourcc, fps, target_size)
+            if crop_size:
+                # the box can never be larger than the frame it is cut from
+                crop_size = min(crop_size, w - w % 2, h - h % 2)
+                crop_writer = cv2.VideoWriter(str(cropped_vid_path), fourcc, fps,
+                                              (crop_size, crop_size))
+
+        if crop_writer is not None:
+            # Cut the box here, from the frame as the camera recorded it (already
+            # rotated for the bottom row), so the crop keeps the original pixels.
+            frame_h, frame_w = frame.shape[:2]
+            eye_x, eye_y = rat_position_in_eye_frame(row["Rat_X"], row["Rat_Y"], int(region_id))
+            x0, y0 = crop_box_origin(eye_x, eye_y, crop_size, frame_w, frame_h)
+            cropped = frame[y0:y0 + crop_size, x0:x0 + crop_size]
+            if cropped.shape[:2] != (crop_size, crop_size):
+                cropped = cv2.resize(cropped, (crop_size, crop_size))
+            crop_writer.write(cropped)
+            df.at[row_idx, 'crop_x0'] = x0
+            df.at[row_idx, 'crop_y0'] = y0
 
         if (frame.shape[1], frame.shape[0]) != target_size:
             frame = cv2.resize(frame, target_size)
@@ -207,6 +317,8 @@ def process_tracking_data(
     # Clean up
     if writer:
         writer.release()
+    if crop_writer is not None:
+        crop_writer.release()
     video_reader.release_all()
     cv2.destroyAllWindows()
     
@@ -215,6 +327,9 @@ def process_tracking_data(
     df.to_csv(output_csv_path, index=False)
     
     print(f"\n\nProcessing Complete. Video saved to: {output_vid_path}")
+    if crop_writer is not None:
+        print(f"Rat-centred video ({crop_size}x{crop_size} px, about {crop_cm:g} cm) "
+              f"saved to: {cropped_vid_path}")
     print(f"Updated CSV saved to: {output_csv_path}")
     
     if errors:
@@ -228,11 +343,15 @@ def main():
     parser.add_argument("--csv", "-c", help="Specific path to tracking CSV (optional)")
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--no-vis", action="store_false", dest="show_stream", help="Disable real-time video preview")
+    parser.add_argument("--crop_cm", type=float, default=DEFAULT_CROP_CM,
+                        help=f"Side of the square cut around the rat for {CROPPED_VIDEO_NAME}, "
+                             "in cm (default: %(default)s; 0 = do not write the cropped video)")
 
     args = parser.parse_args()
 
     try:
-        process_tracking_data(args.input_folder, args.output_folder, args.csv, args.fps, args.show_stream)
+        process_tracking_data(args.input_folder, args.output_folder, args.csv, args.fps,
+                              args.show_stream, args.crop_cm)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

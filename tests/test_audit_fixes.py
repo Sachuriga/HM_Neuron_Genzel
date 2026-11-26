@@ -136,6 +136,28 @@ def test_step_d_skips_sidecars_and_backup_copies(tmp_path):
     assert [p.relative_to(tmp_path).as_posix() for p in found] == ["20260630_Rat5_Coordinates_Full.csv"]
 
 
+def test_step_d_maps_the_rat_into_the_eye_frame():
+    pytest.importorskip("cv2")
+    sys.path.insert(0, str(REPO / "src" / "dlc"))
+    import tracking_eyes as T
+    # Top row, camera 3 (region 2): canvas = display x 2, tile starts at 2 * 392,
+    # and the stitch cut 104 px off the left and nothing off the top.
+    assert T.rat_position_in_eye_frame(542.0, 300.0, 2) == (2 * 542 - 784 + 104, 600)
+    # Bottom row, camera 8 (region 7): the tile starts at canvas y = 709 and the
+    # stitch cut 91 px off the top of the (rotated) frame.
+    assert T.rat_position_in_eye_frame(226.0, 554.5, 7) == (2 * 226 - 392 + 104, 1109 - 709 + 91)
+
+
+def test_step_d_crop_box_stays_inside_the_frame():
+    pytest.importorskip("cv2")
+    sys.path.insert(0, str(REPO / "src" / "dlc"))
+    import tracking_eyes as T
+    size = T.crop_size_in_pixels(40)
+    assert size == 106 and T.crop_size_in_pixels(0) == 0
+    assert T.crop_box_origin(300, 400, size, 600, 800) == (247, 347)      # centred on the rat
+    assert T.crop_box_origin(5, 795, size, 600, 800) == (0, 800 - size)   # pushed back inside
+
+
 # ------------------------------------------------------------------ tracker_gui
 def test_gui_keeps_a_character_split_between_two_reads_whole():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

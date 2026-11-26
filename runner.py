@@ -571,8 +571,18 @@ def run_worker(ip, op, steps, out):
     # --- STEP d: DeepLabCut export + inference (extract frames -> run DLC -> write) ---
     if "d" in steps and Path("./src/dlc/tracking_eyes.py").exists():
         log(out, "[STEP d] Exporting eye frames for DeepLabCut...")
+        # DLC_CROP_CM = side (cm) of the box cut around the tracked rat. Part 1
+        # then also writes collected_frames_crop.mp4 with only that box. 0
+        # switches it off. DeepLabCut below does not use the cropped video yet;
+        # it still analyzes the whole eye frames in collected_frames.mp4.
+        crop_cm = os.environ.get("DLC_CROP_CM", "").strip() or "40"
+        try:
+            float(crop_cm)
+        except ValueError:
+            log(out, f"[STEP d] DLC_CROP_CM='{crop_cm}' is not a number; using 40.")
+            crop_cm = "40"
         run([PYTHON, "-u", "./src/dlc/tracking_eyes.py",
-             "--input_folder", ip, "--output_folder", op], out=out)
+             "--input_folder", ip, "--output_folder", op, "--crop_cm", crop_cm], out=out)
         # Run DeepLabCut on the collected_frames.mp4 just exported and merge the
         # predicted keypoints back into the CSV. Uses the GPU like step 4; the
         # per-worker resource gate (MAX_GPU) throttles concurrent launches. Skipped

@@ -179,6 +179,7 @@ SYNC_LEGACY=0            # 1 = old index-paired regression (reproduces pre-fix o
 # DeepLabCut (step d)
 DLC_CONFIG_PATH=         # path to the trained project's config.yaml; blank = export-only
 DLC_SHUFFLE=2
+DLC_CROP_CM=40           # box (cm) cut around the rat -> collected_frames_crop.mp4; 0 = off
 
 # NWB (written at the end of step 4)
 NWB_RAT_NR=1             # fallback only — RecordingMeta.xlsx Rat_ID wins
@@ -432,6 +433,7 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `TRODES_EXPORT_CMD` | — | step 1 binary |
 | `DLC_CONFIG_PATH` | — (inference skipped) | step d part 2 |
 | `DLC_SHUFFLE` | 2 | step d part 2 |
+| `DLC_CROP_CM` | 40 (0 = no crop) | step d part 1 |
 | `NWB_RAT_NR` | 1 | step 4 NWB fallback rat number |
 | `DECODE_FOLDS` | 1 | step b: visualisation-track folds |
 | `DECODE_CV_FOLDS` | 5 | step b: held-out accuracy folds |
@@ -744,7 +746,9 @@ Re-running is safe: an NWB already rewritten at that rate, or holding step 8's o
 
 Part 1 maps every tracked frame to the eye camera that captured it (1176×712 gridded into 6×2 regions of 196×356 px; bottom-row frames flipped 180°) and compiles the per-frame close-ups into `collected_frames.mp4` + `<csv>_with_frames.csv` (adds `region_id`, `extracted_frame_idx`). Opens a live preview by default (`--no-vis` disables; `q` aborts).
 
-Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`** (shuffle from `DLC_SHUFFLE`, default 2): `deeplabcut.analyze_videos` on `collected_frames.mp4`, merges per-bodypart `_x/_y` back into the CSV rows, **re-centres all keypoints on `mid_brain`** (that bodypart must exist), overwrites the CSV in place, and writes a DLC-labelled QC video.
+Part 1 also writes **`collected_frames_crop.mp4`**: the same frames in the same order, but only a square box around the tracked rat (`DLC_CROP_CM` / `--crop_cm`, default 40 cm ≈ 106 px; `0` = off). `Rat_X/Rat_Y` are mapped back from the stitched canvas into the eye frame (undoing the `join_views.py` crop of 104 / 91 px), at ≈ 2.6 eye px per cm (2352 px canvas = 9 m maze). Near a frame border the box is shifted back inside the frame, never padded. The box corner is stored per row as `crop_x0`, `crop_y0` (eye-frame px, after the 180° flip for the bottom row), so `eye x = crop x + crop_x0`.
+
+Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`** (shuffle from `DLC_SHUFFLE`, default 2): `deeplabcut.analyze_videos` on `collected_frames.mp4` (the cropped video is not used by DLC yet), merges per-bodypart `_x/_y` back into the CSV rows, **re-centres all keypoints on `mid_brain`** (that bodypart must exist), overwrites the CSV in place, and writes a DLC-labelled QC video.
 
 ### Step 9 — Cleanup
 
