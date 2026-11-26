@@ -179,7 +179,11 @@ SYNC_LEGACY=0            # 1 = old index-paired regression (reproduces pre-fix o
 # DeepLabCut (step d)
 DLC_CONFIG_PATH=         # path to the trained project's config.yaml; blank = export-only
 DLC_SHUFFLE=2
-DLC_CROP_CM=40           # box (cm) cut around the rat -> collected_frames_crop.mp4; 0 = off
+DLC_CROP_CM=40           # box (cm) cut around the rat -> collected_frames_crop.mp4 (+ _crop_sr.mp4)
+DLC_CROP_SCALE=4         # the box is saved this many times larger (424 px), high quality
+DLC_CROP_SR=1            # also write the super-resolved video (Real-ESRGAN, needs PyTorch); 0 = off
+DLC_SR_MODEL=            # realesr-general-x4v3.pth; blank = downloaded once into models/
+DLC_VIDEO=crop           # video DeepLabCut analyzes: crop (real pixels) or sr
 
 # NWB (written at the end of step 4)
 NWB_RAT_NR=1             # fallback only — RecordingMeta.xlsx Rat_ID wins
@@ -263,7 +267,7 @@ genzeltracker
 The Qt window imports the step menu straight from `runner.py` (GUI and CLI can never disagree) and launches `runner.py` with `HM_STEPS` set. Left half: what to run; right half: the session jobs and the log (drag the bar between them).
 
 - **Data** — the data root (type it, **Browse…**, drop a folder onto the window, or pick an earlier root from the drop-down) and the config file. The line below the root says what was found: `ip*` folders (ipN → opN pairs) or a session tree.
-- **Steps** — a preset, or tick the steps yourself (the preset then reads *Custom*). Steps are grouped and carry short names; hover a step for the runner's full description. Step l's *check only (dry run)* box appears while step l is ticked.
+- **Steps** — a preset, or tick the steps yourself (the preset then reads *Custom*). Steps are grouped and carry short names; hover a step for the runner's full description. Step l's *check only (dry run)* box appears while step l is ticked, and step d's *also write the super-resolved video* box while step d is ticked (it overrides `DLC_CROP_SR` from the config file).
 - **Session tree** — only shown for a root without `ip*` folders (see below).
 - **Options** (folded) — the CPU / GPU / memory limits and *each worker in its own terminal window*.
 - **Run** (also Ctrl+Return; Cmd+Return on the Mac) / **Stop** (asks first). The line below says what Run will do, or what is still missing; when a run ends it shows the result and the taskbar / Dock icon flashes.
@@ -433,7 +437,11 @@ Everything in `hm_tracker_paths.txt` is exported as env; these can also be set d
 | `TRODES_EXPORT_CMD` | — | step 1 binary |
 | `DLC_CONFIG_PATH` | — (inference skipped) | step d part 2 |
 | `DLC_SHUFFLE` | 2 | step d part 2 |
-| `DLC_CROP_CM` | 40 (0 = no crop) | step d part 1 |
+| `DLC_CROP_CM` | 40 | step d part 1 |
+| `DLC_CROP_SCALE` | 4 (1 = no enlarging) | step d part 1 |
+| `DLC_CROP_SR` | 1 (0 = no super-resolved video) | step d part 1 |
+| `DLC_SR_MODEL` | — (auto-download to `models/`) | step d part 1 |
+| `DLC_VIDEO` | crop (`sr` = super-resolved) | step d part 2 |
 | `NWB_RAT_NR` | 1 | step 4 NWB fallback rat number |
 | `DECODE_FOLDS` | 1 | step b: visualisation-track folds |
 | `DECODE_CV_FOLDS` | 5 | step b: held-out accuracy folds |
@@ -744,11 +752,20 @@ Re-running is safe: an NWB already rewritten at that rate, or holding step 8's o
 
 **Scripts:** `src/dlc/tracking_eyes.py` → `src/dlc/dlc_coordinates.py`
 
-Part 1 maps every tracked frame to the eye camera that captured it (1176×712 gridded into 6×2 regions of 196×356 px; bottom-row frames flipped 180°) and compiles the per-frame close-ups into `collected_frames.mp4` + `<csv>_with_frames.csv` (adds `region_id`, `extracted_frame_idx`). Opens a live preview by default (`--no-vis` disables; `q` aborts).
+Part 1 maps every tracked frame to the eye camera that captured it (1176×712 gridded into 6×2 regions of 196×356 px; bottom-row frames flipped 180°), cuts a square box around the tracked rat out of that eye frame, and writes the boxes as videos + `<csv>_with_frames.csv` (adds `region_id`, `extracted_frame_idx`, `crop_x0`, `crop_y0`, `crop_scale`). The whole eye frame is **no longer saved** (the former `collected_frames.mp4`). Opens a live preview by default (`--no-vis` disables; `q` aborts).
 
-Part 1 also writes **`collected_frames_crop.mp4`**: the same frames in the same order, but only a square box around the tracked rat (`DLC_CROP_CM` / `--crop_cm`, default 40 cm ≈ 106 px; `0` = off). `Rat_X/Rat_Y` are mapped back from the stitched canvas into the eye frame (undoing the `join_views.py` crop of 104 / 91 px), at ≈ 2.6 eye px per cm (2352 px canvas = 9 m maze). Near a frame border the box is shifted back inside the frame, never padded. The box corner is stored per row as `crop_x0`, `crop_y0` (eye-frame px, after the 180° flip for the bottom row), so `eye x = crop x + crop_x0`.
+The box: `DLC_CROP_CM` / `--crop_cm`, default 40 cm ≈ 106 px. `Rat_X/Rat_Y` are mapped back from the stitched canvas into the eye frame (undoing the `join_views.py` crop of 104 / 91 px), at ≈ 2.6 eye px per cm (2352 px canvas = 9 m maze). Near a frame border the box is shifted back inside the frame, never padded. The box corner is stored per row as `crop_x0`, `crop_y0` (eye-frame px, after the 180° flip for the bottom row).
 
-Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`** (shuffle from `DLC_SHUFFLE`, default 2): `deeplabcut.analyze_videos` on `collected_frames.mp4` (the cropped video is not used by DLC yet), merges per-bodypart `_x/_y` back into the CSV rows, **re-centres all keypoints on `mid_brain`** (that bodypart must exist), overwrites the CSV in place, and writes a DLC-labelled QC video.
+Two videos come out, with the **same frames, order and size** (`DLC_CROP_SCALE` / `--crop_scale`, default 4 → 424×424 px), both encoded by ffmpeg as H.264 at CRF 12 (OpenCV's `mp4v` only when ffmpeg has no libx264) and both skipped by step 6's compression:
+
+| File | How the 106 px box becomes 424 px | Use |
+|---|---|---|
+| `collected_frames_crop.mp4` | Lanczos enlargement — **real camera pixels only** | measurements, DeepLabCut (default) |
+| `collected_frames_crop_sr.mp4` | Real-ESRGAN super-resolution (`realesr-general-x4v3`, `src/dlc/super_resolution.py`) | looking at the rat; sharper, but the extra detail is **drawn by the network**, not recorded (the camera has ≈ 2.6 px per cm) |
+
+The super-resolved video needs PyTorch (GPU when available, else CPU — slow) and the 5 MB model file, downloaded once into `<repo>/models/` or taken from `DLC_SR_MODEL`. `DLC_CROP_SR=0` / `--no-sr` skips it; when PyTorch or the model is missing it is skipped with a message and the plain video is still written. A point in either video maps back with `eye x = crop x / crop_scale + crop_x0` (`crop_pixel_to_eye_pixel` in `tracking_eyes.py`).
+
+Part 2 runs **only if `DLC_CONFIG_PATH` points to an existing DLC `config.yaml`** (shuffle from `DLC_SHUFFLE`, default 2): `deeplabcut.analyze_videos` on `collected_frames_crop.mp4` (`DLC_VIDEO=sr` → the super-resolved one; the DLC model must have been trained on that kind of video, not on whole eye frames), converts the keypoints from crop pixels back to eye-frame pixels, merges per-bodypart `_x/_y` back into the CSV rows, **re-centres all keypoints on `mid_brain`** (that bodypart must exist), overwrites the CSV in place, and writes a DLC-labelled QC video.
 
 ### Step 9 — Cleanup
 

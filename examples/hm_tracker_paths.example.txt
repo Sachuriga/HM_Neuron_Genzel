@@ -58,13 +58,33 @@ LFP_FIX_DRY_RUN=0
 #                   Leave blank to run step [d] as export-only (no inference).
 # DLC_SHUFFLE     : DLC shuffle index to analyze with. Defaults to 2 if omitted.
 # DLC_CROP_CM     : side (cm) of the square cut around the tracked rat. Step [d]
-#                   also writes collected_frames_crop.mp4 with only that box.
-#                   DeepLabCut does not use it yet (it still analyzes
-#                   collected_frames.mp4).
-#                   Defaults to 40 (about 106 px, a whole rat). 0 = no cropping.
+#                   saves only that box (the whole eye frame is no longer
+#                   saved), as two videos with the same frames and size:
+#                     collected_frames_crop.mp4     enlarged the plain way
+#                                                   (Lanczos) - real pixels only
+#                     collected_frames_crop_sr.mp4  enlarged by a super-resolution
+#                                                   network (Real-ESRGAN) - looks
+#                                                   sharper, but the added detail
+#                                                   is drawn by the network, not
+#                                                   recorded by the camera
+#                   Defaults to 40 (about 106 px, a whole rat).
+# DLC_CROP_SCALE  : how many times the box is enlarged before it is saved, as
+#                   high-quality H.264. 4 -> 424x424 px (keep 4: it is what the
+#                   network enlarges by).
+# DLC_CROP_SR     : 1 = also write the super-resolved video (needs PyTorch;
+#                   uses the GPU when there is one). 0 = only the plain video.
+#                   The GUI's "also write the super-resolved video" box wins.
+# DLC_SR_MODEL    : path of the model file realesr-general-x4v3.pth. Blank =
+#                   downloaded once (5 MB) into <repo>/models/.
+# DLC_VIDEO       : which video DeepLabCut analyzes: crop (default) or sr.
+#                   The DLC model must have been trained on that kind of video.
 DLC_CONFIG_PATH=
 DLC_SHUFFLE=2
 DLC_CROP_CM=40
+DLC_CROP_SCALE=4
+DLC_CROP_SR=1
+DLC_SR_MODEL=
+DLC_VIDEO=crop
 
 # -------------------------------------------------------------------
 # Video/LED sync (menu [2]).

@@ -3,4 +3,5 @@
 __pycache__/
 *.pyc
 **/.vscode
-
+# step d: downloaded super-resolution model
+models/*.pth

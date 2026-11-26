@@ -24,9 +24,18 @@ def _find_files(folder: Path, pattern: str) -> list:
     return sorted(hits, key=lambda p: (len(p.relative_to(folder).parts), str(p).lower()))
 
 
-def find_collected_video(op_path: Path) -> Optional[Path]:
-    # find collected_frames.mp4
-    matches = _find_files(op_path, "collected_frames.mp4")
+# The two videos step d part 1 (tracking_eyes.py) writes. Both hold the same
+# frames at the same size, so DeepLabCut can read either one:
+#   "crop" = the box around the rat enlarged the plain way (real camera pixels)
+#   "sr"   = the same box enlarged by the super-resolution network, which looks
+#            sharper but draws detail the camera did not record
+VIDEO_NAMES = {"crop": "collected_frames_crop.mp4",
+               "sr": "collected_frames_crop_sr.mp4"}
+
+
+def find_collected_video(op_path: Path, which: str = "crop") -> Optional[Path]:
+    # find the cropped video DeepLabCut should read
+    matches = _find_files(op_path, VIDEO_NAMES[which])
     return matches[0] if matches else None
 
 
@@ -72,6 +81,19 @@ def center_on_mid_brain(df: pd.DataFrame, dlc_df: pd.DataFrame, written_rows: np
     return df
 
 
+def crop_pixels_to_eye_pixels(df: pd.DataFrame, dlc_df: pd.DataFrame, written_rows: np.ndarray) -> pd.DataFrame:
+    """DeepLabCut saw the enlarged box around the rat, so its x / y are pixels of
+    that box. Put them back into the eye camera's frame, the unit these columns
+    always had:   eye = crop / crop_scale + crop corner."""
+    scale = df.loc[written_rows, 'crop_scale'].astype(float)
+    corner_x = df.loc[written_rows, 'crop_x0'].astype(float)
+    corner_y = df.loc[written_rows, 'crop_y0'].astype(float)
+    for bp in dlc_df.columns.get_level_values(0).unique():
+        df.loc[written_rows, f"{bp}_x"] = df.loc[written_rows, f"{bp}_x"] / scale + corner_x
+        df.loc[written_rows, f"{bp}_y"] = df.loc[written_rows, f"{bp}_y"] / scale + corner_y
+    return df
+
+
 def merge_coordinates(df: pd.DataFrame, dlc_df: pd.DataFrame) -> pd.DataFrame:
     # written rows = rows put into the video, in DLC frame order
     written_mask = df['extracted_frame_idx'].notna()
@@ -89,6 +111,7 @@ def merge_coordinates(df: pd.DataFrame, dlc_df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].astype(float)
     dlc_values = dlc_df.to_numpy()
     df.loc[written_rows[:n], flat_cols] = dlc_values[:n]
+    df = crop_pixels_to_eye_pixels(df, dlc_df, written_rows[:n])
     df = center_on_mid_brain(df, dlc_df, written_rows[:n])
     return df
 
@@ -103,12 +126,13 @@ def make_labeled_video(config_path: Path, video_path: Path, shuffle: int = 2):
     print(f"Labeled video written next to: {video_path}")
 
 
-def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = None, shuffle: int = 2):
+def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = None, shuffle: int = 2,
+                         which_video: str = "crop"):
     op_path = Path(op_dir)
     config_path = Path(config)
-    video_path = find_collected_video(op_path)
+    video_path = find_collected_video(op_path, which_video)
     if not video_path:
-        raise FileNotFoundError(f"No collected_frames.mp4 found in {op_path}.")
+        raise FileNotFoundError(f"No {VIDEO_NAMES[which_video]} found in {op_path}.")
     if csv_path:
         csv_file = Path(csv_path)
     else:
@@ -119,6 +143,9 @@ def process_dlc_tracking(op_dir: str, config: str, csv_path: Optional[str] = Non
     df = pd.read_csv(csv_file)
     if 'extracted_frame_idx' not in df.columns:
         raise ValueError("CSV is missing 'extracted_frame_idx'. Run the tracking pipeline first.")
+    if not {'crop_x0', 'crop_y0', 'crop_scale'}.issubset(df.columns):
+        raise ValueError("CSV is missing crop_x0 / crop_y0 / crop_scale. Run step d part 1 "
+                         "(tracking_eyes.py) again so it writes the cropped video.")
     dlc_df = run_dlc(config_path, video_path, shuffle)
     df = merge_coordinates(df, dlc_df)
     # overwrite the same CSV
@@ -135,9 +162,12 @@ def main():
     parser.add_argument("--config", "-g", required=True, help="Path to DLC project config.yaml")
     parser.add_argument("--csv", "-c", help="Specific path to the *_with_frames.csv (optional)")
     parser.add_argument("--shuffle", "-s", type=int, default=2, help="DLC shuffle index")
+    parser.add_argument("--video", choices=sorted(VIDEO_NAMES), default="crop",
+                        help="Which cropped video DeepLabCut reads: 'crop' = plain enlargement "
+                             "(real pixels, default), 'sr' = super-resolved")
     args = parser.parse_args()
     try:
-        process_dlc_tracking(args.op_folder, args.config, args.csv, args.shuffle)
+        process_dlc_tracking(args.op_folder, args.config, args.csv, args.shuffle, args.video)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

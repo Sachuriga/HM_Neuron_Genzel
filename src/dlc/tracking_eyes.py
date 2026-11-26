@@ -3,10 +3,16 @@ import re
 import sys
 import cv2
 import argparse
+import subprocess
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Tuple, Dict
+
+# src/tools/vcodec.py knows which ffmpeg this computer should run (FFMPEG_CMD).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import vcodec
+import super_resolution     # this folder: the network for the super-resolved video
 
 def add_region_column(
     df: pd.DataFrame,
@@ -87,7 +93,25 @@ EYE_PX_PER_CM = 2352 / 900.0
 # holds a whole rat. 10 cm would be only 26 px, smaller than the rat itself.
 DEFAULT_CROP_CM = 40.0
 
-CROPPED_VIDEO_NAME = "collected_frames_crop.mp4"
+CROPPED_VIDEO_NAME = "collected_frames_crop.mp4"   # plain enlargement, real pixels
+SR_VIDEO_NAME = "collected_frames_crop_sr.mp4"     # enlarged by the network
+
+# How many crops the super-resolution network gets at once. More is faster on a
+# graphics card but needs more of its memory; 32 crops of 106 px are small.
+SR_BATCH_SIZE = 32
+
+# The box is only about 106 px wide. That is every pixel the camera has of the
+# rat, so cropping loses nothing, but a picture that small is hard to look at
+# and a video encoder throws detail away, which hurts most on a tiny picture.
+# So each crop is enlarged before it is saved (4 x 106 = 424 px) and saved with
+# almost no compression. The plain video does this with Lanczos, which invents
+# nothing; the super-resolved video does it with a network (super_resolution.py).
+# 4 is also what that network enlarges by, so keep 4 unless you have a reason.
+DEFAULT_CROP_SCALE = 4
+
+# libx264 quality: 0 = lossless, 23 = ffmpeg's default, 28 = what step 6 uses.
+# 12 looks the same as the original frames to the eye.
+CROP_VIDEO_CRF = "12"
 
 
 def crop_size_in_pixels(crop_cm: float) -> int:
@@ -138,6 +162,90 @@ def crop_box_origin(center_x: float, center_y: float, crop_size: int,
     return x0, y0
 
 
+def enlarge_crop(cropped: np.ndarray, scale: int) -> np.ndarray:
+    """The crop made `scale` times larger (scale 1 = unchanged).
+
+    Lanczos keeps edges (ears, tail, whisker pad) sharper than the default
+    bilinear resize, which blurs them."""
+    if scale <= 1:
+        return cropped
+    h, w = cropped.shape[:2]
+    return cv2.resize(cropped, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+
+
+def crop_pixel_to_eye_pixel(crop_x: float, crop_y: float, crop_x0: float, crop_y0: float,
+                            scale: float = 1.0) -> Tuple[float, float]:
+    """A point found in the (enlarged) cropped video, back in eye-frame pixels.
+
+    `crop_x0`, `crop_y0` and `scale` are the CSV columns crop_x0, crop_y0 and
+    crop_scale of that frame's row."""
+    return crop_x / scale + crop_x0, crop_y / scale + crop_y0
+
+
+def _ffmpeg_can_encode_h264(ffmpeg: str) -> bool:
+    """True when this ffmpeg really encodes with libx264 (tried on one tiny frame)."""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=black:size=64x64:rate=1", "-frames:v", "1",
+             "-c:v", "libx264", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+class HighQualityVideoWriter:
+    """Writes frames to an .mp4 with almost no compression loss.
+
+    OpenCV's own writer (codec 'mp4v') gives no control over quality and smears
+    a small picture. Here the frames are handed to ffmpeg instead, which encodes
+    them as H.264 at a fixed high quality. If ffmpeg cannot do that on this
+    computer, the OpenCV writer is used so the step still produces a video.
+
+    Same two methods as cv2.VideoWriter: write(frame) and release()."""
+
+    def __init__(self, path: Path, fps: float, size: Tuple[int, int]):
+        self.path = Path(path)
+        self.ffmpeg_process = None
+        self.cv2_writer = None
+        width, height = size
+
+        ffmpeg = vcodec.ffmpeg_cmd()
+        if _ffmpeg_can_encode_h264(ffmpeg):
+            command = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                # what comes in: raw frames, exactly as OpenCV holds them
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", "-",
+                # what goes out: H.264, high quality, playable everywhere (yuv420p)
+                "-an", "-c:v", "libx264", "-preset", "medium", "-crf", CROP_VIDEO_CRF,
+                "-pix_fmt", "yuv420p", str(self.path),
+            ]
+            self.ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        else:
+            print("ffmpeg with libx264 not available: the cropped video is written "
+                  "with OpenCV (lower quality).")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.cv2_writer = cv2.VideoWriter(str(self.path), fourcc, fps, (width, height))
+
+    def write(self, frame: np.ndarray):
+        if self.ffmpeg_process is not None:
+            self.ffmpeg_process.stdin.write(np.ascontiguousarray(frame).tobytes())
+        else:
+            self.cv2_writer.write(frame)
+
+    def release(self):
+        if self.ffmpeg_process is not None:
+            # closing the pipe tells ffmpeg there are no more frames; then wait
+            # until it has finished writing the file
+            self.ffmpeg_process.stdin.close()
+            if self.ffmpeg_process.wait() != 0:
+                print(f"Warning: ffmpeg reported an error while writing {self.path}")
+        else:
+            self.cv2_writer.release()
+
+
 class FastVideoReader:
     """Caches VideoCapture objects to prevent reopening files continuously."""
     MAX_SKIP = 60       # frames skipped by reading on instead of seeking
@@ -182,14 +290,38 @@ class FastVideoReader:
         for cap in self.caps.values():
             cap.release()
 
+def remove_stale_video(video_path: Path):
+    """Delete a video an earlier run left behind when this run does not write it:
+    its frames would no longer match the rows of this run's CSV."""
+    if video_path.exists():
+        video_path.unlink()
+
+
 def process_tracking_data(
-    input_dir: str, 
-    output_dir: str, 
-    csv_path: Optional[str] = None, 
+    input_dir: str,
+    output_dir: str,
+    csv_path: Optional[str] = None,
     fps: float = 30.0,
     show_stream: bool = True,
     crop_cm: float = DEFAULT_CROP_CM,
+    crop_scale: int = DEFAULT_CROP_SCALE,
+    super_resolve: bool = True,
+    sr_model_path: Optional[str] = None,
 ):
+    """Step d, part 1: one small picture of the rat per tracked frame.
+
+    Writes into the output folder:
+      collected_frames_crop.mp4     the box around the rat, enlarged the plain
+                                    way (Lanczos): real camera pixels only
+      collected_frames_crop_sr.mp4  the same box enlarged by the super-resolution
+                                    network (only when super_resolve is on and
+                                    the network can be loaded)
+      <csv>_with_frames.csv         the tracking CSV plus region_id,
+                                    extracted_frame_idx, crop_x0, crop_y0, crop_scale
+
+    Both videos have the same frames, in the same order and at the same size, so
+    frame i of either one belongs to the i-th CSV row that has extracted_frame_idx.
+    The whole eye frame is no longer saved (the old collected_frames.mp4)."""
     ip_path = Path(input_dir)
     op_path = Path(output_dir)
     op_path.mkdir(parents=True, exist_ok=True)
@@ -207,38 +339,65 @@ def process_tracking_data(
 
     df = pd.read_csv(csv_file)
     df = add_region_column(df)
-    
-    # --- NEW: Initialize the column to store the extracted frame index ---
+
+    # which video frame each row's picture was taken from (empty = no picture)
     df['extracted_frame_idx'] = pd.NA
 
-    # Second video: a small box around the rat, cut from the same frames. The
-    # corner of each box is kept in the CSV so a keypoint found in the cropped
-    # video can be put back into the eye frame (eye x = crop x + crop_x0).
+    # The box around the rat. Its corner is kept in the CSV so a keypoint found
+    # in the cropped video can be put back into the eye frame, and the box is
+    # enlarged crop_scale times before it is saved (see crop_pixel_to_eye_pixel).
     crop_size = crop_size_in_pixels(crop_cm)
+    if crop_size == 0:
+        # the cropped videos are the only videos this step writes now
+        print(f"crop_cm={crop_cm:g} would write no video; using {DEFAULT_CROP_CM:g} cm.")
+        crop_cm = DEFAULT_CROP_CM
+        crop_size = crop_size_in_pixels(crop_cm)
+    crop_scale = max(int(crop_scale), 1)
+    df['crop_x0'] = pd.NA
+    df['crop_y0'] = pd.NA
+    df['crop_scale'] = pd.NA
+
     cropped_vid_path = op_path / CROPPED_VIDEO_NAME
-    crop_writer = None
-    if crop_size:
-        df['crop_x0'] = pd.NA
-        df['crop_y0'] = pd.NA
-    elif cropped_vid_path.exists():
-        # Cropping is switched off: a cropped video left from an earlier run
-        # would no longer match this run's frames, so do not leave it around.
-        cropped_vid_path.unlink()
-    
+    sr_vid_path = op_path / SR_VIDEO_NAME
+    crop_writer = None      # plain enlarged video (real pixels)
+    sr_writer = None        # super-resolved video
+    saved_size = None       # side of both saved videos, in pixels
+
+    # The super-resolution network, or None when it is switched off or cannot be
+    # loaded here (no PyTorch, no model file): the plain video is still written.
+    upscaler = None
+    if super_resolve:
+        upscaler = super_resolution.load_upscaler(sr_model_path)
+    if upscaler is None:
+        remove_stale_video(sr_vid_path)
+    # crops waiting for the network; it is much faster on many pictures at once
+    sr_waiting = []
+
+    def write_waiting_crops_super_resolved():
+        """Run the waiting crops through the network and append them to the video."""
+        if not sr_waiting:
+            return
+        for picture in upscaler.upscale(sr_waiting):
+            # The network always enlarges 4x. With another crop_scale, bring its
+            # picture to the size of the plain video so both stay comparable.
+            if picture.shape[0] != saved_size:
+                picture = cv2.resize(picture, (saved_size, saved_size),
+                                     interpolation=cv2.INTER_AREA)
+            sr_writer.write(picture)
+        sr_waiting.clear()
+
     # --- OPTIMIZATION 1: Pre-map regions to video files ---
     print("Pre-mapping video paths...")
     unique_regions = df['region_id'].dropna().unique()
     region_to_video = {}
     for region in unique_regions:
         region_to_video[region] = find_video_for_region(region, ip_path)
-    
+
     # --- OPTIMIZATION 2: Initialize the FastVideoReader ---
     video_reader = FastVideoReader()
 
-    output_vid_path = op_path / "collected_frames.mp4"
-    writer = None
-    target_size = None
     errors = []
+    frames_written = 0
 
     total_rows = len(df)
     has_frame_index = "Frame_Index" in df.columns
@@ -267,43 +426,45 @@ def process_tracking_data(
             errors.append(f"Row {row_idx}: {err}")
             continue
 
-        # --- NEW: Record the frame index successfully extracted for this row ---
-        df.at[row_idx, 'extracted_frame_idx'] = frame_no
-
         if int(region_id) > 5:
             frame = cv2.flip(frame, -1)  # -1 = flip both vertically and horizontally
 
-        if writer is None:
-            h, w = frame.shape[:2]
-            target_size = (w, h)
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(str(output_vid_path), fourcc, fps, target_size)
-            if crop_size:
-                # the box can never be larger than the frame it is cut from
-                crop_size = min(crop_size, w - w % 2, h - h % 2)
-                crop_writer = cv2.VideoWriter(str(cropped_vid_path), fourcc, fps,
-                                              (crop_size, crop_size))
+        frame_h, frame_w = frame.shape[:2]
+        if crop_writer is None:
+            # First picture: now the frame size is known, open the video file(s).
+            # The box can never be larger than the frame it is cut from.
+            crop_size = min(crop_size, frame_w - frame_w % 2, frame_h - frame_h % 2)
+            saved_size = crop_size * crop_scale
+            crop_writer = HighQualityVideoWriter(cropped_vid_path, fps, (saved_size, saved_size))
+            if upscaler is not None:
+                sr_writer = HighQualityVideoWriter(sr_vid_path, fps, (saved_size, saved_size))
 
-        if crop_writer is not None:
-            # Cut the box here, from the frame as the camera recorded it (already
-            # rotated for the bottom row), so the crop keeps the original pixels.
-            frame_h, frame_w = frame.shape[:2]
-            eye_x, eye_y = rat_position_in_eye_frame(row["Rat_X"], row["Rat_Y"], int(region_id))
-            x0, y0 = crop_box_origin(eye_x, eye_y, crop_size, frame_w, frame_h)
-            cropped = frame[y0:y0 + crop_size, x0:x0 + crop_size]
-            if cropped.shape[:2] != (crop_size, crop_size):
-                cropped = cv2.resize(cropped, (crop_size, crop_size))
-            crop_writer.write(cropped)
-            df.at[row_idx, 'crop_x0'] = x0
-            df.at[row_idx, 'crop_y0'] = y0
+        # Cut the box from the frame as the camera recorded it (already rotated
+        # for the bottom row), so the crop keeps the original pixels.
+        eye_x, eye_y = rat_position_in_eye_frame(row["Rat_X"], row["Rat_Y"], int(region_id))
+        x0, y0 = crop_box_origin(eye_x, eye_y, crop_size, frame_w, frame_h)
+        cropped = frame[y0:y0 + crop_size, x0:x0 + crop_size]
+        if cropped.shape[:2] != (crop_size, crop_size):
+            cropped = cv2.resize(cropped, (crop_size, crop_size))
 
-        if (frame.shape[1], frame.shape[0]) != target_size:
-            frame = cv2.resize(frame, target_size)
+        # video 1: plain enlargement
+        enlarged = enlarge_crop(cropped, crop_scale)
+        crop_writer.write(enlarged)
 
-        writer.write(frame)
+        # video 2: super-resolution, a batch of crops at a time
+        if sr_writer is not None:
+            sr_waiting.append(cropped.copy())
+            if len(sr_waiting) >= SR_BATCH_SIZE:
+                write_waiting_crops_super_resolved()
+
+        df.at[row_idx, 'extracted_frame_idx'] = frame_no
+        df.at[row_idx, 'crop_x0'] = x0
+        df.at[row_idx, 'crop_y0'] = y0
+        df.at[row_idx, 'crop_scale'] = crop_scale
+        frames_written += 1
 
         if show_stream:
-            cv2.imshow("Processing Stream (Press 'q' to quit)", frame)
+            cv2.imshow("Processing Stream (Press 'q' to quit)", enlarged)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("\nInterrupted by user.")
                 break
@@ -315,23 +476,30 @@ def process_tracking_data(
             sys.stdout.flush()
 
     # Clean up
-    if writer:
-        writer.release()
+    if sr_writer is not None:
+        write_waiting_crops_super_resolved()    # the last, not yet full, batch
+        sr_writer.release()
     if crop_writer is not None:
         crop_writer.release()
+    else:
+        # not one frame could be written: do not leave last run's videos behind
+        remove_stale_video(cropped_vid_path)
+        remove_stale_video(sr_vid_path)
     video_reader.release_all()
     cv2.destroyAllWindows()
-    
-    # --- NEW: Save the updated dataframe to a new CSV file ---
+
     output_csv_path = op_path / f"{csv_file.stem}_with_frames.csv"
     df.to_csv(output_csv_path, index=False)
-    
-    print(f"\n\nProcessing Complete. Video saved to: {output_vid_path}")
+
+    print(f"\n\nProcessing Complete. {frames_written} frames written.")
     if crop_writer is not None:
-        print(f"Rat-centred video ({crop_size}x{crop_size} px, about {crop_cm:g} cm) "
+        print(f"Rat-centred video ({crop_size}x{crop_size} px box, about {crop_cm:g} cm, "
+              f"saved {crop_scale}x larger as {saved_size}x{saved_size} px) "
               f"saved to: {cropped_vid_path}")
+    if sr_writer is not None:
+        print(f"Super-resolved video (same frames, same size) saved to: {sr_vid_path}")
     print(f"Updated CSV saved to: {output_csv_path}")
-    
+
     if errors:
         print(f"Encountered {len(errors)} errors. (Showing first 5)")
         for e in errors[:5]: print(e)
@@ -345,13 +513,23 @@ def main():
     parser.add_argument("--no-vis", action="store_false", dest="show_stream", help="Disable real-time video preview")
     parser.add_argument("--crop_cm", type=float, default=DEFAULT_CROP_CM,
                         help=f"Side of the square cut around the rat for {CROPPED_VIDEO_NAME}, "
-                             "in cm (default: %(default)s; 0 = do not write the cropped video)")
+                             "in cm (default: %(default)s)")
+    parser.add_argument("--no-sr", action="store_false", dest="super_resolve",
+                        help=f"Do not write the super-resolved video {SR_VIDEO_NAME}")
+    parser.add_argument("--sr_model", default=os.environ.get("DLC_SR_MODEL", "").strip() or None,
+                        help="Path of the Real-ESRGAN model file (default: DLC_SR_MODEL, "
+                             "else downloaded once into <repo>/models/)")
+
+    parser.add_argument("--crop_scale", type=int, default=DEFAULT_CROP_SCALE,
+                        help="How many times the cropped box is enlarged before it is saved "
+                             "(default: %(default)s; 1 = keep the camera's own pixels)")
 
     args = parser.parse_args()
 
     try:
         process_tracking_data(args.input_folder, args.output_folder, args.csv, args.fps,
-                              args.show_stream, args.crop_cm)
+                              args.show_stream, args.crop_cm, args.crop_scale,
+                              args.super_resolve, args.sr_model)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

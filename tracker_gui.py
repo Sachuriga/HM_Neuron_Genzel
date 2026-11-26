@@ -554,6 +554,19 @@ class TrackerGUI(QMainWindow):
                                     "without replacing anything in the session folders.")
         self.lfp_dry_run.toggled.connect(self._refresh_run_hint)
         rows.addWidget(self.lfp_dry_run)
+
+        # --- step d's own switch; only shown while step d is ticked
+        self.dlc_super_resolution = QCheckBox("Step d: also write the super-resolved video")
+        self.dlc_super_resolution.setChecked(True)
+        self.dlc_super_resolution.setToolTip(
+            "Step d always writes collected_frames_crop.mp4: the box around the rat, "
+            "enlarged with the camera's real pixels only.\n\n"
+            "Ticked: it also writes collected_frames_crop_sr.mp4, the same frames made "
+            "sharper by a network (Real-ESRGAN). Good for looking at the rat; the extra "
+            "detail is drawn by the network, not recorded by the camera.\n"
+            "Needs PyTorch, and is slow without a graphics card.")
+        self.dlc_super_resolution.toggled.connect(self._refresh_run_hint)
+        rows.addWidget(self.dlc_super_resolution)
         return card
 
     def _fill_preset_box(self):
@@ -927,9 +940,10 @@ class TrackerGUI(QMainWindow):
         self.run_hint.setStyleSheet(f"color:{HINT_COLORS[kind]};")
 
     def _refresh_run_hint(self, *_):
-        """Show what Run would do — and step l's dry-run box only with step l."""
+        """Show what Run would do — and each step's own switch only with that step."""
         steps = self._selection()
         self.lfp_dry_run.setVisible("l" in steps)
+        self.dlc_super_resolution.setVisible("d" in steps)
         if self.proc is not None:                # a run is going: leave its message alone
             return
         problem = self._problem()
@@ -1019,6 +1033,7 @@ class TrackerGUI(QMainWindow):
         # tree mode; the HM_ names win over the same settings in the config file
         env.insert("HM_POST_JOBS", str(self.post_jobs.value() or "auto"))
         env.insert("HM_LFP_FIX_DRY_RUN", "1" if self.lfp_dry_run.isChecked() else "0")
+        env.insert("HM_DLC_CROP_SR", "1" if self.dlc_super_resolution.isChecked() else "0")
         # only the picked sessions: the runner reads them from a list file
         # (always set, so an HM_SESSIONS_FILE left in the shell cannot leak in)
         sessions_file = ""
@@ -1344,6 +1359,7 @@ class TrackerGUI(QMainWindow):
         self.min_free.setValue(s.value("min_free_gb", 20, type=int))
         self.post_jobs.setValue(s.value("post_jobs", 0, type=int))
         self.options_toggle.setChecked(s.value("options_open", False, type=bool))
+        self.dlc_super_resolution.setChecked(s.value("dlc_super_resolution", True, type=bool))
 
         # the steps: a preset by name, or the user's own ticks
         preset = s.value("preset", CUSTOM_PRESET, type=str)
@@ -1373,6 +1389,7 @@ class TrackerGUI(QMainWindow):
         s.setValue("min_free_gb", self.min_free.value())
         s.setValue("post_jobs", self.post_jobs.value())
         s.setValue("options_open", self.options_toggle.isChecked())
+        s.setValue("dlc_super_resolution", self.dlc_super_resolution.isChecked())
         s.setValue("preset", self.preset.currentText())
         s.setValue("steps", self._selection())
         s.setValue("geometry", self.saveGeometry())

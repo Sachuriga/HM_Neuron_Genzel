@@ -127,6 +127,14 @@ def test_dry_run_box_only_shows_with_step_l(gui):
     assert not gui.lfp_dry_run.isHidden()
 
 
+def test_super_resolution_box_only_shows_with_step_d(gui):
+    gui._untick_all()
+    assert gui.dlc_super_resolution.isHidden()
+    gui.checks["d"].setChecked(True)
+    assert not gui.dlc_super_resolution.isHidden()
+    assert gui.dlc_super_resolution.isChecked()             # on unless switched off
+
+
 def test_data_root_is_recognised(gui, tmp_path):
     classic = tmp_path / "classic"
     (classic / "ip1").mkdir(parents=True)

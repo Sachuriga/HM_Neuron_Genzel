@@ -158,6 +158,34 @@ def test_step_d_crop_box_stays_inside_the_frame():
     assert T.crop_box_origin(5, 795, size, 600, 800) == (0, 800 - size)   # pushed back inside
 
 
+def test_step_d_cropped_video_is_enlarged_and_maps_back(tmp_path):
+    """The saved crop is crop_scale times larger, has one frame per written frame,
+    and a point in it maps back to the eye frame through crop_x0 / crop_scale."""
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    sys.path.insert(0, str(REPO / "src" / "dlc"))
+    import tracking_eyes as T
+
+    small = np.zeros((106, 106, 3), np.uint8)
+    assert T.enlarge_crop(small, 4).shape == (424, 424, 3)
+    assert T.enlarge_crop(small, 1) is small                    # 1 = left as it is
+    # crop pixel (212, 100) of a 4x crop whose box starts at (247, 347)
+    assert T.crop_pixel_to_eye_pixel(212, 100, 247, 347, 4) == (247 + 53, 347 + 25)
+
+    video = tmp_path / "crop.mp4"
+    writer = T.HighQualityVideoWriter(video, 30.0, (424, 424))
+    for shade in range(5):
+        writer.write(np.full((424, 424, 3), shade * 50, np.uint8))
+    writer.release()
+    cap = cv2.VideoCapture(str(video))
+    frames = 0
+    while cap.read()[0]:
+        frames += 1
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap.release()
+    assert (frames, width) == (5, 424)
+
+
 # ------------------------------------------------------------------ tracker_gui
 def test_gui_keeps_a_character_split_between_two_reads_whole():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -167,3 +195,38 @@ def test_gui_keeps_a_character_split_between_two_reads_whole():
     cut = text.index("—".encode("utf-8")) + 1           # in the middle of the dash
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     assert decoder.decode(text[:cut]) + decoder.decode(text[cut:]) == text.decode("utf-8")
+
+
+def test_step_d_writes_only_the_cropped_video_and_keeps_frames_in_step(tmp_path):
+    """Step d part 1 saves the box around the rat (not the whole eye frame), one
+    frame per row it could read, and skips the super-resolved video on request."""
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    sys.path.insert(0, str(REPO / "src" / "dlc"))
+    import tracking_eyes as T
+
+    ip, op = tmp_path / "ip", tmp_path / "op"
+    ip.mkdir(); op.mkdir()
+    writer = cv2.VideoWriter(str(ip / "eye03_a.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 30, (600, 800))
+    for shade in range(6):
+        writer.write(np.full((800, 600, 3), shade * 40, np.uint8))
+    writer.release()
+    rows = pd.DataFrame({"Frame_Index": range(6), "Rat_X": 542.0, "Rat_Y": 300.0})
+    rows.loc[2, "Rat_X"] = np.nan                       # the rat was not tracked here
+    rows.to_csv(op / "s_Coordinates_Full.csv", index=False)
+    (op / T.SR_VIDEO_NAME).write_bytes(b"left over from an earlier run")
+
+    T.process_tracking_data(str(ip), str(op), show_stream=False, super_resolve=False)
+
+    assert not (op / "collected_frames.mp4").exists()   # whole frames are not saved
+    assert not (op / T.SR_VIDEO_NAME).exists()          # stale video removed
+    out = pd.read_csv(op / "s_Coordinates_Full_with_frames.csv")
+    assert out["extracted_frame_idx"].notna().sum() == 5
+    assert out.loc[0, ["crop_x0", "crop_y0", "crop_scale"]].tolist() == [351, 547, 4]
+    cap = cv2.VideoCapture(str(op / T.CROPPED_VIDEO_NAME))
+    frames = 0
+    while cap.read()[0]:
+        frames += 1
+    assert (frames, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))) == (5, 424)
+    cap.release()

@@ -169,7 +169,8 @@ def worker_job_need(ip, op, steps, exports_raw=False):
         keeps_npy = os.environ.get("KEEP_NPY", "").strip().lower() in ("1", "true", "yes", "on")
         into_op += (0.25 if keeps_npy else 0.15) * rec
     if "d" in steps:
-        # collected_frames.mp4: only the frames DeepLabCut needs
+        # the two cropped videos (collected_frames_crop*.mp4) are far smaller
+        # than this; it is the old whole-frame estimate, kept as a safe upper limit
         into_op += 0.25 * videos
     return {Path(ip): into_ip, Path(op): into_op}
 

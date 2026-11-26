@@ -40,7 +40,7 @@ STEP_SIGNATURES = {
     "5": ["*_analysis_final.pdf"],           # Plotting
     "7": ["*_sorting_output"],               # Spike sorting
     "8": ["LFP_Output"],                     # LFP + motion/EMG (.npy only with --keep-npy; NWB: below)
-    "d": ["collected_framesDLC_*.h5", "collected_framesDLC_*.csv"],  # DeepLabCut
+    "d": ["collected_frames*DLC_*.h5", "collected_frames*DLC_*.csv"],  # DeepLabCut (crop / crop_sr; older runs: whole frames)
 }
 # Intermediates cleaned up: done once the step that consumes them is done.
 IMPLIED_BY = {"2": "4", "3": "4"}

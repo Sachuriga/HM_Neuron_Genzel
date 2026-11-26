@@ -572,18 +572,37 @@ def run_worker(ip, op, steps, out):
     if "d" in steps and Path("./src/dlc/tracking_eyes.py").exists():
         log(out, "[STEP d] Exporting eye frames for DeepLabCut...")
         # DLC_CROP_CM = side (cm) of the box cut around the tracked rat. Part 1
-        # then also writes collected_frames_crop.mp4 with only that box. 0
-        # switches it off. DeepLabCut below does not use the cropped video yet;
-        # it still analyzes the whole eye frames in collected_frames.mp4.
+        # writes only that box, twice: collected_frames_crop.mp4 (enlarged the
+        # plain way, real pixels) and collected_frames_crop_sr.mp4 (enlarged by
+        # the super-resolution network). The whole eye frame is no longer saved.
         crop_cm = os.environ.get("DLC_CROP_CM", "").strip() or "40"
         try:
             float(crop_cm)
         except ValueError:
             log(out, f"[STEP d] DLC_CROP_CM='{crop_cm}' is not a number; using 40.")
             crop_cm = "40"
-        run([PYTHON, "-u", "./src/dlc/tracking_eyes.py",
-             "--input_folder", ip, "--output_folder", op, "--crop_cm", crop_cm], out=out)
-        # Run DeepLabCut on the collected_frames.mp4 just exported and merge the
+        # DLC_CROP_SCALE = how many times that box is enlarged before it is saved
+        # (4 -> 424 px), so the rat is easy to see. 1 = the camera's own pixels.
+        crop_scale = os.environ.get("DLC_CROP_SCALE", "").strip() or "4"
+        if not crop_scale.isdigit() or int(crop_scale) < 1:
+            log(out, f"[STEP d] DLC_CROP_SCALE='{crop_scale}' is not a whole number >= 1; using 4.")
+            crop_scale = "4"
+        export_cmd = [PYTHON, "-u", "./src/dlc/tracking_eyes.py",
+                      "--input_folder", ip, "--output_folder", op,
+                      "--crop_cm", crop_cm, "--crop_scale", crop_scale]
+        # DLC_CROP_SR=0 skips the super-resolved video (it needs PyTorch and is
+        # the slow part of the export). The GUI's switch (HM_DLC_CROP_SR) wins
+        # over the config file. The model file comes from DLC_SR_MODEL.
+        if _str_env("HM_DLC_CROP_SR", "DLC_CROP_SR", default="1").lower() in ("0", "false", "no", "off"):
+            export_cmd.append("--no-sr")
+        run(export_cmd, out=out)
+        # DLC_VIDEO = which of the two videos DeepLabCut reads: crop (real
+        # pixels, default) or sr (super-resolved).
+        dlc_video = os.environ.get("DLC_VIDEO", "").strip().lower() or "crop"
+        if dlc_video not in ("crop", "sr"):
+            log(out, f"[STEP d] DLC_VIDEO='{dlc_video}' is not crop or sr; using crop.")
+            dlc_video = "crop"
+        # Run DeepLabCut on the cropped video just exported and merge the
         # predicted keypoints back into the CSV. Uses the GPU like step 4; the
         # per-worker resource gate (MAX_GPU) throttles concurrent launches. Skipped
         # unless DLC_CONFIG_PATH (the DLC project's config.yaml) points to a real file.
@@ -593,7 +612,8 @@ def run_worker(ip, op, steps, out):
                 log(out, "[STEP d] Running DeepLabCut inference...")
                 run([PYTHON, "-u", "./src/dlc/dlc_coordinates.py",
                      "--output_folder", op, "--config", dlc_cfg,
-                     "--shuffle", os.environ.get("DLC_SHUFFLE", "2")], out=out)
+                     "--shuffle", os.environ.get("DLC_SHUFFLE", "2"),
+                     "--video", dlc_video], out=out)
             else:
                 log(out, f"[STEP d] Skipping DLC inference: DLC_CONFIG_PATH not set or not found: '{dlc_cfg}'")
 
@@ -795,7 +815,11 @@ def compress_all_op_videos(op_dirs):
     """STEP 6 (final phase): GPU-compress EVERY top-level .mp4 in each op folder,
     in-place. Runs last so it never re-encodes a video another step still reads."""
     ffmpeg = os.environ.get("FFMPEG_CMD", "ffmpeg")
-    todo = [(op, [f for f in sorted(op.glob("*.mp4")) if f.name != "__temp_compressed.mp4"])
+    # Step d's cropped videos are left alone: they are small and saved at high
+    # quality on purpose, and compressing them again would blur the rat.
+    keep_as_is = {"__temp_compressed.mp4", "collected_frames_crop.mp4",
+                  "collected_frames_crop_sr.mp4"}
+    todo = [(op, [f for f in sorted(op.glob("*.mp4")) if f.name not in keep_as_is])
             for op in op_dirs]
 
     # Probe at the largest frame we actually have to encode: an old GPU can manage
